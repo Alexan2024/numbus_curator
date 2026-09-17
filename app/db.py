@@ -276,6 +276,44 @@ async def announced_posts(slot_key: str | None = None) -> list[aiosqlite.Row]:
         return await cur.fetchall()
 
 
+async def posts_in_slots(keys: list[str]) -> list[aiosqlite.Row]:
+    """Всё, что привязано к этим слотам: вышедшее, стоящее в слоте, анонсы, присланные варианты."""
+    if not keys:
+        return []
+    q = ",".join("?" * len(keys))
+    async with connect() as db:
+        cur = await db.execute(
+            f"SELECT * FROM posts WHERE slot_key IN ({q}) "
+            "AND status IN ('published','approved','announced','sent') ORDER BY id ASC", tuple(keys))
+        return await cur.fetchall()
+
+
+async def approved_in_slot(slot_key: str) -> aiosqlite.Row | None:
+    async with connect() as db:
+        cur = await db.execute(
+            "SELECT * FROM posts WHERE status='approved' AND slot_key=? ORDER BY decided_at ASC LIMIT 1", (slot_key,))
+        return await cur.fetchone()
+
+
+async def overdue_approved(slot_key: str, fmt: str | None = None) -> list[aiosqlite.Row]:
+    """Одобренные посты без слота или со слотом, который уже прошёл (бот лежал, стояла пауза)."""
+    q = "SELECT * FROM posts WHERE status='approved' AND (slot_key IS NULL OR slot_key<?)"
+    args: tuple = (slot_key,)
+    if fmt:
+        q += " AND format=?"
+        args += (fmt,)
+    async with connect() as db:
+        cur = await db.execute(q + " ORDER BY decided_at ASC, id ASC", args)
+        return await cur.fetchall()
+
+
+async def taken_keys(from_key: str) -> set[str]:
+    async with connect() as db:
+        cur = await db.execute(
+            "SELECT slot_key FROM posts WHERE status IN ('approved','announced') AND slot_key>=?", (from_key,))
+        return {r["slot_key"] for r in await cur.fetchall()}
+
+
 async def slot_leftovers(slot_key: str) -> list[aiosqlite.Row]:
     """Предложенные к этому (или более раннему) слоту и так и не выбранные."""
     async with connect() as db:

@@ -95,6 +95,7 @@ async def main():
     sched.add_job(guarded(bot, "очистка", cleanup), "cron", hour=4, minute=30, id="cleanup")
     sched.start()
 
+    await slots.reschedule(bot)   # посты, чей слот прошёл, пока бот не работал
     await bot.set_my_commands([
         BotCommand(command="menu", description="Меню"),
         BotCommand(command="next", description="Следующий пост"),

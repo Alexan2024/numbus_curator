@@ -56,6 +56,25 @@ async def _send_photos(bot: Bot, chat_id, files: list, caption: str | None) -> l
     return await bot.send_media_group(chat_id, build_album(files, caption))
 
 
+def slot_label(key: str | None) -> str:
+    """'2026-09-17 19:00' → '17.09 в 19:00'"""
+    if not key:
+        return "— (будет назначен)"
+    return f"{key[8:10]}.{key[5:7]} в {key[-5:]}"
+
+
+def post_link(post) -> str | None:
+    """Ссылка на вышедший пост в канале."""
+    if not post["channel_msg_id"]:
+        return None
+    ch = str(config.CHANNEL_ID)
+    if ch.startswith("@"):
+        return f"https://t.me/{ch[1:]}/{post['channel_msg_id']}"
+    if ch.startswith("-100"):
+        return f"https://t.me/c/{ch[4:]}/{post['channel_msg_id']}"
+    return None
+
+
 # ---------- клавиатуры ----------
 
 def kb_for(post) -> InlineKeyboardMarkup | None:
@@ -65,14 +84,15 @@ def kb_for(post) -> InlineKeyboardMarkup | None:
     if st not in ("sent", "approved", "announced"):
         return None
     if st == "sent":
-        first = [_btn("✅ Опубликовать", f"pub:{pid}")]
+        top = [[_btn("✅ Опубликовать", f"pub:{pid}")]]
         if fmt != "notes":
-            first.append(_btn("⏱ В слот", f"slot:{pid}"))
+            top.append([_btn("⏱ Ближайший слот", f"slot:{pid}"), _btn("🗓 Выбрать слот", f"pick:{pid}")])
     elif st == "approved":
-        first = [_btn("✅ Сейчас", f"pub:{pid}"), _btn("↩️ Убрать из слота", f"unslot:{pid}")]
+        top = [[_btn("✅ Сейчас", f"pub:{pid}")],
+               [_btn("🔀 Перенести", f"pick:{pid}"), _btn("↩️ Убрать из слота", f"unslot:{pid}")]]
     else:
-        first = [_btn("✅ Сейчас", f"pub:{pid}"), _btn("🚫 Отменить автопост", f"unslot:{pid}")]
-    rows = [first, [_btn("✏️ Свой текст", f"edit:{pid}"), _btn("🔁 Переписать", f"rw:{pid}")]]
+        top = [[_btn("✅ Сейчас", f"pub:{pid}"), _btn("🚫 Отменить автопост", f"unslot:{pid}")]]
+    rows = [*top, [_btn("✏️ Свой текст", f"edit:{pid}"), _btn("🔁 Переписать", f"rw:{pid}")]]
     third = []
     if len(json.loads(post["images"])) > 1:
         third.append(_btn("🖼 Фото", f"ph:{pid}"))
@@ -130,7 +150,7 @@ def control_text(post, suffix: str = "") -> str:
             f'• <a href="{html.escape(s.get("url") or "")}">{html.escape((s.get("title") or s.get("url") or "?")[:70])}</a>'
             for s in srcs if s.get("url"))
     if post["status"] == "approved":
-        meta += "\n\n⏱ <b>В очереди на слот</b>"
+        meta += f"\n\n⏱ <b>Стоит в слоте {slot_label(post['slot_key'])}</b>"
     elif post["status"] == "announced" and post["slot_key"]:
         meta += f"\n\n🤖 <b>Автопост в {post['slot_key'][-5:]}</b> — выйдет сам, если не отменить"
     meta += suffix
@@ -194,8 +214,9 @@ async def refresh_card(bot: Bot, pid: int, suffix: str = "", caption_changed: bo
 
 # ---------- публикация ----------
 
-async def publish_post(bot: Bot, pid: int, how: str = "") -> bool:
-    """Отправляет пост в канал. how — пометка в карточке («по слоту 14:00», «автомат»)."""
+async def publish_post(bot: Bot, pid: int, how: str = "", slot_key: str | None = None) -> bool:
+    """Отправляет пост в канал. how — пометка в карточке («по слоту 14:00», «автомат»).
+    slot_key остаётся на посте, если он вышел по слоту — так расписание помнит, чем слот был занят."""
     post = await db.get_post(pid)
     if not post or post["status"] == "published":
         return False
@@ -213,7 +234,7 @@ async def publish_post(bot: Bot, pid: int, how: str = "") -> bool:
         for chunk in formatter.split_blocks(caption, config.MESSAGE_LIMIT - 100):
             m = await bot.send_message(config.CHANNEL_ID, chunk, disable_web_page_preview=True)
             first_id = first_id or m.message_id
-    await db.update_post(pid, status="published", decided_at=db.now(), slot_key=None, channel_msg_id=first_id)
+    await db.update_post(pid, status="published", decided_at=db.now(), slot_key=slot_key, channel_msg_id=first_id)
     await refresh_card(bot, pid, f"\n\n✅ <b>Опубликовано</b>{' · ' + how if how else ''}")
     return True
 

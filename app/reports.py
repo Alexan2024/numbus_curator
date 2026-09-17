@@ -1,4 +1,6 @@
 """Тексты для меню: состояние, статистика, дайджест, источники."""
+import html
+
 from app import cards, config, db, slots, sources
 
 
@@ -6,26 +8,36 @@ def _fmt(d: dict) -> str:
     return ", ".join(f"{k} {v}" for k, v in sorted(d.items(), key=lambda x: -x[1])) or "—"
 
 
-async def menu_text() -> str:
+def _slot_line(s: dict) -> str:
+    line = f"{slots.ICON[s['state']]} {s['dt']:%H:%M} {slots.SHORT[s['fmt']]}"
+    post, state = s["post"], s["state"]
+    if state in ("published", "approved"):
+        return f"{line} · {html.escape(slots.headline(post))}"
+    if state == "announced":
+        return f"{line} · автопост: {html.escape(slots.headline(post, 34))}"
+    if state == "offered":
+        return f"{line} · вариантов на выбор: {s['n']}"
+    return f"{line} · " + {"skipped": "пропуск", "missed": "прошёл пустым"}.get(state, "пусто")
+
+
+async def menu_text(day: int = 0) -> str:
     s = await db.stats()
     rf = s["ready_by_format"]
     md, is_paused = await slots.mode(), await slots.paused()
-    approved = len(await db.approved_posts())
-    nxt = slots.upcoming(None, 1)
-    sl = " · ".join(f"{h:02d}:{m:02d} {'мини' if f == 'mini' else 'ст'}" for h, m, f in config.SLOTS)
+    today, other = await slots.day_state(day), await slots.day_state(1 - day)
+    title = "Сегодня" if day == 0 else "Завтра"
     lines = [
-        "<b>AHMAG curator</b>",
-        f"Режим: {slots.MODES[md]}" + (" · ⏸ <b>пауза</b>" if is_paused else ""),
-        f"Слоты: {sl}",
-    ]
-    if nxt:
-        lines.append(f"Ближайший: {slots.human(nxt[0][0])} ({cards.FORMAT_LABEL[nxt[0][1]]})")
-    lines += [
+        f"<b>AHMAG</b> · {slots.MODES[md]}" + (" · ⏸ <b>пауза</b>" if is_paused else ""),
         "",
-        f"Готово: стандарт {rf.get('std', 0)} · мини {rf.get('mini', 0)} · ждут слота {approved}",
-        f"Claude сегодня: {await db.calls_today()}/{config.DAILY_API_CALLS_MAX} вызовов",
+        f"<b>{title}, {today[0]['dt']:%d.%m}</b>" if today else f"<b>{title}</b>",
+        *[_slot_line(x) for x in today],
         "",
-        "<i>Пришлите ссылку — соберу пост из неё.</i>",
+        ("Завтра: " if day == 0 else "Сегодня: ") + "".join(slots.ICON[x["state"]] for x in other),
+        "",
+        f"Готово к выдаче: стандарт {rf.get('std', 0)} · мини {rf.get('mini', 0)}",
+        f"Claude сегодня: {await db.calls_today()}/{config.DAILY_API_CALLS_MAX}",
+        "",
+        "<i>Нажмите на слот, чтобы управлять им. Ссылка в чат — пост из неё.</i>",
     ]
     return "\n".join(lines)
 

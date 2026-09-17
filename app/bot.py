@@ -46,27 +46,31 @@ def _pid(cb: CallbackQuery) -> int:
 
 # ======================= меню =======================
 
-async def kb_menu() -> InlineKeyboardMarkup:
+async def kb_menu(day: int = 0) -> InlineKeyboardMarkup:
     md, is_paused = await slots.mode(), await slots.paused()
 
     def mode_btn(key: str, label: str) -> InlineKeyboardButton:
         return _btn(("● " if md == key else "") + label, f"m:mode:{key}")
 
+    state = await slots.day_state(day)
+    slot_btns = [_btn(f"{x['dt']:%H:%M} {slots.ICON[x['state']]}", f"sl:{slots.enc(x['key'])}") for x in state]
+    slot_rows = [slot_btns[i:i + 4] for i in range(0, len(slot_btns), 4)]
     return InlineKeyboardMarkup(inline_keyboard=[
+        *slot_rows,
+        [_btn("Завтра ▸" if day == 0 else "◂ Сегодня", f"m:day:{1 - day}"), _btn("🔄 Обновить", f"m:day:{day}")],
         [mode_btn("manual", "✋ Ручной"), mode_btn("semi", "🤝 Полуавто"), mode_btn("auto", "🤖 Авто")],
         [_btn("▶️ Следующий пост", "m:next:std"), _btn("▫️ Мини-пост", "m:next:mini")],
-        [_btn("📝 #ahmagnotes", "m:notes"), _btn("🗂 Очередь слотов", "m:queue")],
+        [_btn("📝 #ahmagnotes", "m:notes"), _btn("🔄 Собрать сейчас", "m:collect")],
         [_btn("📊 Статистика", "m:stats"), _btn("📈 Итоги недели", "m:digest")],
-        [_btn("📡 Источники", "m:src"), _btn("🔄 Собрать сейчас", "m:collect")],
-        [_btn("▶️ Снять с паузы" if is_paused else "⏸ Пауза", "m:pause")],
+        [_btn("📡 Источники", "m:src"), _btn("▶️ Снять с паузы" if is_paused else "⏸ Пауза", "m:pause")],
     ])
 
 
 KB_HOME = InlineKeyboardMarkup(inline_keyboard=[[_btn("← Меню", "m:home")]])
 
 
-async def show_menu(msg: Message, edit: bool = False) -> None:
-    text, kb = await reports.menu_text(), await kb_menu()
+async def show_menu(msg: Message, edit: bool = False, day: int = 0) -> None:
+    text, kb = await reports.menu_text(day), await kb_menu(day)
     if edit:
         try:
             return await msg.edit_text(text, reply_markup=kb)
@@ -92,27 +96,6 @@ async def run_collect(msg: Message) -> None:
                          f"Готово: стандарт {s.get('std', 0)} · мини {s.get('mini', 0)}")
 
 
-async def queue_view() -> tuple[str, InlineKeyboardMarkup]:
-    lines, rows = ["<b>Очередь слотов</b>"], []
-    for fmt in ("std", "mini"):
-        queue = await db.approved_posts(fmt)
-        times = slots.upcoming(fmt, len(queue))
-        for i, p in enumerate(queue):
-            head = json.loads(p["data"]).get("headline", "?")
-            when = slots.human(times[i][0]) if i < len(times) else "—"
-            lines.append(f"• {when} · {cards.FORMAT_LABEL[fmt]} · {head[:60]}")
-            rows.append([_btn(f"✕ {head[:40]}", f"q:rm:{p['id']}")])
-    for p in await db.announced_posts():
-        head = json.loads(p["data"]).get("headline", "?")
-        lines.append(f"• 🤖 {p['slot_key'][-5:]} · автопост · {head[:60]}")
-    if len(lines) == 1:
-        lines.append("Пусто. Посты попадают сюда кнопкой «⏱ В слот» на карточке.")
-    if await slots.paused():
-        lines.append("\n⏸ Пауза: слоты сейчас не публикуют.")
-    rows.append([_btn("← Меню", "m:home")])
-    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
-
-
 async def sources_view() -> tuple[str, InlineKeyboardMarkup]:
     rows_data = await reports.sources_rows()
     lines = ["<b>Источники</b> — доля одобренных вами постов"]
@@ -131,6 +114,9 @@ async def on_menu(cb: CallbackQuery, bot: Bot):
     if action == "home":
         await cb.answer()
         return await show_menu(cb.message, edit=True)
+    if action == "day":
+        await cb.answer("Обновлено")
+        return await show_menu(cb.message, edit=True, day=int(parts[2]))
     if action == "mode":
         await db.set_setting("mode", parts[2])
         hints = {
@@ -143,6 +129,8 @@ async def on_menu(cb: CallbackQuery, bot: Bot):
     if action == "pause":
         now_paused = not await slots.paused()
         await db.set_setting("paused", now_paused)
+        if not now_paused:
+            await slots.reschedule(bot)   # посты, чей слот прошёл за время паузы, — в ближайшие свободные
         await cb.answer("Пауза: ничего не публикую и не присылаю" if now_paused else "Работаю", show_alert=now_paused)
         return await show_menu(cb.message, edit=True)
     await cb.answer()
@@ -156,24 +144,9 @@ async def on_menu(cb: CallbackQuery, bot: Bot):
         return await cb.message.edit_text(await reports.stats_text(), reply_markup=KB_HOME)
     if action == "digest":
         return await cb.message.edit_text(await reports.digest_text(), reply_markup=KB_HOME)
-    if action == "queue":
-        text, kb = await queue_view()
-        return await cb.message.edit_text(text, reply_markup=kb)
     if action == "src":
         text, kb = await sources_view()
         return await cb.message.edit_text(text, reply_markup=kb)
-
-
-@router.callback_query(F.data.startswith("q:rm:"))
-async def on_queue_remove(cb: CallbackQuery, bot: Bot):
-    pid = int(cb.data.split(":")[2])
-    post = await db.get_post(pid)
-    if post and post["status"] == "approved":
-        await db.update_post(pid, status="sent")
-        await cards.refresh_card(bot, pid, "\n\n↩️ <i>Убран из очереди слотов</i>")
-    await cb.answer("Убрал — карточка снова активна")
-    text, kb = await queue_view()
-    await cb.message.edit_text(text, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("src:"))
@@ -253,17 +226,72 @@ async def on_publish(cb: CallbackQuery, bot: Bot):
     await cb.answer("Опубликовано" if ok else "Уже опубликовано")
 
 
+async def _put_in_slot(bot: Bot, pid: int, key: str) -> None:
+    await db.update_post(pid, status="approved", decided_at=db.now(), slot_key=key)
+    await cards.refresh_card(bot, pid)
+
+
 @router.callback_query(F.data.startswith("slot:"))
 async def on_slot(cb: CallbackQuery, bot: Bot):
+    """Одно нажатие: слот, к которому пост предложен, иначе ближайший свободный его формата."""
     pid = _pid(cb)
     post = await db.get_post(pid)
     if post["status"] not in ("sent", "announced"):
         return await cb.answer("Этот пост уже не на модерации")
-    await db.update_post(pid, status="approved", decided_at=db.now(), slot_key=None)
-    when = await slots.eta(post["format"])
-    await cards.refresh_card(bot, pid, f"\nВыйдет: {when}")
+    offered = post["slot_key"]
+    if post["status"] == "announced" and offered and slots.key_dt(offered) > slots._now():
+        key = offered                      # автопост → подтверждённый пост в том же слоте
+    elif offered and await slots.is_free(offered):
+        key = offered
+    else:
+        key = await slots.next_free(post["format"])
+    if not key:
+        return await cb.answer("Свободных слотов этого формата нет. Выберите слот вручную.", show_alert=True)
+    await _put_in_slot(bot, pid, key)
     note = " (сейчас пауза)" if await slots.paused() else ""
-    await cb.answer(f"В очереди. Выйдет {when}{note}", show_alert=bool(note))
+    await cb.answer(f"Выйдет {slots.human_key(key)}{note}", show_alert=bool(note))
+
+
+@router.callback_query(F.data.startswith("pick:"))
+async def on_pick(cb: CallbackQuery):
+    """Список слотов: свободные — поставить; занятые (для уже стоящего поста) — поменяться местами."""
+    pid = _pid(cb)
+    post = await db.get_post(pid)
+    if post["status"] not in ("sent", "approved", "announced"):
+        return await cb.answer("Этот пост уже не на модерации")
+    rows = []
+    for key, fmt in await slots.free_slots(None, limit=8):
+        mark = "" if fmt == post["format"] else " ≠"
+        rows.append([_btn(f"{slots.human_key(key)} · {slots.SHORT[fmt]}{mark}", f"ps:{pid}:{slots.enc(key)}")])
+    if post["status"] == "approved":
+        for other in await db.approved_posts():
+            if other["id"] != pid and other["slot_key"] and slots.key_dt(other["slot_key"]) > slots._now():
+                rows.append([_btn(f"⇄ {slots.human_key(other['slot_key'])} · {slots.headline(other, 24)}",
+                                  f"ps:{pid}:{slots.enc(other['slot_key'])}")])
+    rows.append([_btn("← Назад", f"back:{pid}")])
+    await cb.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await cb.answer("≠ — слот другого формата" if any("≠" in r[0].text for r in rows) else None)
+
+
+@router.callback_query(F.data.startswith("ps:"))
+async def on_pick_slot(cb: CallbackQuery, bot: Bot):
+    _, pid, code = cb.data.split(":")
+    pid, key = int(pid), slots.dec(code)
+    post = await db.get_post(pid)
+    if post["status"] not in ("sent", "approved", "announced"):
+        return await cb.answer("Этот пост уже не на модерации")
+    if slots.key_dt(key) <= slots._now():
+        return await cb.answer("Этот слот уже прошёл", show_alert=True)
+    other = await db.approved_in_slot(key)
+    if other and other["id"] != pid:
+        if post["status"] != "approved" or not post["slot_key"]:
+            return await cb.answer("Слот уже занят", show_alert=True)
+        await db.update_post(other["id"], slot_key=post["slot_key"])      # меняемся местами
+        await cards.refresh_card(bot, other["id"], f"\n⇄ <i>Перенесён: {slots.human_key(post['slot_key'])}</i>")
+    elif not other and post["slot_key"] != key and not await slots.is_free(key):
+        return await cb.answer("Слот занят автопостом — сначала отмените его", show_alert=True)
+    await _put_in_slot(bot, pid, key)
+    await cb.answer(f"Выйдет {slots.human_key(key)}")
 
 
 @router.callback_query(F.data.startswith("unslot:"))
@@ -271,10 +299,95 @@ async def on_unslot(cb: CallbackQuery, bot: Bot):
     pid = _pid(cb)
     post = await db.get_post(pid)
     if post["status"] not in ("approved", "announced"):
-        return await cb.answer("Уже не в очереди")
+        return await cb.answer("Уже не в слоте")
     await db.update_post(pid, status="sent", slot_key=None)
     await cards.refresh_card(bot, pid, "\n\n↩️ <i>Снят с публикации — решение за вами</i>")
-    await cb.answer("Снял")
+    await cb.answer("Снял, слот свободен")
+
+
+# ======================= слот из меню =======================
+
+async def slot_view(key: str) -> tuple[str, InlineKeyboardMarkup]:
+    offset = (slots.key_dt(key).date() - slots._now().date()).days
+    state = next((x for x in await slots.day_state(offset) if x["key"] == key), None)
+    code, rows = slots.enc(key), []
+    if not state:
+        return "Такого слота в расписании нет.", KB_HOME
+    post, st = state["post"], state["state"]
+    text = f"<b>Слот {slots.human_key(key)}</b> · {cards.FORMAT_LABEL[state['fmt']]}\n{slots.ICON[st]} "
+    if st == "published":
+        text += f"Вышел: {slots.headline(post, 80)}"
+        link = cards.post_link(post)
+        if link:
+            rows.append([InlineKeyboardButton(text="Открыть в канале", url=link)])
+    elif st == "approved":
+        text += f"Стоит: {slots.headline(post, 80)}\n\nПеренести или поменять местами — кнопкой «🔀 Перенести» на карточке."
+        rows.append([_btn("👁 К карточке", f"sc:{post['id']}"), _btn("↩️ Освободить слот", f"su:{post['id']}:{code}")])
+    elif st == "announced":
+        text += f"Автопост: {slots.headline(post, 80)}\nВыйдет сам, если не отменить."
+        rows.append([_btn("👁 К карточке", f"sc:{post['id']}"), _btn("🚫 Отменить", f"su:{post['id']}:{code}")])
+    elif st == "offered":
+        text += f"Прислано вариантов: {state['n']}. Выберите на карточке «⏱ Ближайший слот» — пост встанет сюда."
+        rows.append([_btn("👁 К вариантам", f"sc:{post['id']}")])
+    elif st == "missed":
+        text += "Прошёл пустым."
+    else:
+        text += "Пропуск: бот не будет его заполнять." if st == "skipped" else "Пусто."
+        if st == "empty":
+            rows.append([_btn("🎯 Подобрать варианты сейчас", f"so:{code}")])
+        rows.append([_btn("↩️ Вернуть слот" if st == "skipped" else "⏭ Пропустить этот слот", f"sk:{code}")])
+    rows.append([_btn("← Меню", f"m:day:{min(max(offset, 0), 1)}")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("sl:"))
+async def on_slot_open(cb: CallbackQuery):
+    text, kb = await slot_view(slots.dec(cb.data.split(":")[1]))
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("sk:"))
+async def on_slot_skip(cb: CallbackQuery):
+    key = slots.dec(cb.data.split(":")[1])
+    now_skipped = await slots.toggle_skip(key)
+    await cb.answer("Слот пропускается" if now_skipped else "Слот снова в работе")
+    text, kb = await slot_view(key)
+    await cb.message.edit_text(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("so:"))
+async def on_slot_offer(cb: CallbackQuery, bot: Bot):
+    key = slots.dec(cb.data.split(":")[1])
+    fmt = slots.slot_fmt(key)
+    if not fmt or not await slots.is_free(key):
+        return await cb.answer("Слот уже занят или прошёл", show_alert=True)
+    await cb.answer("Подбираю…")
+    head = f"🎯 Варианты для слота {slots.human_key(key)} · {cards.FORMAT_LABEL[fmt]}. «⏱ Ближайший слот» поставит пост сюда."
+    if not await slots.offer(bot, key, fmt, head):
+        await cb.message.answer("Готовых постов этого формата нет. Нажмите «Собрать сейчас» или пришлите ссылку.")
+
+
+@router.callback_query(F.data.startswith("sc:"))
+async def on_slot_card(cb: CallbackQuery, bot: Bot):
+    post = await db.get_post(_pid(cb))
+    await cb.answer()
+    try:
+        await bot.send_message(config.ADMIN_ID, "Карточка ↑", reply_to_message_id=post["card_msg_id"])
+    except TelegramBadRequest:
+        await cards.send_card(bot, post, slot_key=post["slot_key"], status=post["status"])  # сообщение удалено — шлём заново
+
+
+@router.callback_query(F.data.startswith("su:"))
+async def on_slot_free(cb: CallbackQuery, bot: Bot):
+    _, pid, code = cb.data.split(":")
+    post = await db.get_post(int(pid))
+    if post and post["status"] in ("approved", "announced"):
+        await db.update_post(int(pid), status="sent", slot_key=None)
+        await cards.refresh_card(bot, int(pid), "\n\n↩️ <i>Снят со слота — решение за вами</i>")
+    await cb.answer("Слот свободен")
+    text, kb = await slot_view(slots.dec(code))
+    await cb.message.edit_text(text, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("rej:"))
