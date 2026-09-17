@@ -8,10 +8,10 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import BotCommand
+from aiogram.types import BotCommand, ErrorEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from app import cards, config, db, pipeline, reports, slots, sources
+from app import cards, config, curator, db, pipeline, reports, slots, sources
 from app.bot import router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -36,9 +36,14 @@ def guarded(bot: Bot, name: str, fn, *args):
     return job
 
 
-async def collect():
+async def collect(bot: Bot | None = None):
     await sources.collect_all()
-    await pipeline.process_new()
+    before = await db.get_setting("api_error")
+    _, note = await pipeline.process_new()
+    after = await db.get_setting("api_error")
+    # об ошибке доступа к Claude сообщаем один раз, а не при каждом сборе
+    if bot and after and (not before or before["text"] != after["text"]):
+        await bot.send_message(config.ADMIN_ID, f"⚠️ {after['text']}")
 
 
 async def deliver(bot: Bot, n: int):
@@ -79,7 +84,7 @@ async def main():
     dp.include_router(router)
 
     sched = AsyncIOScheduler(timezone=config.TZ_NAME, job_defaults={"misfire_grace_time": 300, "coalesce": True})
-    sched.add_job(guarded(bot, "сбор", collect), "interval", hours=config.COLLECT_EVERY_HOURS,
+    sched.add_job(guarded(bot, "сбор", collect, bot), "interval", hours=config.COLLECT_EVERY_HOURS,
                   id="collect", max_instances=1)
     per_slot = math.ceil(config.DAILY_MAX / len(config.DELIVERY_HOURS))
     for h in config.DELIVERY_HOURS:
@@ -100,10 +105,27 @@ async def main():
         BotCommand(command="menu", description="Меню"),
         BotCommand(command="next", description="Следующий пост"),
         BotCommand(command="mini", description="Мини-пост"),
+        BotCommand(command="diag", description="Проверить, всё ли работает"),
         BotCommand(command="cancel", description="Отменить ввод"),
     ])
-    asyncio.create_task(guarded(bot, "сбор", collect)())  # первый сбор сразу после старта
+    asyncio.create_task(guarded(bot, "сбор", collect, bot)())  # первый сбор сразу после старта
     log.info("AHMAG curator запущен · режим %s · слоты %s", await slots.mode(), config.SLOTS)
+    @dp.error()
+    async def on_error(event: ErrorEvent) -> None:
+        """Ошибка в кнопке или команде: раньше она уходила в лог, и бот молчал."""
+        exc = event.exception
+        log.exception("Ошибка обработчика", exc_info=exc)
+        text = f"⚠️ {curator.explain(exc)}"
+        cb = event.update.callback_query
+        try:
+            if cb:
+                await cb.answer("Не получилось", show_alert=False)
+                await bot.send_message(cb.from_user.id, text)
+            elif event.update.message:
+                await event.update.message.answer(text)
+        except Exception:
+            log.exception("Не смог сообщить об ошибке")
+
     await dp.start_polling(bot)
 
 

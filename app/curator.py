@@ -5,6 +5,7 @@ import random
 import re
 from pathlib import Path
 
+import anthropic
 from anthropic import AsyncAnthropic
 
 from app import config, db, media
@@ -85,7 +86,28 @@ NOTES_SYSTEM = f"""Ты — редактор Telegram-канала AHMAG и ве
 
 
 class BudgetExceeded(RuntimeError):
-    pass
+    """Достигнут дневной потолок фоновых вызовов."""
+
+
+class NoCredits(RuntimeError):
+    """На счёте Anthropic закончились средства."""
+
+
+class ApiDown(RuntimeError):
+    """API Anthropic временно недоступен."""
+
+
+def explain(exc: Exception) -> str:
+    """Человеческое объяснение ошибки для сообщения в чат."""
+    if isinstance(exc, NoCredits):
+        return ("На счёте Anthropic закончились средства. Пополните баланс: "
+                "console.anthropic.com → Plans & Billing → Add credits. После этого всё заработает само.")
+    if isinstance(exc, BudgetExceeded):
+        return (f"Дневной лимит обращений к Claude исчерпан ({config.DAILY_API_CALLS_MAX}). "
+                "Он сбросится в полночь, а поднять его можно переменной DAILY_API_CALLS_MAX.")
+    if isinstance(exc, ApiDown):
+        return "API Anthropic сейчас недоступен. Обычно это ненадолго — попробуйте через несколько минут."
+    return f"Что-то пошло не так: {exc!r}"
 
 
 def _examples() -> str:
@@ -132,8 +154,18 @@ async def _call(content: list, max_tokens: int = 2000, system: str = SYSTEM,
     kwargs = {"tools": tools} if tools else {}
     text = ""
     for _ in range(4):  # веб-поиск может вернуть pause_turn — тогда продолжаем тот же ход
-        resp = await client.messages.create(
-            model=config.CLAUDE_MODEL, max_tokens=max_tokens, system=system, messages=messages, **kwargs)
+        try:
+            resp = await client.messages.create(
+                model=config.CLAUDE_MODEL, max_tokens=max_tokens, system=system, messages=messages, **kwargs)
+        except anthropic.APIStatusError as exc:
+            detail = str(getattr(exc, "message", "") or exc).lower()
+            if "credit balance" in detail or "billing" in detail:
+                raise NoCredits() from exc
+            if exc.status_code in (429, 500, 502, 503, 529):
+                raise ApiDown() from exc
+            raise
+        except anthropic.APIConnectionError as exc:
+            raise ApiDown() from exc
         try:
             await db.add_usage(resp.usage.input_tokens or 0, resp.usage.output_tokens or 0)
         except Exception:
@@ -143,6 +175,18 @@ async def _call(content: list, max_tokens: int = 2000, system: str = SYSTEM,
             break
         messages.append({"role": "assistant", "content": resp.content})
     return _parse_json(text)
+
+
+async def ping() -> None:
+    """Дешёвая проверка доступа к API — для /diag."""
+    try:
+        await client.messages.create(model=config.CLAUDE_MODEL, max_tokens=4,
+                                     messages=[{"role": "user", "content": "ping"}])
+    except anthropic.APIStatusError as exc:
+        detail = str(getattr(exc, "message", "") or exc).lower()
+        if "credit balance" in detail or "billing" in detail:
+            raise NoCredits() from exc
+        raise
 
 
 # ---------- посты ----------

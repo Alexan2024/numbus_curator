@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -82,18 +83,38 @@ async def show_menu(msg: Message, edit: bool = False, day: int = 0) -> None:
 
 async def send_next(msg: Message, bot: Bot, fmt: str) -> None:
     post = await pipeline.pick_next(fmt)
-    if not post:
-        return await msg.answer(f"Готовых постов ({cards.FORMAT_LABEL[fmt]}) нет. Нажмите «Собрать сейчас» или пришлите ссылку.")
-    await cards.send_card(bot, post)
+    if post:
+        return await cards.send_card(bot, post)
+    other = "mini" if fmt == "std" else "std"
+    n = await db.count_ready(other)
+    text = f"Готовых постов ({cards.FORMAT_LABEL[fmt]}) нет."
+    if n:
+        text += (f"\n\nНо в очереди есть {n} — {cards.FORMAT_LABEL[other]}. "
+                 f"Возьмите такой пост и нажмите на карточке «↔️», чтобы сменить формат.")
+    else:
+        text += "\n\nНажмите «🔄 Собрать сейчас» или пришлите ссылку — соберу пост из неё."
+    err = await db.get_setting("api_error")
+    if err:
+        text += f"\n\n⚠️ {err['text']}"
+    await msg.answer(text)
 
 
 async def run_collect(msg: Message) -> None:
     wait = await msg.answer("Собираю…")
-    added = await sources.collect_all()
-    processed = await pipeline.process_new()
+    try:
+        added = await sources.collect_all()
+        processed, note = await pipeline.process_new()
+    except Exception as exc:
+        log.exception("collect")
+        return await wait.edit_text(curator.explain(exc))
     s = (await db.stats())["ready_by_format"]
-    await wait.edit_text(f"Новых материалов: {added}\nОбработано: {processed}\n"
-                         f"Готово: стандарт {s.get('std', 0)} · мини {s.get('mini', 0)}")
+    text = (f"Новых материалов: {added}\nОценено: {processed}\n"
+            f"Готово: стандарт {s.get('std', 0)} · мини {s.get('mini', 0)}")
+    if note:
+        text += f"\n\n⚠️ {note}"
+    elif processed and not s.get("std", 0) and not s.get("mini", 0):
+        text += "\n\nНичего не набрало проходной балл — обычное дело при строгом отборе."
+    await wait.edit_text(text)
 
 
 async def sources_view() -> tuple[str, InlineKeyboardMarkup]:
@@ -203,6 +224,36 @@ async def cmd_collect(msg: Message):
 @router.message(Command("stats"))
 async def cmd_stats(msg: Message):
     await msg.answer(await reports.stats_text())
+
+
+@router.message(Command("diag"))
+async def cmd_diag(msg: Message):
+    """Короткая самопроверка: диск, база, доступ к Claude."""
+    wait = await msg.answer("Проверяю…")
+    lines = []
+    try:
+        config.IMG_DIR.mkdir(parents=True, exist_ok=True)
+        probe = config.DATA_DIR / ".probe"
+        probe.write_text("ok")
+        probe.unlink()
+        size = config.DB_PATH.stat().st_size // 1024 if config.DB_PATH.exists() else 0
+        folders = len(list(config.IMG_DIR.glob("*"))) if config.IMG_DIR.exists() else 0
+        lines.append(f"💾 Диск {config.DATA_DIR}: доступен · база {size} КБ · папок с фото {folders}")
+    except Exception as exc:
+        lines.append(f"💾 Диск {config.DATA_DIR}: ❌ {exc!r}\nПроверьте volume в настройках Railway.")
+    missing = 0
+    for p in await db.ready_posts():
+        imgs = json.loads(p["images"] or "[]")
+        if imgs and not all(Path(x).exists() for x in imgs):
+            missing += 1
+    lines.append(f"🖼 Постов в очереди с пропавшими фото: {missing}")
+    try:
+        await curator.ping()
+        lines.append("🤖 Claude: отвечает")
+    except Exception as exc:
+        lines.append(f"🤖 Claude: ❌ {curator.explain(exc)}")
+    lines.append(f"📊 Вызовов сегодня: {await db.calls_today()}/{config.DAILY_API_CALLS_MAX}")
+    await wait.edit_text("\n\n".join(lines))
 
 
 @router.message(Command("purge"))
@@ -528,7 +579,7 @@ async def on_rewrite_comment(msg: Message, state: FSMContext, bot: Bot):
         await wait.edit_text("Готово, карточка обновлена ↑")
     except Exception as exc:
         log.exception("rewrite")
-        await wait.edit_text(f"Не получилось: {exc!r}")
+        await wait.edit_text(curator.explain(exc))
 
 
 # ======================= источники: добавить RSS =======================
@@ -562,7 +613,7 @@ async def on_link(msg: Message, bot: Bot):
         pid, note = await pipeline.process_link(url)
     except Exception as exc:
         log.exception("link")
-        return await wait.edit_text(f"Не получилось: {exc!r}")
+        return await wait.edit_text(curator.explain(exc))
     if not pid:
         return await wait.edit_text(f"Пост не собрался: {note}")
     await cards.send_card(bot, await db.get_post(pid))

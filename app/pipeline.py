@@ -3,6 +3,7 @@
 import json
 import logging
 import shutil
+from pathlib import Path
 
 import httpx
 
@@ -78,9 +79,9 @@ async def process_candidate(client: httpx.AsyncClient, cand, force: bool = False
         )
         await db.mark_candidate(cid, "processed", f"в очереди {score} ({fmt})")
         return pid, "ok"
-    except curator.BudgetExceeded:
+    except (curator.BudgetExceeded, curator.NoCredits, curator.ApiDown):
         shutil.rmtree(folder, ignore_errors=True)
-        return None, "лимит API"          # кандидат остаётся new — обработаем завтра
+        raise                             # кандидат остаётся new — вернёмся к нему позже
     except Exception as exc:
         log.exception("Кандидат %s упал", cid)
         await db.mark_candidate(cid, "error", repr(exc))
@@ -88,20 +89,28 @@ async def process_candidate(client: httpx.AsyncClient, cand, force: bool = False
         return None, f"ошибка: {exc!r}"
 
 
-async def process_new() -> int:
-    if await db.count_ready() >= config.MAX_READY_QUEUE:
-        log.info("Очередь полна, обработку пропускаем")
-        return 0
+async def process_new() -> tuple[int, str]:
+    """→ (сколько обработано, пояснение для чата)."""
+    ready_now = await db.count_ready()
+    if ready_now >= config.MAX_READY_QUEUE:
+        return 0, f"очередь полна ({ready_now}) — обработку пропустил"
     cands = await db.new_candidates(config.MAX_PER_RUN, {"met": config.MET_PER_RUN}, skip=await sources.disabled())
+    if not cands:
+        return 0, "новых материалов для оценки нет"
     done = 0
     async with httpx.AsyncClient(headers={"User-Agent": config.USER_AGENT}) as client:
         for c in cands:
             if await db.calls_today() >= config.DAILY_API_CALLS_MAX:
-                log.info("Дневной лимит вызовов Claude — обработка остановлена")
-                break
-            await process_candidate(client, c)
+                await db.set_setting("api_error", {"at": db.now(), "text": curator.explain(curator.BudgetExceeded())})
+                return done, f"дневной лимит Claude исчерпан на {done}-м материале"
+            try:
+                await process_candidate(client, c)
+            except (curator.NoCredits, curator.ApiDown) as exc:
+                await db.set_setting("api_error", {"at": db.now(), "text": curator.explain(exc)})
+                return done, curator.explain(exc)
             done += 1
-    return done
+    await db.set_setting("api_error", None)   # дошли до конца — прошлая ошибка неактуальна
+    return done, ""
 
 
 async def process_link(url: str) -> tuple[int | None, str]:
@@ -163,6 +172,16 @@ async def _to_mini(post) -> None:
     await db.update_post(post["id"], format="mini", data=data, caption=formatter.build_caption(data, "mini"))
 
 
+async def _files_ok(post) -> bool:
+    """Файлы фото на месте? Если volume отвалился, пост снимаем, а не падаем при отправке."""
+    images = json.loads(post["images"] or "[]")
+    if not images or all(Path(p).exists() for p in images):
+        return True
+    await db.update_post(post["id"], status="auto_rejected", reject_reason="файлы фото пропали с диска")
+    log.warning("Пост %s снят: файлов нет на диске", post["id"])
+    return False
+
+
 async def pick_next(fmt: str = "std", min_score: int = 0, clean_only: bool = False,
                     skip_sources: set[str] | None = None):
     """Лучший готовый пост нужного формата с поправкой на баланс рубрик за сегодня.
@@ -174,6 +193,7 @@ async def pick_next(fmt: str = "std", min_score: int = 0, clean_only: bool = Fal
         ready = std[4:] if len(std) > 6 else []   # лучшие четыре не трогаем
         converted = True
     ready = [p for p in ready if p["score"] >= min_score and p["source"] not in (skip_sources or set())]
+    ready = [p for p in ready if await _files_ok(p)]
     if clean_only:
         ready = [p for p in ready if not (json.loads(p["data"]).get("flags") or [])]
     if not ready:

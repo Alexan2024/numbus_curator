@@ -39,6 +39,9 @@ async def menu_text(day: int = 0) -> str:
         "",
         "<i>Нажмите на слот, чтобы управлять им. Ссылка в чат — пост из неё.</i>",
     ]
+    err = await db.get_setting("api_error")
+    if err:
+        lines.insert(1, f"⚠️ {err['text']}")
     return "\n".join(lines)
 
 

@@ -61,7 +61,7 @@ MET_DAILY_MAX = int(os.getenv("MET_DAILY_MAX", "2"))   # сколько карт
 # Фото
 MIN_LONG_SIDE = int(os.getenv("MIN_LONG_SIDE", "1200"))
 MIN_SHORT_SIDE = int(os.getenv("MIN_SHORT_SIDE", "700"))
-MIN_PHOTOS_ARTICLE = int(os.getenv("MIN_PHOTOS_ARTICLE", "4"))   # для стандартного поста
+MIN_PHOTOS_ARTICLE = int(os.getenv("MIN_PHOTOS_ARTICLE", "3"))   # для стандартного поста
 MIN_PHOTOS_MINI = int(os.getenv("MIN_PHOTOS_MINI", "2"))         # для мини-поста
 MAX_PHOTOS = 10
 MINI_MAX_PHOTOS = int(os.getenv("MINI_MAX_PHOTOS", "4"))
