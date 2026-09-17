@@ -30,10 +30,10 @@ def _credit(label: str, name: str | None, url: str | None) -> str | None:
     return f"<i>{label}: {name_e}</i>"
 
 
-def normalize_tags(tags: list[str]) -> list[str]:
+def normalize_tags(tags: list[str], fmt: str = "std") -> list[str]:
     out = []
     for t in tags or []:
-        t = re.sub(r"[^a-z]", "", t.lower().lstrip("#"))
+        t = re.sub(r"[^a-z]", "", str(t).lower().lstrip("#"))
         if not t:
             continue
         if not t.startswith("ahmag"):
@@ -41,6 +41,9 @@ def normalize_tags(tags: list[str]) -> list[str]:
         t = TAG_FIX.get(t, t)
         if t not in out:
             out.append(t)
+    if fmt == "notes":
+        out = ["ahmagnotes"] + [t for t in out if t != "ahmagnotes"]
+        return out[:4]
     return out[:3]
 
 
@@ -48,12 +51,20 @@ def headline_parts(data: dict) -> list[str]:
     return [str(p).strip() for p in (data.get("headline_parts") or []) if p and str(p).strip().lower() != "null"]
 
 
-def build_caption(data: dict) -> str:
-    """Собирает подпись и заодно проставляет data['headline'] для истории."""
+def build_caption(data: dict, fmt: str = "std") -> str:
+    """Собирает подпись и заодно проставляет data['headline'] для истории.
+    std / notes — заголовок, текст, кредиты, теги; mini — заголовок, одна фраза (если есть), кредиты, теги."""
     parts = headline_parts(data)
     data["headline"] = " // ".join(parts)
     headline = " // ".join(html.escape(p, quote=False) for p in parts)
-    blocks = [f"<b>{headline}</b>", _safe_body(data.get("body", ""))]
+    blocks = [f"<b>{headline}</b>"] if headline else []
+
+    if fmt == "mini":
+        line = str(data.get("mini_line") or "").strip()
+        if line and line.lower() != "null":
+            blocks.append(_safe_body(line))
+    else:
+        blocks.append(_safe_body(data.get("body", "")))
 
     c = data.get("credits") or {}
     credits = [x for x in (
@@ -64,7 +75,7 @@ def build_caption(data: dict) -> str:
     if credits:
         blocks.append("\n".join(credits))
 
-    tags = normalize_tags(data.get("tags", []))
+    tags = normalize_tags(data.get("tags", []), fmt)
     if tags:
         blocks.append(" ".join("#" + t for t in tags))
     return "\n\n".join(b for b in blocks if b)
@@ -73,3 +84,32 @@ def build_caption(data: dict) -> str:
 def visible_len(caption: str) -> int:
     """Длина подписи без HTML-разметки — так её считает Telegram."""
     return len(html.unescape(re.sub(r"<[^>]+>", "", caption)))
+
+
+def plain_text(caption: str) -> str:
+    """Подпись без разметки — для Instagram."""
+    return html.unescape(re.sub(r"<[^>]+>", "", caption)).strip()
+
+
+def split_blocks(text: str, limit: int) -> list[str]:
+    """Режет длинный HTML-текст по абзацам, чтобы каждый кусок влезал в сообщение."""
+    chunks, cur = [], ""
+    for block in text.split("\n\n"):
+        candidate = f"{cur}\n\n{block}" if cur else block
+        if visible_len(candidate) <= limit:
+            cur = candidate
+        else:
+            if cur:
+                chunks.append(cur)
+            cur = block
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def clip_blocks(text: str, budget: int) -> tuple[str, bool]:
+    """Первые абзацы, которые влезают в budget видимых знаков. → (текст, обрезано ли)"""
+    chunks = split_blocks(text, max(budget, 200))
+    if len(chunks) <= 1 and visible_len(text) <= budget:
+        return text, False
+    return chunks[0], True

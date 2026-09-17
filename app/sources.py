@@ -1,6 +1,6 @@
 """Сбор кандидатов из источников. Каждый источник возвращает список словарей
-{url, title, source, payload}. Добавить источник = добавить строку в FEEDS
-или функцию в COLLECTORS."""
+{url, title, source, payload}. Добавить RSS можно из меню бота (📡 Источники)
+или строкой в FEEDS; другой тип источника — функцией в COLLECTORS."""
 import asyncio
 import logging
 import random
@@ -29,6 +29,19 @@ MET_QUERIES = [
 ]
 
 
+async def all_feeds() -> dict[str, str]:
+    """Встроенные RSS + добавленные из бота."""
+    return {**FEEDS, **(await db.get_setting("custom_feeds", {}))}
+
+
+async def disabled() -> set[str]:
+    return set(await db.get_setting("disabled_sources", []))
+
+
+async def source_names() -> list[str]:
+    return [*(await all_feeds()), "met"]
+
+
 async def _get(client: httpx.AsyncClient, url: str, **kw) -> httpx.Response:
     r = await client.get(url, timeout=30, follow_redirects=True, **kw)
     r.raise_for_status()
@@ -37,7 +50,10 @@ async def _get(client: httpx.AsyncClient, url: str, **kw) -> httpx.Response:
 
 async def collect_rss(client: httpx.AsyncClient) -> list[dict]:
     items = []
-    for name, url in FEEDS.items():
+    off = await disabled()
+    for name, url in (await all_feeds()).items():
+        if name in off:
+            continue
         try:
             r = await _get(client, url)
             feed = feedparser.parse(r.content)
@@ -53,7 +69,16 @@ async def collect_rss(client: httpx.AsyncClient) -> list[dict]:
     return items
 
 
+async def check_feed(url: str) -> int:
+    """Сколько записей отдаёт RSS — проверка перед добавлением."""
+    async with httpx.AsyncClient(headers={"User-Agent": config.USER_AGENT}) as client:
+        r = await _get(client, url)
+    return len(feedparser.parse(r.content).entries)
+
+
 async def collect_met(client: httpx.AsyncClient, n_queries: int = 2, per_query: int = 2) -> list[dict]:
+    if "met" in await disabled():
+        return []
     base = "https://collectionapi.metmuseum.org/public/collection/v1"
     items = []
     for q in random.sample(MET_QUERIES, n_queries):
