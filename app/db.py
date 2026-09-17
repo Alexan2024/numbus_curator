@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS posts (
     reject_reason TEXT,
     card_chat_id INTEGER,
     card_msg_id INTEGER,
+    album_msg_id INTEGER,
     created_at TEXT NOT NULL,
     sent_at TEXT,
     decided_at TEXT
@@ -63,6 +64,11 @@ async def connect():
 async def init() -> None:
     async with connect() as db:
         await db.executescript(SCHEMA)
+        # миграция для баз, созданных первой версией
+        cur = await db.execute("PRAGMA table_info(posts)")
+        cols = {r["name"] for r in await cur.fetchall()}
+        if "album_msg_id" not in cols:
+            await db.execute("ALTER TABLE posts ADD COLUMN album_msg_id INTEGER")
         await db.commit()
 
 
@@ -78,12 +84,23 @@ async def add_candidate(url: str, source: str, title: str, payload: dict | None 
         return cur.rowcount > 0
 
 
-async def new_candidates(limit: int) -> list[aiosqlite.Row]:
+async def new_candidates(limit: int, per_source: dict[str, int]) -> list[aiosqlite.Row]:
+    """Свежие кандидаты вперемешку по источникам, с лимитом на каждый источник."""
     async with connect() as db:
-        cur = await db.execute(
-            "SELECT * FROM candidates WHERE status='new' ORDER BY id DESC LIMIT ?", (limit,)
-        )
-        return await cur.fetchall()
+        cur = await db.execute("SELECT * FROM candidates WHERE status='new' ORDER BY id DESC")
+        rows = await cur.fetchall()
+    buckets: dict[str, list] = {}
+    for r in rows:
+        buckets.setdefault(r["source"], []).append(r)
+    for src, cap in per_source.items():
+        if src in buckets:
+            buckets[src] = buckets[src][:cap]
+    out = []
+    while len(out) < limit and any(buckets.values()):
+        for src in list(buckets):
+            if buckets[src] and len(out) < limit:
+                out.append(buckets[src].pop(0))
+    return out
 
 
 async def mark_candidate(cid: int, status: str, note: str = "") -> None:
@@ -138,7 +155,7 @@ async def count_ready() -> int:
 async def sent_today() -> list[aiosqlite.Row]:
     async with connect() as db:
         cur = await db.execute(
-            "SELECT category FROM posts WHERE sent_at >= ?", (today_start(),)
+            "SELECT category, source FROM posts WHERE sent_at >= ?", (today_start(),)
         )
         return await cur.fetchall()
 
@@ -172,10 +189,24 @@ async def recent_headlines(days: int = 60) -> list[str]:
     return [json.loads(r["data"]).get("headline", "") for r in rows]
 
 
+async def purge_ready(source: str) -> int:
+    async with connect() as db:
+        cur = await db.execute(
+            "UPDATE posts SET status='auto_rejected', reject_reason='очищено вручную' "
+            "WHERE status='ready' AND source=?", (source,))
+        await db.commit()
+        return cur.rowcount
+
+
 async def stats() -> dict:
     async with connect() as db:
+        cur = await db.execute("SELECT source, COUNT(*) c FROM posts WHERE status='ready' GROUP BY source")
+        ready_by_source = {r["source"]: r["c"] for r in await cur.fetchall()}
+        cur = await db.execute("SELECT source, COUNT(*) c FROM candidates WHERE status='new' GROUP BY source")
+        new_by_source = {r["source"]: r["c"] for r in await cur.fetchall()}
         cur = await db.execute("SELECT status, COUNT(*) c FROM posts GROUP BY status")
         posts = {r["status"]: r["c"] for r in await cur.fetchall()}
         cur = await db.execute("SELECT status, COUNT(*) c FROM candidates GROUP BY status")
         cands = {r["status"]: r["c"] for r in await cur.fetchall()}
-    return {"posts": posts, "candidates": cands}
+    return {"posts": posts, "candidates": cands,
+            "ready_by_source": ready_by_source, "new_by_source": new_by_source}

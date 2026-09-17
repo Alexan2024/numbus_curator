@@ -23,6 +23,10 @@ MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "12"))
 MAX_READY_QUEUE = int(os.getenv("MAX_READY_QUEUE", "40"))
 DELIVERY_HOURS = [int(h) for h in os.getenv("DELIVERY_HOURS", "10,14,19").split(",")]
 
+# Музейный open access — приправа, а не основа ленты
+MET_PER_RUN = int(os.getenv("MET_PER_RUN", "2"))       # сколько объектов Met оценивать за проход
+MET_DAILY_MAX = int(os.getenv("MET_DAILY_MAX", "2"))   # сколько карточек Met в день
+
 # Фото
 MIN_LONG_SIDE = int(os.getenv("MIN_LONG_SIDE", "1200"))
 MIN_SHORT_SIDE = int(os.getenv("MIN_SHORT_SIDE", "700"))

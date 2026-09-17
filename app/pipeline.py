@@ -70,7 +70,7 @@ async def process_new() -> int:
     if await db.count_ready() >= config.MAX_READY_QUEUE:
         log.info("Очередь полна, обработку пропускаем")
         return 0
-    cands = await db.new_candidates(config.MAX_PER_RUN)
+    cands = await db.new_candidates(config.MAX_PER_RUN, {"met": config.MET_PER_RUN})
     async with httpx.AsyncClient(headers={"User-Agent": config.USER_AGENT}) as client:
         for c in cands:
             await process_candidate(client, c)
@@ -82,8 +82,14 @@ async def pick_next():
     ready = await db.ready_posts()
     if not ready:
         return None
-    sent = [r["category"] for r in await db.sent_today()]
+    today = await db.sent_today()
+    sent = [r["category"] for r in today]
     total = len(sent) + 1
+    met_sent = sum(1 for r in today if r["source"] == "met")
+    if met_sent >= config.MET_DAILY_MAX:
+        ready = [p for p in ready if p["source"] != "met"]
+        if not ready:
+            return None
 
     def weight(p):
         share = sent.count(p["category"]) / total

@@ -53,7 +53,7 @@ async def collect_rss(client: httpx.AsyncClient) -> list[dict]:
     return items
 
 
-async def collect_met(client: httpx.AsyncClient, n_queries: int = 3, per_query: int = 4) -> list[dict]:
+async def collect_met(client: httpx.AsyncClient, n_queries: int = 2, per_query: int = 2) -> list[dict]:
     base = "https://collectionapi.metmuseum.org/public/collection/v1"
     items = []
     for q in random.sample(MET_QUERIES, n_queries):
