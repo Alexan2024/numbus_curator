@@ -1,4 +1,4 @@
-"""#ahmagnotes по запросу: темы → сбор материала → план на утверждение → текст → обычная карточка."""
+"""#ahmagnotes по запросу: темы → сбор материала → план на утверждение → текст → входящие."""
 import html
 import json
 import logging
@@ -8,7 +8,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from app import cards, config, curator, db, pipeline
+from app import config, curator, db, pipeline, screen, slots
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -32,7 +32,7 @@ async def propose(msg: Message) -> None:
         topics = await curator.notes_topics(avoid)
     except Exception as exc:
         log.exception("notes_topics")
-        return await wait.edit_text(f"Не получилось: {exc!r}")
+        return await wait.edit_text(curator.explain(exc))
     if not topics:
         return await wait.edit_text("Темы не придумались. Попробуйте ещё раз или задайте свою.")
     await db.set_setting("notes_topics", topics)
@@ -68,7 +68,7 @@ async def research(msg: Message, topic: str, angle: str = "") -> None:
         await wait.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
     except Exception as exc:
         log.exception("notes_research")
-        await wait.edit_text(f"Не получилось собрать материал: {exc!r}")
+        await wait.edit_text(f"Не получилось собрать материал. {curator.explain(exc)}")
 
 
 @router.callback_query(F.data.startswith("nt:"))
@@ -108,16 +108,16 @@ async def on_plan(cb: CallbackQuery, state: FSMContext, bot: Bot):
         await state.set_state(Notes.plan)
         await state.update_data(nid=nid, msg_id=cb.message.message_id)
         return await cb.message.answer("Что поменять в плане или в главной мысли? /cancel — отмена.")
-    # write
     await cb.message.edit_reply_markup(reply_markup=None)
     wait = await cb.message.answer("Подбираю фото и пишу заметку…")
     try:
         pid = await pipeline.build_notes_post(nid)
-        await cards.send_card(bot, await db.get_post(pid))
+        await slots.propose(pid, None)
         await wait.delete()
+        await screen.move_down(bot, "list", mode="inbox", pid=pid)
     except Exception as exc:
         log.exception("notes write")
-        await wait.edit_text(f"Не получилось: {exc!r}")
+        await wait.edit_text(f"Не получилось. {curator.explain(exc)}")
 
 
 @router.message(Notes.plan, F.text, ~F.text.startswith("/"))
@@ -133,4 +133,4 @@ async def on_plan_comment(msg: Message, state: FSMContext):
         await wait.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
     except Exception as exc:
         log.exception("notes_replan")
-        await wait.edit_text(f"Не получилось: {exc!r}")
+        await wait.edit_text(f"Не получилось. {curator.explain(exc)}")

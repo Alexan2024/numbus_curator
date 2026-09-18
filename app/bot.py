@@ -1,29 +1,24 @@
+"""Кнопки и команды. Всё управление — на одном экране (app/screen.py):
+h:… — пульт и его разделы, v:… — действия с постом, n:… — кнопки уведомлений."""
+import asyncio
 import json
 import logging
 import re
 from pathlib import Path
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, Message
 
-from app import cards, config, curator, db, formatter, notes, pipeline, reports, slots, sources
+from app import cards, config, curator, db, formatter, notes, pipeline, screen, slots, sources, voice
 
 log = logging.getLogger(__name__)
 router = Router()
 router.message.filter(F.from_user.id == config.ADMIN_ID)
 router.callback_query.filter(F.from_user.id == config.ADMIN_ID)
 
-REJECT_REASONS = {
-    "taste": "не мой вкус",
-    "photo": "слабые фото",
-    "dup": "уже было",
-    "topic": "не та тема",
-    "text": "плохой текст",
-}
 URL_RE = re.compile(r"https?://\S+")
 NOT_COMMAND = ~F.text.startswith("/")
 
@@ -31,204 +26,85 @@ NOT_COMMAND = ~F.text.startswith("/")
 class Edit(StatesGroup):
     text = State()
     rewrite = State()
+    ban = State()
 
 
 class Src(StatesGroup):
     add = State()
 
 
-def _btn(text: str, data: str) -> InlineKeyboardButton:
-    return InlineKeyboardButton(text=text, callback_data=data)
+class VoiceAdd(StatesGroup):
+    phrase = State()
 
 
-def _pid(cb: CallbackQuery) -> int:
-    return int(cb.data.split(":")[1])
+def _parts(cb: CallbackQuery) -> list[str]:
+    return cb.data.split(":")
 
 
-# ======================= меню =======================
-
-async def kb_menu(day: int = 0) -> InlineKeyboardMarkup:
-    md, is_paused = await slots.mode(), await slots.paused()
-
-    def mode_btn(key: str, label: str) -> InlineKeyboardButton:
-        return _btn(("● " if md == key else "") + label, f"m:mode:{key}")
-
-    state = await slots.day_state(day)
-    slot_btns = [_btn(f"{x['dt']:%H:%M} {slots.ICON[x['state']]}", f"sl:{slots.enc(x['key'])}") for x in state]
-    slot_rows = [slot_btns[i:i + 4] for i in range(0, len(slot_btns), 4)]
-    return InlineKeyboardMarkup(inline_keyboard=[
-        *slot_rows,
-        [_btn("Завтра ▸" if day == 0 else "◂ Сегодня", f"m:day:{1 - day}"), _btn("🔄 Обновить", f"m:day:{day}")],
-        [mode_btn("manual", "✋ Ручной"), mode_btn("semi", "🤝 Полуавто"), mode_btn("auto", "🤖 Авто")],
-        [_btn("▶️ Следующий пост", "m:next:std"), _btn("▫️ Мини-пост", "m:next:mini")],
-        [_btn("📝 #ahmagnotes", "m:notes"), _btn("🔄 Собрать сейчас", "m:collect")],
-        [_btn("📊 Статистика", "m:stats"), _btn("📈 Итоги недели", "m:digest")],
-        [_btn("📡 Источники", "m:src"), _btn("▶️ Снять с паузы" if is_paused else "⏸ Пауза", "m:pause")],
-    ])
-
-
-KB_HOME = InlineKeyboardMarkup(inline_keyboard=[[_btn("← Меню", "m:home")]])
-
-
-async def show_menu(msg: Message, edit: bool = False, day: int = 0) -> None:
-    text, kb = await reports.menu_text(day), await kb_menu(day)
-    if edit:
+def _background(bot: Bot, coro, what: str) -> None:
+    """Долгое дело — в фоне, ошибка приходит сообщением."""
+    async def run():
         try:
-            return await msg.edit_text(text, reply_markup=kb)
-        except TelegramBadRequest as exc:
-            if "not modified" in str(exc):
-                return
-    await msg.answer(text, reply_markup=kb)
+            await coro
+        except Exception as exc:
+            log.exception(what)
+            await screen.notify(bot, f"⚠️ {what}: {curator.explain(exc)}"[:900])
+    asyncio.create_task(run())
 
 
-async def send_next(msg: Message, bot: Bot, fmt: str) -> None:
-    post = await pipeline.pick_next(fmt)
-    if post:
-        return await cards.send_card(bot, post)
-    other = "mini" if fmt == "std" else "std"
-    n = await db.count_ready(other)
-    text = f"Готовых постов ({cards.FORMAT_LABEL[fmt]}) нет."
-    if n:
-        text += (f"\n\nНо в очереди есть {n} — {cards.FORMAT_LABEL[other]}. "
-                 f"Возьмите такой пост и нажмите на карточке «↔️», чтобы сменить формат.")
-    else:
-        text += "\n\nНажмите «🔄 Собрать сейчас» или пришлите ссылку — соберу пост из неё."
-    err = await db.get_setting("api_error")
-    if err:
-        text += f"\n\n⚠️ {err['text']}"
-    await msg.answer(text)
+async def _drop(bot: Bot, *ids) -> None:
+    for mid in ids:
+        if mid:
+            try:
+                await bot.delete_message(config.ADMIN_ID, mid)
+            except Exception:
+                pass
 
 
-async def run_collect(msg: Message) -> None:
-    wait = await msg.answer("Собираю…")
-    try:
-        added = await sources.collect_all()
-        processed, note = await pipeline.process_new()
-    except Exception as exc:
-        log.exception("collect")
-        return await wait.edit_text(curator.explain(exc))
-    s = (await db.stats())["ready_by_format"]
-    text = (f"Новых материалов: {added}\nОценено: {processed}\n"
-            f"Готово: стандарт {s.get('std', 0)} · мини {s.get('mini', 0)}")
-    if note:
-        text += f"\n\n⚠️ {note}"
-    elif processed and not s.get("std", 0) and not s.get("mini", 0):
-        text += "\n\nНичего не набрало проходной балл — обычное дело при строгом отборе."
-    await wait.edit_text(text)
-
-
-async def sources_view() -> tuple[str, InlineKeyboardMarkup]:
-    rows_data = await reports.sources_rows()
-    lines = ["<b>Источники</b> — доля одобренных вами постов"]
-    rows = []
-    for name, on, rate in rows_data:
-        lines.append(f"{'🟢' if on else '⚪️'} {name}: {rate}")
-        rows.append([_btn(f"{'Выключить' if on else 'Включить'} {name}", f"src:t:{name}")])
-    rows.append([_btn("➕ Добавить RSS", "src:add"), _btn("← Меню", "m:home")])
-    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@router.callback_query(F.data.startswith("m:"))
-async def on_menu(cb: CallbackQuery, bot: Bot):
-    parts = cb.data.split(":")
-    action = parts[1]
-    if action == "home":
-        await cb.answer()
-        return await show_menu(cb.message, edit=True)
-    if action == "day":
-        await cb.answer("Обновлено")
-        return await show_menu(cb.message, edit=True, day=int(parts[2]))
-    if action == "mode":
-        await db.set_setting("mode", parts[2])
-        hints = {
-            "manual": "Ручной: присылаю карточки, решаете вы",
-            "semi": f"Полуавтомат: за {config.SLOT_LEAD_MIN} мин до слота пришлю варианты",
-            "auto": f"Автомат: анонс за {config.SLOT_LEAD_MIN} мин, публикую сам от {config.AUTO_MIN_SCORE}/10",
-        }
-        await cb.answer(hints[parts[2]], show_alert=True)
-        return await show_menu(cb.message, edit=True)
-    if action == "pause":
-        now_paused = not await slots.paused()
-        await db.set_setting("paused", now_paused)
-        if not now_paused:
-            await slots.reschedule(bot)   # посты, чей слот прошёл за время паузы, — в ближайшие свободные
-        await cb.answer("Пауза: ничего не публикую и не присылаю" if now_paused else "Работаю", show_alert=now_paused)
-        return await show_menu(cb.message, edit=True)
-    await cb.answer()
-    if action == "next":
-        return await send_next(cb.message, bot, parts[2])
-    if action == "notes":
-        return await notes.propose(cb.message)
-    if action == "collect":
-        return await run_collect(cb.message)
-    if action == "stats":
-        return await cb.message.edit_text(await reports.stats_text(), reply_markup=KB_HOME)
-    if action == "digest":
-        return await cb.message.edit_text(await reports.digest_text(), reply_markup=KB_HOME)
-    if action == "src":
-        text, kb = await sources_view()
-        return await cb.message.edit_text(text, reply_markup=kb)
-
-
-@router.callback_query(F.data.startswith("src:"))
-async def on_sources(cb: CallbackQuery, state: FSMContext):
-    parts = cb.data.split(":", 2)
-    if parts[1] == "add":
-        await state.set_state(Src.add)
-        await cb.answer()
-        return await cb.message.answer(
-            "Пришлите строкой: <code>имя https://адрес-rss</code>\nИмя — латиницей, до 20 знаков. /cancel — отмена.")
-    name = parts[2]
-    off = await sources.disabled()
-    if name in off:
-        off.discard(name)
-        await cb.answer(f"{name} включён")
-    else:
-        off.add(name)
-        purged = await db.purge_ready(name)
-        await cb.answer(f"{name} выключен" + (f", из очереди убрано {purged}" if purged else ""), show_alert=bool(purged))
-    await db.set_setting("disabled_sources", sorted(off))
-    text, kb = await sources_view()
-    await cb.message.edit_text(text, reply_markup=kb)
+async def _list(bot: Bot, **arg) -> None:
+    """Показать пост на экране в текущем режиме просмотра (или в указанном)."""
+    view, cur = await screen.current()
+    base = cur if view == "list" else {"mode": "one"}
+    await screen.show(bot, "list", **{**base, "kb": None, **arg})
 
 
 # ======================= команды =======================
 
 @router.message(Command("start", "help", "menu"))
-async def cmd_start(msg: Message, state: FSMContext):
+async def cmd_start(msg: Message, state: FSMContext, bot: Bot):
     await state.clear()
-    await show_menu(msg)
-
-
-@router.message(Command("cancel"))
-async def cmd_cancel(msg: Message, state: FSMContext):
-    await state.clear()
-    await msg.answer("Отменено.")
+    await _drop(bot, msg.message_id)
+    await screen.move_down(bot, "home")
 
 
 @router.message(Command("next"))
 async def cmd_next(msg: Message, bot: Bot):
-    await send_next(msg, bot, "std")
-
-
-@router.message(Command("mini"))
-async def cmd_mini(msg: Message, bot: Bot):
-    await send_next(msg, bot, "mini")
-
-
-@router.message(Command("collect"))
-async def cmd_collect(msg: Message):
-    await run_collect(msg)
+    await _drop(bot, msg.message_id)
+    await screen.move_down(bot, "next", fmt="mini")
 
 
 @router.message(Command("stats"))
-async def cmd_stats(msg: Message):
-    await msg.answer(await reports.stats_text())
+async def cmd_stats(msg: Message, bot: Bot):
+    await _drop(bot, msg.message_id)
+    await screen.move_down(bot, "stats")
+
+
+@router.message(Command("collect"))
+async def cmd_collect(msg: Message, bot: Bot):
+    await _drop(bot, msg.message_id)
+    _background(bot, _collect(bot), "Сбор")
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(msg: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    await state.clear()
+    await _drop(bot, msg.message_id, data.get("prompt"))
 
 
 @router.message(Command("diag"))
 async def cmd_diag(msg: Message):
-    """Короткая самопроверка: диск, база, доступ к Claude."""
+    """Короткая самопроверка: диск, база, доступ к Claude, пакеты, расход."""
     wait = await msg.answer("Проверяю…")
     lines = []
     try:
@@ -241,366 +117,515 @@ async def cmd_diag(msg: Message):
         lines.append(f"💾 Диск {config.DATA_DIR}: доступен · база {size} КБ · папок с фото {folders}")
     except Exception as exc:
         lines.append(f"💾 Диск {config.DATA_DIR}: ❌ {exc!r}\nПроверьте volume в настройках Railway.")
-    missing = 0
-    for p in await db.ready_posts():
-        imgs = json.loads(p["images"] or "[]")
-        if imgs and not all(Path(x).exists() for x in imgs):
-            missing += 1
-    lines.append(f"🖼 Постов в очереди с пропавшими фото: {missing}")
+    missing = sum(1 for p in await db.ready_posts()
+                  if json.loads(p["images"] or "[]") and not all(Path(x).exists() for x in json.loads(p["images"])))
+    lines.append(f"🖼 Постов в запасе с пропавшими фото: {missing}")
     try:
         await curator.ping()
         lines.append("🤖 Claude: отвечает")
     except Exception as exc:
         lines.append(f"🤖 Claude: ❌ {curator.explain(exc)}")
-    lines.append(f"📊 Вызовов сегодня: {await db.calls_today()}/{config.DAILY_API_CALLS_MAX}")
+    batches = await db.open_batches()
+    lines.append(f"📦 Пакетов на оценке: {len(batches)}" + (f" (старейший с {batches[0]['created_at'][5:16]})" if batches else ""))
+    lines.append(f"💵 Сегодня ${await db.cost_today():.2f}, из них фоном ${await db.cost_today(True):.2f} "
+                 f"из ${config.DAILY_BUDGET_USD:.2f} · вызовов {await db.calls_today()}")
+    lines.append(f"🧠 Модели: оценка {config.CLAUDE_MODEL} · фильтр {config.TRIAGE_MODEL} · тексты {config.WRITER_MODEL}")
     await wait.edit_text("\n\n".join(lines))
 
 
 @router.message(Command("purge"))
-async def cmd_purge(msg: Message, command: CommandObject):
+async def cmd_purge(msg: Message, command: CommandObject, bot: Bot):
     source = (command.args or "").strip().lower()
     if not source:
         return await msg.answer("Укажите источник: /purge met")
     n = await db.purge_ready(source)
-    await msg.answer(f"Убрано из очереди: {n} ({source})")
+    await msg.answer(f"Убрано из запаса: {n} ({source})")
+    screen.refresh_soon(bot)
 
 
-# ======================= кнопки карточки =======================
+# ======================= пульт и разделы =======================
 
-@router.callback_query(F.data.startswith("pub:"))
-async def on_publish(cb: CallbackQuery, bot: Bot):
-    try:
-        ok = await cards.publish_post(bot, _pid(cb))
-    except Exception as exc:
-        log.exception("publish")
-        return await cb.answer(f"Не вышло: {exc!r}"[:190], show_alert=True)
-    await cb.answer("Опубликовано" if ok else "Уже опубликовано")
-
-
-async def _put_in_slot(bot: Bot, pid: int, key: str) -> None:
-    await db.update_post(pid, status="approved", decided_at=db.now(), slot_key=key)
-    await cards.refresh_card(bot, pid)
-
-
-@router.callback_query(F.data.startswith("slot:"))
-async def on_slot(cb: CallbackQuery, bot: Bot):
-    """Одно нажатие: слот, к которому пост предложен, иначе ближайший свободный его формата."""
-    pid = _pid(cb)
-    post = await db.get_post(pid)
-    if post["status"] not in ("sent", "announced"):
-        return await cb.answer("Этот пост уже не на модерации")
-    offered = post["slot_key"]
-    if post["status"] == "announced" and offered and slots.key_dt(offered) > slots._now():
-        key = offered                      # автопост → подтверждённый пост в том же слоте
-    elif offered and await slots.is_free(offered):
-        key = offered
-    else:
-        key = await slots.next_free(post["format"])
-    if not key:
-        return await cb.answer("Свободных слотов этого формата нет. Выберите слот вручную.", show_alert=True)
-    await _put_in_slot(bot, pid, key)
-    note = " (сейчас пауза)" if await slots.paused() else ""
-    await cb.answer(f"Выйдет {slots.human_key(key)}{note}", show_alert=bool(note))
+async def _collect(bot: Bot) -> None:
+    s = await pipeline.run_collection(manual=True)
+    stock = sum(sum(v.values()) for v in (await db.stock_counts()).values())
+    lines = [f"🔎 Сбор: новых {s['added']}, отсеяно по заголовку и дублям {s['dropped'] + s['dups']}, "
+             f"фильтр пропустил {s['yes']} из {s['yes'] + s['no']}."]
+    if s["queued"]:
+        lines.append(f"⏳ На оценке: {s['queued']}. Готовые посты появятся в запасе обычно в течение часа, "
+                     "иногда дольше (пакетная оценка вдвое дешевле).")
+    if s["made"]:
+        lines.append(f"📦 Сразу в запас: +{s['made']}.")
+    if s["note"]:
+        lines.append(f"ℹ️ {s['note']}")
+    lines.append(f"📦 В запасе сейчас: {stock}")
+    await screen.notify(bot, "\n".join(lines), [("🏠 Экран", "n:home")])
+    screen.refresh_soon(bot)
 
 
-@router.callback_query(F.data.startswith("pick:"))
-async def on_pick(cb: CallbackQuery):
-    """Список слотов: свободные — поставить; занятые (для уже стоящего поста) — поменяться местами."""
-    pid = _pid(cb)
-    post = await db.get_post(pid)
-    if post["status"] not in ("sent", "approved", "announced"):
-        return await cb.answer("Этот пост уже не на модерации")
-    rows = []
-    for key, fmt in await slots.free_slots(None, limit=8):
-        mark = "" if fmt == post["format"] else " ≠"
-        rows.append([_btn(f"{slots.human_key(key)} · {slots.SHORT[fmt]}{mark}", f"ps:{pid}:{slots.enc(key)}")])
-    if post["status"] == "approved":
-        for other in await db.approved_posts():
-            if other["id"] != pid and other["slot_key"] and slots.key_dt(other["slot_key"]) > slots._now():
-                rows.append([_btn(f"⇄ {slots.human_key(other['slot_key'])} · {slots.headline(other, 24)}",
-                                  f"ps:{pid}:{slots.enc(other['slot_key'])}")])
-    rows.append([_btn("← Назад", f"back:{pid}")])
-    await cb.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await cb.answer("≠ — слот другого формата" if any("≠" in r[0].text for r in rows) else None)
+@router.callback_query(F.data.startswith("h:"))
+async def on_home(cb: CallbackQuery, bot: Bot, state: FSMContext):
+    await screen.adopt(cb.message)
+    p = _parts(cb)
+    action = p[1]
 
+    if action == "home":
+        await cb.answer()
+        return await screen.show(bot, "home", day=0)
+    if action == "day":
+        await cb.answer("Обновлено")
+        return await screen.show(bot, "home", day=int(p[2]))
+    if action == "mode":
+        await db.set_setting("mode", p[2])
+        hints = {
+            "manual": f"Ручной: в {', '.join(map(str, config.DELIVERY_HOURS))} ч кладу посты во входящие, решаешь ты",
+            "semi": f"Полуавтомат: в {config.PLAN_TIME[0]:02d}:{config.PLAN_TIME[1]:02d} собираю план на завтра — "
+                    "по посту на слот, ты одобряешь. Сейчас соберу план на остаток дня",
+            "auto": f"Автомат: анонс за {config.SLOT_LEAD_MIN} мин, публикую сам от {config.AUTO_MIN_SCORE}/10",
+        }
+        await cb.answer(hints[p[2]], show_alert=True)
+        await screen.show(bot, "home", day=0)
 
-@router.callback_query(F.data.startswith("ps:"))
-async def on_pick_slot(cb: CallbackQuery, bot: Bot):
-    _, pid, code = cb.data.split(":")
-    pid, key = int(pid), slots.dec(code)
-    post = await db.get_post(pid)
-    if post["status"] not in ("sent", "approved", "announced"):
-        return await cb.answer("Этот пост уже не на модерации")
-    if slots.key_dt(key) <= slots._now():
-        return await cb.answer("Этот слот уже прошёл", show_alert=True)
-    other = await db.approved_in_slot(key)
-    if other and other["id"] != pid:
-        if post["status"] != "approved" or not post["slot_key"]:
-            return await cb.answer("Слот уже занят", show_alert=True)
-        await db.update_post(other["id"], slot_key=post["slot_key"])      # меняемся местами
-        await cards.refresh_card(bot, other["id"], f"\n⇄ <i>Перенесён: {slots.human_key(post['slot_key'])}</i>")
-    elif not other and post["slot_key"] != key and not await slots.is_free(key):
-        return await cb.answer("Слот занят автопостом — сначала отмените его", show_alert=True)
-    await _put_in_slot(bot, pid, key)
-    await cb.answer(f"Выйдет {slots.human_key(key)}")
-
-
-@router.callback_query(F.data.startswith("unslot:"))
-async def on_unslot(cb: CallbackQuery, bot: Bot):
-    pid = _pid(cb)
-    post = await db.get_post(pid)
-    if post["status"] not in ("approved", "announced"):
-        return await cb.answer("Уже не в слоте")
-    await db.update_post(pid, status="sent", slot_key=None)
-    await cards.refresh_card(bot, pid, "\n\n↩️ <i>Снят с публикации — решение за вами</i>")
-    await cb.answer("Снял, слот свободен")
-
-
-# ======================= слот из меню =======================
-
-async def slot_view(key: str) -> tuple[str, InlineKeyboardMarkup]:
-    offset = (slots.key_dt(key).date() - slots._now().date()).days
-    state = next((x for x in await slots.day_state(offset) if x["key"] == key), None)
-    code, rows = slots.enc(key), []
-    if not state:
-        return "Такого слота в расписании нет.", KB_HOME
-    post, st = state["post"], state["state"]
-    text = f"<b>Слот {slots.human_key(key)}</b> · {cards.FORMAT_LABEL[state['fmt']]}\n{slots.ICON[st]} "
-    if st == "published":
-        text += f"Вышел: {slots.headline(post, 80)}"
-        link = cards.post_link(post)
-        if link:
-            rows.append([InlineKeyboardButton(text="Открыть в канале", url=link)])
-    elif st == "approved":
-        text += f"Стоит: {slots.headline(post, 80)}\n\nПеренести или поменять местами — кнопкой «🔀 Перенести» на карточке."
-        rows.append([_btn("👁 К карточке", f"sc:{post['id']}"), _btn("↩️ Освободить слот", f"su:{post['id']}:{code}")])
-    elif st == "announced":
-        text += f"Автопост: {slots.headline(post, 80)}\nВыйдет сам, если не отменить."
-        rows.append([_btn("👁 К карточке", f"sc:{post['id']}"), _btn("🚫 Отменить", f"su:{post['id']}:{code}")])
-    elif st == "offered":
-        text += f"Прислано вариантов: {state['n']}. Выберите на карточке «⏱ Ближайший слот» — пост встанет сюда."
-        rows.append([_btn("👁 К вариантам", f"sc:{post['id']}")])
-    elif st == "missed":
-        text += "Прошёл пустым."
-    else:
-        text += "Пропуск: бот не будет его заполнять." if st == "skipped" else "Пусто."
-        if st == "empty":
-            rows.append([_btn("🎯 Подобрать варианты сейчас", f"so:{code}")])
-        rows.append([_btn("↩️ Вернуть слот" if st == "skipped" else "⏭ Пропустить этот слот", f"sk:{code}")])
-    rows.append([_btn("← Меню", f"m:day:{min(max(offset, 0), 1)}")])
-    return text, InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@router.callback_query(F.data.startswith("sl:"))
-async def on_slot_open(cb: CallbackQuery):
-    text, kb = await slot_view(slots.dec(cb.data.split(":")[1]))
-    await cb.message.edit_text(text, reply_markup=kb)
+        async def plan_now():
+            text = await slots.on_mode_change(p[2])
+            if text:
+                await screen.notify(bot, text, [("📥 Разобрать", "n:inbox")])
+            screen.refresh_soon(bot)
+        return _background(bot, plan_now(), "План")
+    if action == "pause":
+        now_paused = not await slots.paused()
+        await db.set_setting("paused", now_paused)
+        if not now_paused:
+            await slots.reschedule()
+        await cb.answer("Пауза: ничего не публикую" if now_paused else "Работаю", show_alert=now_paused)
+        return await screen.show(bot, "home", day=0)
+    if action == "inbox":
+        await cb.answer()
+        return await screen.show(bot, "list", mode="inbox", idx=0)
+    if action == "stock":
+        await cb.answer()
+        return await screen.show(bot, "stockmenu")
+    if action == "stk":
+        await cb.answer()
+        return await screen.show(bot, "list", mode="stock", cat=p[2], idx=0)
+    if action == "next":
+        await cb.answer()
+        return await screen.show(bot, "next", fmt=p[2])
+    if action == "nx":
+        return await _next_post(cb, bot, p[2], None if p[3] == "any" else p[3])
+    if action == "plan" and len(p) == 2:
+        await cb.answer()
+        return await screen.show(bot, "plan")
+    if action == "plan":
+        await cb.answer("Собираю план — большим постам пишу текст, это до минуты…")
+        made, missing = await slots.build_plan(int(p[2]))
+        summary = slots.plan_summary(made, missing, "сегодня" if p[2] == "0" else "завтра")
+        return await screen.show(bot, "list", mode="inbox", idx=0, note=summary.splitlines()[0])
+    if action == "collect":
+        await cb.answer("Собираю. Пришлю сводку", show_alert=False)
+        return _background(bot, _collect(bot), "Сбор")
+    if action in ("stats", "digest", "src", "voice"):
+        await cb.answer()
+        return await screen.show(bot, action)
+    if action == "srct":
+        name = p[2]
+        off = await sources.disabled()
+        if name in off:
+            off.discard(name)
+            await cb.answer(f"{name} включён")
+        else:
+            off.add(name)
+            purged = await db.purge_ready(name)
+            await cb.answer(f"{name} выключен" + (f", из запаса убрано {purged}" if purged else ""), show_alert=bool(purged))
+        await db.set_setting("disabled_sources", sorted(off))
+        return await screen.show(bot, "src")
+    if action == "srcadd":
+        await cb.answer()
+        return await _ask(bot, state, Src.add, "Пришлите строкой: <code>имя https://адрес-rss</code>\n"
+                                               "Имя — латиницей, до 20 знаков. /cancel — отмена.")
+    if action == "vdel":
+        gone = await voice.remove_banned(int(p[2]))
+        await cb.answer(f"Снял запрет: {gone}" if gone else "Уже нет")
+        return await screen.show(bot, "voice")
+    if action == "vadd":
+        await cb.answer()
+        return await _ask(bot, state, VoiceAdd.phrase,
+                          "Какие слова или обороты боту больше не писать? Можно несколько через «;». /cancel — отмена.")
+    if action == "notes":
+        await cb.answer()
+        return await notes.propose(cb.message)
+    if action == "slot":
+        await cb.answer()
+        return await screen.show(bot, "slot", key=slots.dec(p[2]))
+    if action == "sk":
+        key = slots.dec(p[2])
+        now_skipped = await slots.toggle_skip(key)
+        await cb.answer("Слот пропускается" if now_skipped else "Слот снова в работе")
+        return await screen.show(bot, "slot", key=key)
+    if action == "sf":
+        pid, key = int(p[2]), slots.dec(p[3])
+        post = await db.get_post(pid)
+        if post and post["status"] in ("approved", "announced"):
+            await db.update_post(pid, status="sent", slot_key=None, sent_at=db.now())
+        await cb.answer("Слот свободен, пост — во входящих")
+        return await screen.show(bot, "slot", key=key)
+    if action == "so":
+        return await _offer_for_slot(cb, bot, slots.dec(p[2]), None if p[3] == "any" else p[3])
+    if action == "open":
+        await cb.answer()
+        return await screen.show(bot, "list", mode=p[3], pid=int(p[2]), kb=None)
     await cb.answer()
 
 
-@router.callback_query(F.data.startswith("sk:"))
-async def on_slot_skip(cb: CallbackQuery):
-    key = slots.dec(cb.data.split(":")[1])
-    now_skipped = await slots.toggle_skip(key)
-    await cb.answer("Слот пропускается" if now_skipped else "Слот снова в работе")
-    text, kb = await slot_view(key)
-    await cb.message.edit_text(text, reply_markup=kb)
+async def _with_text(bot: Bot, pid: int, **arg) -> None:
+    """Большому посту без текста — пишем текст, показывая это на экране."""
+    post = await db.get_post(pid)
+    if slots.has_text(post):
+        return
+    await _list(bot, pid=pid, note="✍️ Пишу текст…", **arg)
+    await pipeline.ensure_text(pid)
 
 
-@router.callback_query(F.data.startswith("so:"))
-async def on_slot_offer(cb: CallbackQuery, bot: Bot):
-    key = slots.dec(cb.data.split(":")[1])
+async def _next_post(cb: CallbackQuery, bot: Bot, fmt: str, cat: str | None):
+    post = await pipeline.pick_next(fmt, category=cat)
+    if not post:
+        stock = await db.stock_counts()
+        where = " · ".join(f"{config.CATEGORIES[c]} {sum(v.values())}" for c, v in stock.items()
+                           if c in config.CATEGORIES and sum(v.values()))
+        label = config.CATEGORIES.get(cat, "запасе") if cat else "запасе"
+        return await cb.answer(f"В «{label}» пусто." + (f" Есть: {where}" if where else " Запас пуст — нажми «Собрать»."),
+                               show_alert=True)
+    await cb.answer("Кладу во входящие")
+    await slots.propose(post["id"], None)
+    try:
+        await _with_text(bot, post["id"], mode="inbox")
+    except Exception as exc:
+        return await _list(bot, mode="inbox", pid=post["id"], note=curator.explain(exc)[:200])
+    await _list(bot, mode="inbox", pid=post["id"])
+
+
+async def _offer_for_slot(cb: CallbackQuery, bot: Bot, key: str, cat: str | None):
     fmt = slots.slot_fmt(key)
     if not fmt or not await slots.is_free(key):
         return await cb.answer("Слот уже занят или прошёл", show_alert=True)
-    await cb.answer("Подбираю…")
-    head = f"🎯 Варианты для слота {slots.human_key(key)} · {cards.FORMAT_LABEL[fmt]}. «⏱ Ближайший слот» поставит пост сюда."
-    if not await slots.offer(bot, key, fmt, head):
-        await cb.message.answer("Готовых постов этого формата нет. Нажмите «Собрать сейчас» или пришлите ссылку.")
-
-
-@router.callback_query(F.data.startswith("sc:"))
-async def on_slot_card(cb: CallbackQuery, bot: Bot):
-    post = await db.get_post(_pid(cb))
-    await cb.answer()
+    post = await pipeline.pick_next(fmt, category=cat, exclude={p["id"] for p in await db.inbox_posts()})
+    if not post:
+        return await cb.answer("В этой рубрике пусто — выбери другую." if cat else
+                               "Запас этого формата пуст — нажми «🔎 Собрать сейчас» на пульте.", show_alert=True)
+    await cb.answer("Предлагаю")
+    await slots.propose(post["id"], key)
     try:
-        await bot.send_message(config.ADMIN_ID, "Карточка ↑", reply_to_message_id=post["card_msg_id"])
-    except TelegramBadRequest:
-        await cards.send_card(bot, post, slot_key=post["slot_key"], status=post["status"])  # сообщение удалено — шлём заново
-
-
-@router.callback_query(F.data.startswith("su:"))
-async def on_slot_free(cb: CallbackQuery, bot: Bot):
-    _, pid, code = cb.data.split(":")
-    post = await db.get_post(int(pid))
-    if post and post["status"] in ("approved", "announced"):
-        await db.update_post(int(pid), status="sent", slot_key=None)
-        await cards.refresh_card(bot, int(pid), "\n\n↩️ <i>Снят со слота — решение за вами</i>")
-    await cb.answer("Слот свободен")
-    text, kb = await slot_view(slots.dec(code))
-    await cb.message.edit_text(text, reply_markup=kb)
-
-
-@router.callback_query(F.data.startswith("rej:"))
-async def on_reject(cb: CallbackQuery):
-    pid = _pid(cb)
-    rows = [[_btn(v, f"rr:{pid}:{k}")] for k, v in REJECT_REASONS.items()]
-    rows.append([_btn("← Назад", f"back:{pid}")])
-    await cb.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await cb.answer("Почему?")
-
-
-@router.callback_query(F.data.startswith("back:"))
-async def on_back(cb: CallbackQuery, bot: Bot):
-    await cards.refresh_card(bot, _pid(cb))
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("rr:"))
-async def on_reject_reason(cb: CallbackQuery, bot: Bot):
-    _, pid, code = cb.data.split(":")
-    reason = REJECT_REASONS.get(code, code)
-    await db.update_post(int(pid), status="rejected", reject_reason=reason, decided_at=db.now(), slot_key=None)
-    await cards.refresh_card(bot, int(pid), f"\n\n❌ <b>Отклонено:</b> {reason}")
-    await cb.answer("Учту")
-
-
-@router.callback_query(F.data.startswith("fm:"))
-async def on_format(cb: CallbackQuery, bot: Bot):
-    pid = _pid(cb)
-    post = await db.get_post(pid)
-    fmt = "std" if post["format"] == "mini" else "mini"
-    data = json.loads(post["data"])
-    if fmt == "std" and not (data.get("body") or "").strip():
-        return await cb.answer("У этого поста нет длинного текста. Нажмите «Переписать» после смены или пришлите свой.",
-                               show_alert=True)
-    await db.update_post(pid, format=fmt, data=data, caption=formatter.build_caption(data, fmt))
-    await cards.refresh_card(bot, pid, caption_changed=True)
-    await cb.answer(f"Формат: {cards.FORMAT_LABEL[fmt]}")
-
-
-# ---------- фото ----------
-
-@router.callback_query(F.data.startswith("ph:"))
-async def on_photos(cb: CallbackQuery):
-    post = await db.get_post(_pid(cb))
-    await cb.message.edit_reply_markup(reply_markup=cards.kb_photos(post))
-    await cb.answer("Нажмите номер, чтобы убрать или вернуть фото")
-
-
-@router.callback_query(F.data.startswith("pc:"))
-async def on_cover_mode(cb: CallbackQuery):
-    post = await db.get_post(_pid(cb))
-    await cb.message.edit_reply_markup(reply_markup=cards.kb_photos(post, cover_mode=True))
-    await cb.answer("Какое фото поставить первым?")
-
-
-@router.callback_query(F.data.startswith("px:") | F.data.startswith("pcs:"))
-async def on_photo_toggle(cb: CallbackQuery, bot: Bot):
-    kind, pid, i = cb.data.split(":")
-    pid, i = int(pid), int(i)
-    post = await db.get_post(pid)
-    data = json.loads(post["data"])
-    n = len(json.loads(post["images"]))
-    excluded = set(data.get("_excluded") or [])
-    if kind == "pcs":
-        data["_cover"] = None if data.get("_cover") == i else i
-        excluded.discard(i)
-    elif i in excluded:
-        excluded.discard(i)
-    else:
-        if len(excluded) >= n - 1:
-            return await cb.answer("Должно остаться хотя бы одно фото", show_alert=True)
-        excluded.add(i)
-        if data.get("_cover") == i:
-            data["_cover"] = None
-    data["_excluded"] = sorted(excluded)
-    await db.update_post(pid, data=data)
-    await cards.refresh_card(bot, pid, markup=cards.kb_photos(await db.get_post(pid)))
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("ig:"))
-async def on_instagram(cb: CallbackQuery, bot: Bot):
-    await cb.answer("Собираю пакет…")
-    try:
-        await cards.instagram_pack(bot, _pid(cb))
+        await _with_text(bot, post["id"], mode="inbox")
     except Exception as exc:
-        log.exception("instagram_pack")
-        await cb.message.answer(f"Не получилось: {exc!r}")
+        return await _list(bot, mode="inbox", pid=post["id"], note=curator.explain(exc)[:200])
+    await _list(bot, mode="inbox", pid=post["id"])
 
 
-# ---------- текст ----------
+# ======================= действия с постом =======================
 
-@router.callback_query(F.data.startswith("edit:"))
-async def on_edit(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(Edit.text)
-    await state.update_data(pid=_pid(cb))
-    await cb.message.answer(
-        "Пришлите текст поста целиком, с форматированием, как он должен выйти в канале. /cancel — отмена."
-    )
+async def _approve(bot: Bot, pid: int, key: str) -> str:
+    await _with_text(bot, pid)
+    await db.update_post(pid, status="approved", decided_at=db.now(), slot_key=key)
+    return f"Выйдет {slots.human_key(key)}" + (" (сейчас пауза)" if await slots.paused() else "")
+
+
+@router.callback_query(F.data.startswith("v:"))
+async def on_post(cb: CallbackQuery, bot: Bot, state: FSMContext):
+    await screen.adopt(cb.message)
+    p = _parts(cb)
+    action = p[1]
+    if action == "noop":
+        return await cb.answer()
+    pid = int(p[2])
+    post = await db.get_post(pid)
+    if not post:
+        await cb.answer("Пост не найден")
+        return await screen.show(bot, "home")
+    st = post["status"]
+    active = ("sent", "approved", "announced", "ready")
+
+    if action == "nav":
+        view, arg = await screen.current()
+        ids = await screen._list_ids(arg.get("mode", "inbox"), arg.get("cat"), pid)
+        if not ids:
+            await cb.answer()
+            return await _list(bot)
+        i = ids.index(pid) if pid in ids else 0
+        nxt = ids[(i + int(p[3])) % len(ids)]
+        await cb.answer()
+        return await _list(bot, pid=nxt)
+
+    if action in ("back", "pick", "reject", "now", "rej"):
+        await cb.answer()
+        sub = {"back": None, "pick": "pick", "now": "confirm", "rej": "reject"}.get(action)
+        return await _list(bot, pid=pid, kb=sub)
+
+    if action in ("slot", "ps") and st not in active:
+        return await cb.answer("Этот пост уже не ждёт решения")
+
+    try:
+        if action == "slot":
+            key = post["slot_key"]
+            if not (key and (await slots.is_free(key) or st == "announced") and slots.key_dt(key) > slots._now()):
+                key = await slots.next_free(post["format"] if post["format"] in ("std", "mini") else "std")
+            if not key:
+                return await cb.answer("Свободных слотов этого формата нет — выбери слот вручную.", show_alert=True)
+            await cb.answer("Ставлю в слот…")
+            done = await _approve(bot, pid, key)
+            return await _list(bot, pid=pid, note=f"🟡 {done}")
+
+        if action == "ps":
+            key = slots.dec(p[3])
+            if slots.key_dt(key) <= slots._now():
+                return await cb.answer("Этот слот уже прошёл", show_alert=True)
+            other = await db.approved_in_slot(key)
+            if other and other["id"] != pid:
+                if st != "approved" or not post["slot_key"]:
+                    return await cb.answer("Слот уже занят", show_alert=True)
+                await db.update_post(other["id"], slot_key=post["slot_key"])      # меняемся местами
+            elif not other and post["slot_key"] != key and not await slots.is_free(key):
+                return await cb.answer("Слот занят автопостом — сначала отмени его", show_alert=True)
+            await cb.answer("Ставлю…")
+            done = await _approve(bot, pid, key)
+            return await _list(bot, pid=pid, note=f"🟡 {done}")
+
+        if action == "swap":
+            key = post["slot_key"]
+            fmt = slots.slot_fmt(key) or post["format"]
+            busy = {q["id"] for q in await db.inbox_posts()} | {pid}
+            new = await pipeline.pick_next(fmt, exclude=busy)
+            if not new:
+                return await cb.answer("Замены этого формата в запасе нет", show_alert=True)
+            await cb.answer("Меняю…")
+            await db.update_post(pid, status="ready", slot_key=None)
+            await slots.propose(new["id"], key)
+            await _with_text(bot, new["id"])
+            return await _list(bot, pid=new["id"], note="🔄 Заменил: прежний вернулся в запас")
+
+        if action == "nowok":
+            await cb.answer("Публикую…")
+            ok = await cards.publish_post(bot, pid, "вручную")
+            return await _list(bot, pid=pid, note="✅ Опубликовано" if ok else "Уже опубликовано")
+
+        if action == "rr":
+            reason = screen.REJECT_REASONS.get(p[3], p[3])
+            await db.update_post(pid, status="rejected", reject_reason=reason, decided_at=db.now(), slot_key=None)
+            await cb.answer(f"Отклонил: {reason}. Учту")
+            return await _list(bot, pid=pid)
+
+        if action == "unslot":
+            if st not in ("approved", "announced"):
+                return await cb.answer("Уже не в слоте")
+            await db.update_post(pid, status="sent", slot_key=None, sent_at=db.now())
+            await cb.answer("Снял со слота — пост во входящих")
+            return await _list(bot, pid=pid)
+
+        if action == "keep":
+            await db.update_post(pid, status="approved", decided_at=db.now())
+            await cb.answer("Оставил — выйдет по слоту")
+            return await _list(bot, pid=pid)
+
+        if action == "toin":
+            await slots.propose(pid, None)
+            await cb.answer("Во входящих")
+            return await _list(bot, pid=pid)
+
+        if action == "restore":
+            await db.update_post(pid, status="ready", reject_reason=None, slot_key=None)
+            await cb.answer("Вернул в запас")
+            return await _list(bot, pid=pid)
+
+        if action == "write":
+            await cb.answer("Пишу текст…")
+            await _with_text(bot, pid)
+            return await _list(bot, pid=pid, note="✍️ Текст готов")
+
+        if action == "fm":
+            fmt = "std" if post["format"] == "mini" else "mini"
+            data = json.loads(post["data"])
+            lost = bool(data.get("_manual"))
+            await cb.answer(("Твоя ручная правка сброшена. " if lost else "")
+                            + ("Пишу текст большого поста…" if fmt == "std" and not formatter.has_body(data) else
+                               f"Теперь {cards.FORMAT_LABEL[fmt]}"), show_alert=lost)
+            if fmt == "std" and not formatter.has_body(data):
+                await _list(bot, pid=pid, note="✍️ Пишу текст…")
+            await pipeline.set_format(pid, fmt, write=True)
+            return await _list(bot, pid=pid)
+
+        if action == "ph":
+            await cb.answer("Нажми номер, чтобы убрать или вернуть фото")
+            view, arg = await screen.current()
+            if arg.get("kb") not in ("photos", "cover"):
+                await screen.add_temp(await cards.send_album(bot, post))
+            return await _list(bot, pid=pid, kb="photos")
+
+        if action == "pc":
+            await cb.answer("Какое фото поставить первым?")
+            return await _list(bot, pid=pid, kb="cover")
+
+        if action in ("px", "pcs"):
+            i = int(p[3])
+            data = json.loads(post["data"])
+            n = len(json.loads(post["images"]))
+            excluded = set(data.get("_excluded") or [])
+            if action == "pcs":
+                data["_cover"] = None if data.get("_cover") == i else i
+                excluded.discard(i)
+            elif i in excluded:
+                excluded.discard(i)
+            else:
+                if len(excluded) >= n - 1:
+                    return await cb.answer("Должно остаться хотя бы одно фото", show_alert=True)
+                excluded.add(i)
+                if data.get("_cover") == i:
+                    data["_cover"] = None
+            data["_excluded"] = sorted(excluded)
+            await db.update_post(pid, data=data)
+            await cb.answer()
+            return await _list(bot, pid=pid, kb="cover" if action == "pcs" else "photos")
+
+        if action == "txt":
+            await cb.answer()
+            m = await bot.send_message(config.ADMIN_ID, post["caption"][:4000], disable_web_page_preview=True)
+            return await screen.add_temp([m.message_id])
+
+        if action == "ig":
+            await cb.answer("Собираю пакет…")
+            await cards.instagram_pack(bot, pid)
+            return
+
+        if action == "edit":
+            await cb.answer()
+            return await _ask(bot, state, Edit.text,
+                              "Пришли текст поста целиком, с форматированием, как он должен выйти в канале. "
+                              "Бот запомнит твою правку и будет писать ближе к ней. /cancel — отмена.", pid=pid)
+        if action == "rw":
+            await cb.answer()
+            return await _ask(bot, state, Edit.rewrite,
+                              "Что поправить? Напиши комментарий или «-», чтобы просто переписать. /cancel — отмена.", pid=pid)
+        if action == "ban":
+            await cb.answer()
+            return await _ask(bot, state, Edit.ban,
+                              "Какое слово или оборот боту больше не писать? Можно несколько через «;». /cancel — отмена.",
+                              pid=pid)
+    except Exception as exc:
+        log.exception("Кнопка %s", cb.data)
+        try:
+            await cb.answer("Не получилось", show_alert=False)
+        except Exception:
+            pass
+        return await _list(bot, pid=pid, note=curator.explain(exc)[:200])
     await cb.answer()
+
+
+# ======================= ввод текста =======================
+
+async def _ask(bot: Bot, state: FSMContext, st, text: str, **data) -> None:
+    await state.set_state(st)
+    m = await bot.send_message(config.ADMIN_ID, text)
+    await state.update_data(prompt=m.message_id, **data)
+    await screen.add_temp([m.message_id])
+
+
+async def _finish(msg: Message, state: FSMContext, bot: Bot) -> dict:
+    data = await state.get_data()
+    await state.clear()
+    await _drop(bot, msg.message_id, data.get("prompt"))
+    return data
 
 
 @router.message(Edit.text, F.text, NOT_COMMAND)
 async def on_edit_text(msg: Message, state: FSMContext, bot: Bot):
-    pid = (await state.get_data())["pid"]
-    await state.clear()
-    await db.update_post(pid, caption=msg.html_text)
-    await cards.refresh_card(bot, pid, "\n\n✏️ <i>Текст заменён</i>", caption_changed=True)
-    await msg.answer("Готово, карточка обновлена ↑")
-
-
-@router.callback_query(F.data.startswith("rw:"))
-async def on_rewrite(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(Edit.rewrite)
-    await state.update_data(pid=_pid(cb))
-    await cb.message.answer("Что поправить? Напишите комментарий или «-», чтобы просто переписать. /cancel — отмена.")
-    await cb.answer()
+    html_text = msg.html_text
+    d = await _finish(msg, state, bot)
+    pid = d["pid"]
+    post = await db.get_post(pid)
+    before = formatter.plain_text(post["caption"])
+    data = json.loads(post["data"])
+    data["_manual"] = True
+    await db.update_post(pid, caption=html_text, data=data)
+    if before and before != formatter.plain_text(html_text):
+        await db.add_edit(pid, post["format"], before[:1500], formatter.plain_text(html_text)[:1500])
+    await _list(bot, pid=pid, note="✏️ Текст заменён — правку запомнил")
 
 
 @router.message(Edit.rewrite, F.text, NOT_COMMAND)
 async def on_rewrite_comment(msg: Message, state: FSMContext, bot: Bot):
-    pid = (await state.get_data())["pid"]
-    await state.clear()
-    wait = await msg.answer("Переписываю…")
-    post = await db.get_post(pid)
-    data = json.loads(post["data"])
-    comment = "" if msg.text.strip() == "-" else msg.text
+    comment = "" if msg.text.strip() == "-" else msg.text.strip()
+    d = await _finish(msg, state, bot)
+    pid = d["pid"]
+    await _list(bot, pid=pid, note="🔁 Переписываю…")
     try:
-        new = await curator.rewrite(data, data.get("_source_text", ""), comment, post["format"])
-        for k, v in data.items():          # служебные поля: исходник, источники, выбор фото
-            if k.startswith("_"):
-                new.setdefault(k, v)
-        new["flags"] = new.get("flags") or []
-        caption = formatter.build_caption(new, post["format"])
-        await db.update_post(pid, data=new, caption=caption)
-        await cards.refresh_card(bot, pid, "\n\n🔁 <i>Переписано</i>", caption_changed=True)
-        await wait.edit_text("Готово, карточка обновлена ↑")
+        await pipeline.rewrite(pid, comment)
+        await _list(bot, pid=pid, note="🔁 Переписано")
     except Exception as exc:
         log.exception("rewrite")
-        await wait.edit_text(curator.explain(exc))
+        await _list(bot, pid=pid, note=curator.explain(exc)[:200])
 
 
-# ======================= источники: добавить RSS =======================
+@router.message(Edit.ban, F.text, NOT_COMMAND)
+async def on_ban(msg: Message, state: FSMContext, bot: Bot):
+    raw = msg.text
+    d = await _finish(msg, state, bot)
+    added = await voice.add_banned(raw)
+    post = await db.get_post(d["pid"])
+    note = ("🚫 Запомнил: " + "; ".join(added)) if added else "🚫 Такое уже в запретах"
+    if post and any(a.lower() in formatter.plain_text(post["caption"]).lower() for a in added):
+        note += ". В этом посте оно есть — нажми «🔁 Переписать»"
+    await _list(bot, pid=d["pid"], note=note)
+
+
+@router.message(VoiceAdd.phrase, F.text, NOT_COMMAND)
+async def on_voice_add(msg: Message, state: FSMContext, bot: Bot):
+    raw = msg.text
+    await _finish(msg, state, bot)
+    await voice.add_banned(raw)
+    await screen.show(bot, "voice")
+
 
 @router.message(Src.add, F.text, NOT_COMMAND)
-async def on_add_feed(msg: Message, state: FSMContext):
+async def on_add_feed(msg: Message, state: FSMContext, bot: Bot):
     m = re.fullmatch(r"\s*([a-z0-9_]{2,20})\s+(https?://\S+)\s*", msg.text, re.I)
     if not m:
         return await msg.answer("Формат: <code>имя https://адрес-rss</code>. Попробуйте ещё раз или /cancel.")
+    await _finish(msg, state, bot)
     name, url = m.group(1).lower(), m.group(2)
-    await state.clear()
     try:
         n = await sources.check_feed(url)
     except Exception as exc:
-        return await msg.answer(f"Лента не открылась: {exc!r}")
+        return await screen.notify(bot, f"Лента не открылась: {exc!r}"[:500])
     if not n:
-        return await msg.answer("По этому адресу нет записей RSS — не добавляю.")
+        return await screen.notify(bot, "По этому адресу нет записей RSS — не добавляю.")
     feeds = await db.get_setting("custom_feeds", {})
     feeds[name] = url
     await db.set_setting("custom_feeds", feeds)
-    await msg.answer(f"Добавил «{name}»: в ленте {n} записей. Подтянутся при следующем сборе.")
+    await screen.show(bot, "src")
+
+
+# ======================= уведомления =======================
+
+@router.callback_query(F.data.startswith("n:"))
+async def on_notice(cb: CallbackQuery, bot: Bot):
+    p = _parts(cb)
+    action = p[1]
+    await cb.answer()
+    if action == "cancel":
+        pid = int(p[2])
+        post = await db.get_post(pid)
+        if post and post["status"] == "announced":
+            await db.update_post(pid, status="sent", slot_key=None, sent_at=db.now())
+            await cb.message.edit_text("🚫 Автопост отменён — пост во входящих.")
+        else:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        return screen.refresh_soon(bot)
+    await _drop(bot, cb.message.message_id)
+    if action == "inbox":
+        return await screen.move_down(bot, "list", mode="inbox", idx=0)
+    if action == "open":
+        pid = int(p[2])
+        post = await db.get_post(pid)
+        mode = "inbox" if post and post["status"] in ("sent", "announced") else "one"
+        return await screen.move_down(bot, "list", mode=mode, pid=pid)
+    return await screen.move_down(bot, "home")
 
 
 # ======================= пост по ссылке =======================
@@ -616,8 +641,25 @@ async def on_link(msg: Message, bot: Bot):
         return await wait.edit_text(curator.explain(exc))
     if not pid:
         return await wait.edit_text(f"Пост не собрался: {note}")
-    await cards.send_card(bot, await db.get_post(pid))
-    await wait.delete()
+    post = await db.get_post(pid)
+    if post["status"] == "ready":
+        await slots.propose(pid, None)
+    await _drop(bot, wait.message_id, msg.message_id)
+    await screen.move_down(bot, "list", mode="inbox", pid=pid)
+
+
+# кнопки из прошлых версий бота — чтобы не висели молча (отдельный роутер, проверяется последним)
+stale = Router()
+
+
+@stale.callback_query()
+async def on_stale(cb: CallbackQuery):
+    await cb.answer("Эта кнопка из прошлой версии бота. Открой /menu — там всё по-новому.", show_alert=True)
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
 router.include_router(notes.router)
+router.include_router(stale)

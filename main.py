@@ -4,6 +4,7 @@ import logging
 import math
 import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher
@@ -11,7 +12,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.types import BotCommand, ErrorEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from app import cards, config, curator, db, pipeline, reports, slots, sources
+from app import config, curator, db, pipeline, reports, screen, slots
 from app.bot import router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -30,44 +31,41 @@ def guarded(bot: Bot, name: str, fn, *args):
             if time.time() - _last_alert.get(name, 0) > 3600:
                 _last_alert[name] = time.time()
                 try:
-                    await bot.send_message(config.ADMIN_ID, f"⚠️ Сбой в задаче «{name}»: {exc!r}"[:1000])
+                    await bot.send_message(config.ADMIN_ID, f"⚠️ Сбой в задаче «{name}»: {curator.explain(exc)}"[:1000])
                 except Exception:
                     log.exception("alert")
     return job
 
 
-async def collect(bot: Bot | None = None):
-    await sources.collect_all()
+async def collect(bot: Bot):
     before = await db.get_setting("api_error")
-    _, note = await pipeline.process_new()
+    await pipeline.run_collection(manual=False)
     after = await db.get_setting("api_error")
     # об ошибке доступа к Claude сообщаем один раз, а не при каждом сборе
-    if bot and after and (not before or before["text"] != after["text"]):
-        await bot.send_message(config.ADMIN_ID, f"⚠️ {after['text']}")
+    if after and (not before or before["text"] != after["text"]):
+        await screen.notify(bot, f"⚠️ {after['text']}")
+    screen.refresh_soon(bot)
 
 
-async def deliver(bot: Bot, n: int):
-    """Ручной режим: карточки на модерацию по часам, не превышая дневной лимит."""
-    if await slots.mode() != "manual" or await slots.paused():
+async def poll(bot: Bot):
+    """Каждые 10 минут: забрать готовые пакеты оценки."""
+    closed = await pipeline.poll_batches()
+    if not closed:
         return
-    left = config.DAILY_MAX - len(await db.sent_today())
-    for _ in range(max(0, min(n, left))):
-        post = await pipeline.pick_next("std") or await pipeline.pick_next("mini")
-        if not post:
-            break
-        try:
-            await cards.send_card(bot, post)
-        except Exception:
-            log.exception("Не удалось отправить карточку %s", post["id"])
-            await db.update_post(post["id"], status="auto_rejected", reject_reason="ошибка отправки")
+    for c in closed:
+        if c["manual"]:
+            await screen.notify(bot, f"📦 Оценка готова: в запас +{c['made']}"
+                                     + (f", не вышло {c['failed']}" if c["failed"] else "") + ".",
+                                [("🏠 Экран", "n:home")])
+    screen.refresh_soon(bot)
 
 
 async def digest(bot: Bot):
-    await bot.send_message(config.ADMIN_ID, await reports.digest_text(7))
+    await screen.notify(bot, await reports.digest_text(7), [("🏠 Экран", "n:home")])
 
 
 async def cleanup():
-    """Удаляет файлы давно решённых постов, чтобы диск не рос бесконечно."""
+    """Удаляет файлы давно решённых постов и отсеянных кандидатов, чтобы диск не рос бесконечно."""
     root = config.IMG_DIR.resolve()
     for r in await db.finished_before(config.IMAGE_TTL_DAYS):
         images = json.loads(r["images"] or "[]")
@@ -75,44 +73,37 @@ async def cleanup():
             folder = Path(images[0]).parent.resolve()
             if folder != root and root in folder.parents:
                 shutil.rmtree(folder, ignore_errors=True)
+    for c in await db.candidates("skipped", limit=2000):
+        shutil.rmtree(config.IMG_DIR / f"c{c['id']}", ignore_errors=True)
+
+
+async def startup(bot: Bot):
+    """После перезапуска: забрать пакеты, при пустом запасе — собрать, освежить экран."""
+    await poll(bot)
+    last = await db.get_setting("last_collect")
+    stale = not last or (datetime.fromisoformat(db.now()) - datetime.fromisoformat(last)).total_seconds() > 6 * 3600
+    if stale and await db.count_ready() + await db.batched_count() < pipeline.target_stock():
+        await collect(bot)
+    # полуавтомат после перезапуска: если на сегодня плана нет, собираем его на оставшиеся слоты
+    if await slots.mode() == "semi" and not await slots.paused():
+        today = await slots.day_state(0)
+        if not any(x["state"] in ("offered", "approved", "announced") for x in today if x["dt"] > slots._now()):
+            made, missing = await slots.build_plan(0)
+            if made:
+                await screen.notify(bot, slots.plan_summary(made, missing, "сегодня"), [("📥 Разобрать", "n:inbox")])
+    screen.refresh_soon(bot)
 
 
 async def main():
     await db.init()
+    screen.banner()
     bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
     dp.include_router(router)
 
-    sched = AsyncIOScheduler(timezone=config.TZ_NAME, job_defaults={"misfire_grace_time": 300, "coalesce": True})
-    sched.add_job(guarded(bot, "сбор", collect, bot), "interval", hours=config.COLLECT_EVERY_HOURS,
-                  id="collect", max_instances=1)
-    per_slot = math.ceil(config.DAILY_MAX / len(config.DELIVERY_HOURS))
-    for h in config.DELIVERY_HOURS:
-        sched.add_job(guarded(bot, "выдача", deliver, bot, per_slot), "cron", hour=h, minute=0, id=f"deliver_{h}")
-    for h, m, fmt in config.SLOTS:
-        pre = (h * 60 + m - config.SLOT_LEAD_MIN) % 1440
-        sched.add_job(guarded(bot, f"подготовка слота {h:02d}:{m:02d}", slots.prepare, bot, h, m, fmt),
-                      "cron", hour=pre // 60, minute=pre % 60, id=f"prep_{h}_{m}")
-        sched.add_job(guarded(bot, f"слот {h:02d}:{m:02d}", slots.fire, bot, h, m, fmt),
-                      "cron", hour=h, minute=m, id=f"fire_{h}_{m}")
-    sched.add_job(guarded(bot, "дайджест", digest, bot), "cron",
-                  day_of_week=config.DIGEST_DOW, hour=config.DIGEST_HOUR, id="digest")
-    sched.add_job(guarded(bot, "очистка", cleanup), "cron", hour=4, minute=30, id="cleanup")
-    sched.start()
-
-    await slots.reschedule(bot)   # посты, чей слот прошёл, пока бот не работал
-    await bot.set_my_commands([
-        BotCommand(command="menu", description="Меню"),
-        BotCommand(command="next", description="Следующий пост"),
-        BotCommand(command="mini", description="Мини-пост"),
-        BotCommand(command="diag", description="Проверить, всё ли работает"),
-        BotCommand(command="cancel", description="Отменить ввод"),
-    ])
-    asyncio.create_task(guarded(bot, "сбор", collect, bot)())  # первый сбор сразу после старта
-    log.info("AHMAG curator запущен · режим %s · слоты %s", await slots.mode(), config.SLOTS)
     @dp.error()
     async def on_error(event: ErrorEvent) -> None:
-        """Ошибка в кнопке или команде: раньше она уходила в лог, и бот молчал."""
+        """Ошибка в кнопке или команде приходит сообщением, а не пропадает в логе."""
         exc = event.exception
         log.exception("Ошибка обработчика", exc_info=exc)
         text = f"⚠️ {curator.explain(exc)}"
@@ -126,6 +117,39 @@ async def main():
         except Exception:
             log.exception("Не смог сообщить об ошибке")
 
+    sched = AsyncIOScheduler(timezone=config.TZ_NAME, job_defaults={"misfire_grace_time": 600, "coalesce": True})
+    for h, m in config.COLLECT_TIMES:
+        sched.add_job(guarded(bot, "сбор", collect, bot), "cron", hour=h, minute=m, id=f"collect_{h}_{m}",
+                      max_instances=1)
+    sched.add_job(guarded(bot, "оценка пакетом", poll, bot), "interval", minutes=10, id="poll", max_instances=1)
+    per_delivery = math.ceil(config.DAILY_MAX / max(1, len(config.DELIVERY_HOURS)))
+    for h in config.DELIVERY_HOURS:
+        sched.add_job(guarded(bot, "входящие", slots.deliver_manual, bot, per_delivery), "cron",
+                      hour=h, minute=0, id=f"deliver_{h}")
+    for h, m, fmt in config.SLOTS:
+        pre = (h * 60 + m - config.SLOT_LEAD_MIN) % 1440
+        sched.add_job(guarded(bot, f"анонс {h:02d}:{m:02d}", slots.prepare, bot, h, m, fmt),
+                      "cron", hour=pre // 60, minute=pre % 60, id=f"prep_{h}_{m}")
+        sched.add_job(guarded(bot, f"слот {h:02d}:{m:02d}", slots.fire, bot, h, m, fmt),
+                      "cron", hour=h, minute=m, id=f"fire_{h}_{m}")
+    ph, pm = config.PLAN_TIME
+    sched.add_job(guarded(bot, "план на завтра", slots.evening, bot), "cron", hour=ph, minute=pm, id="evening")
+    sched.add_job(guarded(bot, "срок входящих", slots.expire_inbox, bot), "interval", hours=1, id="expire")
+    sched.add_job(guarded(bot, "дайджест", digest, bot), "cron",
+                  day_of_week=config.DIGEST_DOW, hour=config.DIGEST_HOUR, id="digest")
+    sched.add_job(guarded(bot, "очистка", cleanup), "cron", hour=4, minute=30, id="cleanup")
+    sched.start()
+
+    await slots.reschedule()   # посты, чей слот прошёл или исчез из расписания, пока бот не работал
+    await bot.set_my_commands([
+        BotCommand(command="menu", description="Экран бота"),
+        BotCommand(command="next", description="Следующий пост"),
+        BotCommand(command="stats", description="Где сейчас посты"),
+        BotCommand(command="diag", description="Проверить, всё ли работает"),
+        BotCommand(command="cancel", description="Отменить ввод"),
+    ])
+    asyncio.create_task(guarded(bot, "запуск", startup, bot)())
+    log.info("AHMAG curator v3 запущен · режим %s · слоты %s", await slots.mode(), config.SLOTS)
     await dp.start_polling(bot)
 
 

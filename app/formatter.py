@@ -22,10 +22,10 @@ def _safe_body(text: str) -> str:
 
 
 def _credit(label: str, name: str | None, url: str | None) -> str | None:
-    if not name:
+    if not name or str(name).strip().lower() == "null":
         return None
-    name_e = html.escape(name, quote=False)
-    if url and url.startswith("http"):
+    name_e = html.escape(str(name), quote=False)
+    if url and str(url).startswith("http"):
         return f'<i>{label}: </i><a href="{html.escape(url)}"><i>{name_e}</i></a>'
     return f"<i>{label}: {name_e}</i>"
 
@@ -51,9 +51,14 @@ def headline_parts(data: dict) -> list[str]:
     return [str(p).strip() for p in (data.get("headline_parts") or []) if p and str(p).strip().lower() != "null"]
 
 
+def has_body(data: dict) -> bool:
+    return bool(str(data.get("body") or "").strip())
+
+
 def build_caption(data: dict, fmt: str = "std") -> str:
     """Собирает подпись и заодно проставляет data['headline'] для истории.
-    std / notes — заголовок, текст, кредиты, теги; mini — заголовок, одна фраза (если есть), кредиты, теги."""
+    std / notes — заголовок, текст, кредиты, теги; mini — заголовок, одна фраза (если есть), кредиты, теги.
+    У большого поста, чей текст ещё не написан, подпись временно без основного текста."""
     parts = headline_parts(data)
     data["headline"] = " // ".join(parts)
     headline = " // ".join(html.escape(p, quote=False) for p in parts)
@@ -83,12 +88,12 @@ def build_caption(data: dict, fmt: str = "std") -> str:
 
 def visible_len(caption: str) -> int:
     """Длина подписи без HTML-разметки — так её считает Telegram."""
-    return len(html.unescape(re.sub(r"<[^>]+>", "", caption)))
+    return len(html.unescape(re.sub(r"<[^>]+>", "", caption or "")))
 
 
 def plain_text(caption: str) -> str:
-    """Подпись без разметки — для Instagram."""
-    return html.unescape(re.sub(r"<[^>]+>", "", caption)).strip()
+    """Подпись без разметки — для Instagram и для сравнения версий."""
+    return html.unescape(re.sub(r"<[^>]+>", "", caption or "")).strip()
 
 
 def split_blocks(text: str, limit: int) -> list[str]:
@@ -109,7 +114,11 @@ def split_blocks(text: str, limit: int) -> list[str]:
 
 def clip_blocks(text: str, budget: int) -> tuple[str, bool]:
     """Первые абзацы, которые влезают в budget видимых знаков. → (текст, обрезано ли)"""
-    chunks = split_blocks(text, max(budget, 200))
-    if len(chunks) <= 1 and visible_len(text) <= budget:
+    if visible_len(text) <= budget:
         return text, False
-    return chunks[0], True
+    chunks = split_blocks(text, max(budget, 120))
+    first = chunks[0] if chunks else ""
+    if visible_len(first) > budget:  # один огромный абзац — режем по словам, без разметки
+        plain = plain_text(first)[: max(budget - 1, 60)].rsplit(" ", 1)[0]
+        return html.escape(plain, quote=False) + "…", True
+    return first, True

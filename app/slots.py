@@ -1,10 +1,10 @@
 """Слоты публикации и режимы.
-manual — бот только присылает карточки; в слоты уходят лишь посты, которые автор сам туда поставил.
-semi   — перед каждым слотом бот присылает несколько вариантов, автор выбирает.
+manual — бот кладёт посты во входящие в часы DELIVERY_HOURS; в слоты уходит только то, что поставил автор.
+semi   — вечером бот собирает план на завтра: по посту на каждый слот, автор одобряет или меняет.
 auto   — бот сам анонсирует пост к слоту и публикует, если автор не отменил.
 
 Пост привязывается к конкретному слоту: posts.slot_key = 'YYYY-MM-DD HH:MM'.
-После публикации по слоту ключ остаётся — расписание помнит, чем слот был занят."""
+После публикации ключ остаётся — расписание помнит, чем слот был занят."""
 import json
 import logging
 from datetime import datetime, timedelta
@@ -12,14 +12,13 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 
-from app import cards, config, db, pipeline
+from app import cards, config, db, formatter, pipeline
 
 log = logging.getLogger(__name__)
 
 MODES = {"manual": "✋ ручной", "semi": "🤝 полуавтомат", "auto": "🤖 автомат"}
-ICON = {"published": "✅", "approved": "🟡", "announced": "🤖", "offered": "🕑",
+ICON = {"published": "✅", "approved": "🟡", "announced": "🤖", "offered": "📥",
         "skipped": "⏭", "empty": "⚪️", "missed": "✖️"}
-SHORT = {"std": "ст", "mini": "мини"}
 
 
 async def mode() -> str:
@@ -82,6 +81,11 @@ def upcoming(fmt: str | None, n: int) -> list[tuple[datetime, str]]:
     return sorted(out)[:n]
 
 
+def headline(post, limit: int = 44) -> str:
+    h = json.loads(post["data"]).get("headline") or "без заголовка"
+    return h if len(h) <= limit else h[: limit - 1] + "…"
+
+
 # ---------- пропуски ----------
 
 async def skipped() -> set[str]:
@@ -100,7 +104,7 @@ async def toggle_skip(key: str) -> bool:
 # ---------- свободные слоты ----------
 
 async def free_slots(fmt: str | None = None, limit: int = 10, horizon: int = 40) -> list[tuple[str, str]]:
-    """[(ключ, формат)] — будущие слоты, где нет ни поста автора, ни автопоста, и которые не пропущены."""
+    """[(ключ, формат)] — будущие слоты без поста автора и автопоста, не пропущенные."""
     taken = await db.taken_keys(key_of(_now())) | await skipped()
     out = [(key_of(dt), f) for dt, f in upcoming(fmt, horizon) if key_of(dt) not in taken]
     return out[:limit]
@@ -115,21 +119,23 @@ async def is_free(key: str) -> bool:
     return key_dt(key) > _now() and key not in await db.taken_keys(key)
 
 
-async def reschedule(bot: Bot | None = None) -> int:
-    """Одобренные посты, чей слот прошёл (пауза, перезапуск) или не назначен, — в ближайшие свободные."""
+async def reschedule() -> int:
+    """Одобренные посты, чей слот прошёл, не назначен или больше не существует в расписании, — в ближайшие свободные."""
     moved = 0
-    for p in await db.overdue_approved(key_of(_now())):
-        key = await next_free(p["format"])
+    times = {f"{h:02d}:{m:02d}" for h, m, _ in config.SLOTS}
+    now_key = key_of(_now())
+    orphans = [p for p in await db.approved_posts()
+               if p["slot_key"] and p["slot_key"] >= now_key and p["slot_key"][-5:] not in times]
+    for p in list(await db.overdue_approved(now_key)) + orphans:
+        key = await next_free(p["format"] if p["format"] in ("std", "mini") else "std")
         if not key:
             continue
         await db.update_post(p["id"], slot_key=key)
         moved += 1
-        if bot:
-            await cards.refresh_card(bot, p["id"], f"\n↪️ <i>Перенесён: {human_key(key)}</i>")
     return moved
 
 
-# ---------- состояние дня (для меню) ----------
+# ---------- состояние дня (для экрана) ----------
 
 async def day_state(offset: int = 0) -> list[dict]:
     now = _now()
@@ -154,88 +160,176 @@ async def day_state(offset: int = 0) -> list[dict]:
     return slots_
 
 
-def headline(post, limit: int = 44) -> str:
-    h = json.loads(post["data"]).get("headline") or "без заголовка"
-    return h if len(h) <= limit else h[: limit - 1] + "…"
+# ---------- предложение поста к слоту ----------
+
+async def propose(pid: int, key: str | None) -> None:
+    post = await db.get_post(pid)
+    await db.update_post(pid, status="sent", sent_at=db.now(), slot_key=key, offers=(post["offers"] or 0) + 1)
 
 
-# ---------- варианты к слоту ----------
-
-async def offer(bot: Bot, key: str, fmt: str, head: str) -> int:
-    sent = 0
-    for _ in range(config.SEMI_OPTIONS):
-        post = await pipeline.pick_next(fmt)
+async def build_plan(offset: int) -> tuple[list, int]:
+    """План на день: на каждый свободный слот — пост нужного формата. Большим постам сразу пишется текст.
+    → (предложенные посты, сколько слотов осталось без поста)"""
+    made, missing = [], 0
+    for s in await day_state(offset):
+        if s["state"] != "empty" or s["dt"] <= _now() + timedelta(minutes=5):
+            continue
+        post = await pipeline.pick_next(s["fmt"], exclude={p["id"] for p in made}, planned=made)
         if not post:
-            break
-        if sent == 0:
-            await bot.send_message(config.ADMIN_ID, head)
-        try:
-            await cards.send_card(bot, post, slot_key=key)
-            sent += 1
-        except Exception:
-            log.exception("Не удалось отправить карточку %s", post["id"])
-            await db.update_post(post["id"], status="auto_rejected", reject_reason="ошибка отправки")
-    return sent
+            missing += 1
+            continue
+        await propose(post["id"], s["key"])
+        if s["fmt"] == "std":
+            try:
+                post = await pipeline.ensure_text(post["id"])
+            except Exception:
+                log.exception("Текст для плана, пост %s", post["id"])  # напишется, когда автор выберет
+        made.append(await db.get_post(post["id"]))
+    return made, missing
 
 
-# ---------- за SLOT_LEAD_MIN минут до слота ----------
+def plan_summary(made: list, missing: int, day_word: str) -> str:
+    mini = sum(1 for p in made if p["format"] == "mini")
+    if made:
+        text = f"🗓 План на {day_word}: {len(made)} (мини {mini}, больших {len(made) - mini})"
+    elif missing:
+        text = f"🗓 План на {day_word}: постов в запасе не хватило"
+    else:
+        text = f"🗓 План на {day_word}: свободных слотов нет"
+    if missing and made:
+        text += f"\nНа {missing} слот(а) постов не хватило — оценка ещё идёт или запас пуст."
+    return text
+
+
+async def on_mode_change(new_mode: str) -> str:
+    """Полуавтомат включили — сразу план на остаток дня (и на завтра, если вечер)."""
+    if new_mode != "semi" or await paused():
+        return ""
+    made, missing = await build_plan(0)
+    text = plan_summary(made, missing, "сегодня") if (made or missing) else ""
+    if _now().hour * 60 + _now().minute >= config.PLAN_TIME[0] * 60 + config.PLAN_TIME[1]:
+        m2, x2 = await build_plan(1)
+        text = (text + "\n" if text else "") + plan_summary(m2, x2, "завтра")
+    return text
+
+
+# ---------- задачи расписания ----------
+
+async def evening(bot: Bot) -> None:
+    """В PLAN_TIME: полуавтомат собирает план на завтра; в любом режиме — напоминание о том, что ждёт решения."""
+    from app import screen
+    lines = []
+    if await mode() == "semi" and not await paused():
+        made, missing = await build_plan(1)
+        if made or missing:
+            lines.append(plan_summary(made, missing, "завтра"))
+    pending = len(await db.inbox_posts())
+    if not pending and not lines:
+        return
+    lines.append(f"📥 Ждут твоего решения: {pending}")
+    await screen.notify(bot, "\n".join(lines), [("📥 Разобрать", "n:inbox")])
+    screen.refresh_soon(bot)
+
 
 async def prepare(bot: Bot, h: int, m: int, fmt: str) -> None:
-    md = await mode()
-    if md == "manual" or await paused():
+    """Автомат: за SLOT_LEAD_MIN минут до слота — анонс поста, который выйдет сам."""
+    from app import screen
+    if await mode() != "auto" or await paused():
         return
     key = key_of((_now() + timedelta(minutes=config.SLOT_LEAD_MIN)).replace(hour=h, minute=m))
-    if key in await skipped() or await db.approved_in_slot(key):
+    if key in await skipped() or await db.approved_in_slot(key) or await db.announced_posts(key):
         return
     if await db.overdue_approved(key_of(_now()), fmt):
         return  # слот закроет пост, чей собственный слот уже прошёл
-    label = cards.FORMAT_LABEL[fmt]
-
-    if md == "auto":
-        post = await pipeline.pick_auto(fmt)
-        if post:
-            await cards.send_card(bot, post, slot_key=key, status="announced")
-            return
-        head = (f"🤖 К слоту {h:02d}:{m:02d} ({label}) нет материала с оценкой ≥ {config.AUTO_MIN_SCORE} "
-                f"без замечаний — выберите сами: «⏱ Ближайший слот» или «✅ Опубликовать».")
+    post = await pipeline.pick_auto(fmt)
+    if post:
+        if fmt == "std":
+            post = await pipeline.ensure_text(post["id"])
+        await propose(post["id"], key)
+        await db.update_post(post["id"], status="announced")
+        await screen.notify(bot, f"🤖 В {h:02d}:{m:02d} выйдет сам: {headline(post, 80)}",
+                            [("👁 Открыть", f"n:open:{post['id']}"), ("🚫 Отменить", f"n:cancel:{post['id']}")])
     else:
-        head = f"🕑 Слот {h:02d}:{m:02d} · {label}. Выберите пост: «⏱ Ближайший слот» поставит его сюда."
+        post = await pipeline.pick_next(fmt)
+        if not post:
+            return await screen.notify(bot, f"К слоту {h:02d}:{m:02d} в запасе пусто.", [("🏠 Экран", "n:home")])
+        await propose(post["id"], key)
+        await screen.notify(bot, f"🤖 К слоту {h:02d}:{m:02d} нет поста с оценкой ≥ {config.AUTO_MIN_SCORE} "
+                                 "без замечаний — предложил вариант, реши сам.", [("📥 Открыть", f"n:open:{post['id']}")])
+    screen.refresh_soon(bot)
 
-    if not await offer(bot, key, fmt, head):
-        await bot.send_message(
-            config.ADMIN_ID, f"К слоту {h:02d}:{m:02d} ({label}) в очереди пусто. Пришлите ссылку или нажмите «Собрать».")
-
-
-# ---------- время слота ----------
 
 async def fire(bot: Bot, h: int, m: int, fmt: str) -> None:
-    if await paused():
-        return
+    from app import screen
     key = key_of(_now().replace(hour=h, minute=m))
-    how = f"по слоту {h:02d}:{m:02d}"
-    post = await db.approved_in_slot(key)
-    if not post:
-        overdue = await db.overdue_approved(key, fmt)   # ждал прошедшего слота — выходит в первом же свободном
-        post = overdue[0] if overdue else None
-    if not post and await mode() == "auto" and key not in await skipped():
-        announced = await db.announced_posts(key)
-        post, how = (announced[0], f"автомат, {h:02d}:{m:02d}") if announced else (None, how)
-    if post:
-        try:
-            await cards.publish_post(bot, post["id"], how, slot_key=key)
-        except Exception as exc:
-            log.exception("Слот %s: публикация %s", key, post["id"])
-            await bot.send_message(config.ADMIN_ID, f"⚠️ Слот {h:02d}:{m:02d}: пост не опубликован — {exc!r}")
+    if not await paused():
+        how = f"по слоту {h:02d}:{m:02d}"
+        post = await db.approved_in_slot(key)
+        if not post:
+            overdue = await db.overdue_approved(key, fmt)   # ждал прошедшего слота — выходит в первом же свободном
+            post = overdue[0] if overdue else None
+        if not post and await mode() == "auto" and key not in await skipped():
+            announced = await db.announced_posts(key)
+            post, how = (announced[0], f"автомат, {h:02d}:{m:02d}") if announced else (None, how)
+        if post:
+            try:
+                await cards.publish_post(bot, post["id"], how, slot_key=key)
+            except Exception as exc:
+                log.exception("Слот %s: публикация %s", key, post["id"])
+                await screen.notify(bot, f"⚠️ Слот {h:02d}:{m:02d}: пост не опубликован — {exc!r}"[:900])
+        await reschedule()
 
-    await reschedule(bot)
-
-    # невыбранные варианты и несостоявшиеся анонсы этого и прошлых слотов возвращаются в очередь
+    # невыбранные предложения и несостоявшиеся анонсы этого и прошлых слотов — обратно в запас
     for p in await db.slot_leftovers(key):
         if (p["offers"] or 0) >= config.MAX_OFFERS:
             await db.update_post(p["id"], status="auto_rejected", slot_key=None,
                                  reject_reason=f"не выбран {config.MAX_OFFERS} раза")
-            note = "\n\n↩️ <i>Не выбран — снят с предложения</i>"
         else:
             await db.update_post(p["id"], status="ready", slot_key=None)
-            note = "\n\n↩️ <i>Слот прошёл — вернулся в очередь</i>"
-        await cards.refresh_card(bot, p["id"], note)
+    screen.refresh_soon(bot)
+
+
+async def expire_inbox(bot: Bot) -> int:
+    """Посты, которые ждут решения дольше INBOX_TTL_HOURS, уходят обратно в запас (или снимаются)."""
+    from app import screen
+    n = 0
+    for p in await db.stale_inbox(config.INBOX_TTL_HOURS, key_of(_now())):
+        if (p["offers"] or 0) >= config.MAX_OFFERS:
+            await db.update_post(p["id"], status="auto_rejected", slot_key=None,
+                                 reject_reason=f"не выбран {config.MAX_OFFERS} раза")
+        else:
+            await db.update_post(p["id"], status="ready", slot_key=None)
+        n += 1
+    if n:
+        screen.refresh_soon(bot)
+    return n
+
+
+async def deliver_manual(bot: Bot, n: int) -> None:
+    """Ручной режим: несколько постов во входящие, 70% мини и 30% больших, не больше DAILY_MAX в день."""
+    from app import screen
+    if await mode() != "manual" or await paused():
+        return
+    left = config.DAILY_MAX - len(await db.sent_today())
+    added = 0
+    for _ in range(max(0, min(n, left))):
+        today = await db.inbox_posts()
+        minis = sum(1 for p in today if p["format"] == "mini")
+        fmt = "mini" if minis < 0.7 * (len(today) + 1) else "std"
+        post = await pipeline.pick_next(fmt)
+        if not post:
+            break
+        await propose(post["id"], None)
+        if post["format"] == "std":
+            try:
+                await pipeline.ensure_text(post["id"])
+            except Exception:
+                log.exception("Текст для входящих %s", post["id"])
+        added += 1
+    if added:
+        await screen.notify(bot, f"📥 Во входящих новых постов: {added}", [("📥 Разобрать", "n:inbox")])
+        screen.refresh_soon(bot)
+
+
+def has_text(post) -> bool:
+    return post["format"] != "std" or formatter.has_body(json.loads(post["data"]))
