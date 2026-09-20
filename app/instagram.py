@@ -25,7 +25,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from aiohttp import web
 from PIL import Image, ImageOps
 
-from app import cards, config, curator, db, formatter, screen
+from app import cards, config, curator, db, formatter, igtags, screen
 
 log = logging.getLogger(__name__)
 router = Router(name="instagram")
@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS ig_posts (
     media_id TEXT,
     permalink TEXT,
     error TEXT,
+    tags TEXT,                  -- json: {"author", "photographer", "via"} — ищутся один раз
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -81,7 +82,14 @@ async def enabled() -> bool:
 async def init() -> None:
     async with db.connect() as c:
         await c.executescript(SCHEMA)
+        cur = await c.execute("PRAGMA table_info(ig_posts)")
+        if "tags" not in {r["name"] for r in await cur.fetchall()}:
+            await c.execute("ALTER TABLE ig_posts ADD COLUMN tags TEXT")
         await c.commit()
+
+
+async def tags_enabled() -> bool:
+    return bool(await db.get_setting("ig_tags", True))
 
 
 # ======================= раздача фото =======================
@@ -251,7 +259,7 @@ Headline parts: names of buildings, works and people keep their original Latin s
 Return ONLY JSON: {"headline_parts": ["...", "..."], "text": "..."}"""
 
 
-async def english_caption(post) -> str:
+async def english_caption(post, tags: dict | None = None) -> str:
     data = json.loads(post["data"])
     fmt = post["format"]
     text_ru = str(data.get("mini_line") or "") if fmt == "mini" else str(data.get("body") or "")
@@ -266,8 +274,15 @@ async def english_caption(post) -> str:
             system=EN_SYSTEM, model=config.CLAUDE_MODEL, max_tokens=2500)
     head = " // ".join(str(p).strip() for p in (en.get("headline_parts") or parts) if str(p).strip())
     body = str(en.get("text") or "").strip()
-    c = data.get("credits") or {}
-    credits = [f"{k}: {c[k]}" for k in ("pr", "ph", "via") if c.get(k) and str(c[k]).strip().lower() != "null"]
+    c = {k: v for k, v in (data.get("credits") or {}).items() if v and str(v).strip().lower() != "null"}
+    tags = tags or {}
+    handle = {"pr": tags.get("author"), "ph": tags.get("photographer"), "via": tags.get("via")}
+    credits = []
+    for k in ("pr", "ph", "via"):
+        if handle[k]:
+            credits.append(f"{k}: @{handle[k]}")      # имя заменяется аккаунтом — так принято в Instagram
+        elif c.get(k):
+            credits.append(f"{k}: {c[k]}")
     tags = " ".join("#" + t for t in formatter.normalize_tags(data.get("tags", []), fmt))
     tail = [x for x in ("\n".join(credits), FOOTER, tags) if x]
     blocks = [b for b in (head, body) if b]
@@ -318,17 +333,28 @@ async def publish(bot: Bot, pid: int) -> None:
                 raise IGError("не заданы IG_ACCESS_TOKEN и IG_USER_ID в Railway")
             if not public_url():
                 raise IGError("у бота нет публичного адреса: Railway → Settings → Networking → Generate Domain")
-            caption = row["caption"] or await english_caption(post)
+            if row["tags"] is not None:
+                tags = json.loads(row["tags"] or "{}")
+            else:
+                tags = {}
+                if await tags_enabled():
+                    try:
+                        tags = await igtags.find(post)
+                    except Exception:
+                        log.warning("Instagram: отметки для %s не нашлись", pid, exc_info=True)
+                await _set(pid, tags=json.dumps(tags, ensure_ascii=False))
+            caption = row["caption"] or await english_caption(post, tags)
             await _set(pid, caption=caption)
             token_dir, urls = await _photos(bot, post)
+            marks = igtags.photo_tags(tags)
             async with httpx.AsyncClient() as client:
                 if len(urls) == 1:
-                    cid = (await _post(client, f"{ENV_USER}/media", image_url=urls[0], caption=caption))["id"]
+                    cid = await _container(client, pid, marks, image_url=urls[0], caption=caption)
                 else:
                     kids = []
-                    for u in urls:
-                        kids.append((await _post(client, f"{ENV_USER}/media", image_url=u,
-                                                 is_carousel_item="true"))["id"])
+                    for n, u in enumerate(urls):
+                        kids.append(await _container(client, pid, marks if n == 0 else [], image_url=u,
+                                                     is_carousel_item="true"))
                     for k in kids:
                         await _wait(client, k)
                     cid = (await _post(client, f"{ENV_USER}/media", media_type="CAROUSEL",
@@ -355,6 +381,23 @@ async def publish(bot: Bot, pid: int) -> None:
         finally:
             if token_dir:   # Instagram скачивает фото при создании контейнера — после публикации они не нужны
                 shutil.rmtree(PUBLIC_DIR / token_dir, ignore_errors=True)
+
+
+async def _container(client: httpx.AsyncClient, pid: int, marks: list, **data) -> str:
+    """Контейнер фото с метками. Не принял метки (аккаунт закрыт, переименован, не найден) — без них."""
+    if not marks:
+        return (await _post(client, f"{ENV_USER}/media", **data))["id"]
+    try:
+        return (await _post(client, f"{ENV_USER}/media", user_tags=json.dumps(marks), **data))["id"]
+    except IGError as exc:
+        first = exc
+    cid = (await _post(client, f"{ENV_USER}/media", **data))["id"]   # без меток прошло — значит, дело было в них
+    log.warning("Instagram: метки %s не приняты (%s), фото без них", marks, first)
+    row = await _row(pid)
+    tags = json.loads(row["tags"] or "{}")
+    tags["_photo_tags_rejected"] = str(first)[:120]
+    await _set(pid, tags=json.dumps(tags, ensure_ascii=False))
+    return cid
 
 
 async def process_pending(bot: Bot) -> None:
@@ -535,10 +578,19 @@ async def _v_ig(arg: dict):
                 item = f'{STATE["done"]} <a href="{html.escape(r["permalink"])}">{html.escape(head)}</a>'
             if r["status"] == "failed" and r["error"]:
                 item += f" — {html.escape(r['error'][:90])}"
+            t = json.loads(r["tags"] or "{}") if r["tags"] else {}
+            marks = [f"@{t[k]}" for k in ("author", "photographer", "via") if t.get(k)]
+            if marks:
+                item += " · " + html.escape(" ".join(marks))
             lines.append(item)
     failed = await failed_ids()
+    tags_on = await tags_enabled()
+    lines.insert(3 if on and configured() else 2,
+                 "Отмечаю бюро, автора, фотографа и издание, если нахожу их аккаунты." if tags_on
+                 else "Отметки аккаунтов выключены.")
     rows = [[btn("⏸ Выключить автопостинг" if on else "▶️ Включить автопостинг", "ig:toggle"),
-             btn("🔄 Проверить", "ig:check")]]
+             btn("🔄 Проверить", "ig:check")],
+            [btn("🏷 Отметки: вкл" if tags_on else "🏷 Отметки: выкл", "ig:tags")]]
     if failed:
         rows.append([btn(f"🔁 Повторить неудачные · {len(failed)}", "ig:retryall")])
     rows.append([btn("📤 Отправить последний пост из канала", "ig:last")])
@@ -566,6 +618,11 @@ async def on_ig(cb: CallbackQuery, bot: Bot):
         await db.set_setting("ig_enabled", now_on)
         await cb.answer("Автопостинг в Instagram включён" if now_on else "Автопостинг выключен: в Instagram ничего не уходит",
                         show_alert=True)
+        return await screen.show(bot, "ig")
+    if a == "tags":
+        now_on = not await tags_enabled()
+        await db.set_setting("ig_tags", now_on)
+        await cb.answer("Отмечаю аккаунты в новых постах" if now_on else "Отметки выключены")
         return await screen.show(bot, "ig")
     if a == "check":
         await cb.answer("Проверяю…")

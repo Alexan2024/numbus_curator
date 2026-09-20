@@ -163,7 +163,7 @@ async def main():
         BotCommand(command="cancel", description="Отменить ввод"),
     ])
     asyncio.create_task(guarded(bot, "запуск", startup, bot)())
-    log.info("AHMAG curator v3.2 запущен · режим %s · слоты %s", await slots.mode(), config.SLOTS)
+    log.info("AHMAG curator v3.3 запущен · режим %s · слоты %s", await slots.mode(), config.SLOTS)
     # chat_member приходит только если явно запрошен — список собирается по подключённым обработчикам
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
