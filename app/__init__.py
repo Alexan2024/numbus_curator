@@ -1,40 +1,63 @@
-"""AHMAG bot.
+"""Пристёжка дополнительных модулей к готовым файлам бота.
 
-Здесь подключается логотип на фото (app/brand.py): когда загружаются app.cards и app.instagram,
-к их функциям отправки фото пристёгивается наложение знака. Сами модули при этом не меняются."""
-import importlib.abc
+Сами cards.py и instagram.py не редактируются: как только Python их загружает,
+нужные функции в них подменяются на обёртки из отдельных модулей.
+
+    app.cards       → brand    логотип на фото, которые уходят в канал
+    app.instagram   → brand    логотип на фото для Instagram
+                    → igfit    пропорция карусели и обрезка без полей
+
+В логах при запуске появляются строки «Логотип подключён: …» и «Карусель Instagram: без полей …»."""
+import importlib.util
 import logging
 import sys
+from importlib.abc import Loader, MetaPathFinder
 
-_TARGETS = ("app.cards", "app.instagram")
+log = logging.getLogger(__name__)
+
+HOOKS = {
+    "app.cards": ("brand",),
+    "app.instagram": ("brand", "igfit"),
+}
 
 
-class _BrandHook(importlib.abc.MetaPathFinder):
-    def find_spec(self, name, path, target=None):
-        if name not in _TARGETS:
+def _attach(module) -> None:
+    for hook in HOOKS.get(module.__name__, ()):
+        try:
+            importlib.import_module(f"app.{hook}").attach(module)
+        except Exception:
+            log.error("Модуль %s не подключился к %s — бот работает без него", hook, module.__name__,
+                      exc_info=True)
+
+
+class _Proxy(Loader):
+    def __init__(self, inner: Loader):
+        self._inner = inner
+
+    def create_module(self, spec):
+        return self._inner.create_module(spec)
+
+    def exec_module(self, module):
+        self._inner.exec_module(module)
+        _attach(module)
+
+
+class _Finder(MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname not in HOOKS:
             return None
-        spec = None
-        for finder in sys.meta_path:
-            if finder is self or not hasattr(finder, "find_spec"):
-                continue
-            spec = finder.find_spec(name, path, target)
-            if spec:
-                break
-        if not spec or not spec.loader or not hasattr(spec.loader, "exec_module"):
-            return spec
-        run = spec.loader.exec_module
-
-        def exec_module(module, _run=run):
-            _run(module)
-            try:
-                from app import brand
-                brand.attach(module)
-            except Exception:
-                logging.getLogger("app.brand").exception("Логотип не подключился к %s", module.__name__)
-
-        spec.loader.exec_module = exec_module
+        sys.meta_path.remove(self)              # чтобы не искать самого себя
+        try:
+            spec = importlib.util.find_spec(fullname)
+        except Exception:
+            return None
+        finally:
+            sys.meta_path.insert(0, self)
+        if spec is None or spec.loader is None:
+            return None
+        spec.loader = _Proxy(spec.loader)
         return spec
 
 
-if not any(isinstance(f, _BrandHook) for f in sys.meta_path):
-    sys.meta_path.insert(0, _BrandHook())
+if not any(isinstance(f, _Finder) for f in sys.meta_path):
+    sys.meta_path.insert(0, _Finder())
