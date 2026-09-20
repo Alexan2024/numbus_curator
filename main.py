@@ -12,7 +12,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.types import BotCommand, ErrorEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from app import attribution, config, curator, db, growth, pipeline, reports, screen, slots
+from app import attribution, config, curator, db, growth, instagram, pipeline, reports, screen, slots
 from app.bot import router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -81,6 +81,9 @@ async def startup(bot: Bot):
     """После перезапуска: забрать пакеты, при пустом запасе — собрать, освежить экран."""
     await poll(bot)
     await attribution.snapshot(bot)   # первая точка кривой подписчиков
+    await instagram.check(bot)        # статус для кнопки «📸 Instagram» на пульте
+    await instagram.refresh_token()
+    await instagram.process_pending(bot)
     last = await db.get_setting("last_collect")
     stale = not last or (datetime.fromisoformat(db.now()) - datetime.fromisoformat(last)).total_seconds() > 6 * 3600
     if stale and await db.count_ready() + await db.batched_count() < pipeline.target_stock():
@@ -98,12 +101,15 @@ async def startup(bot: Bot):
 async def main():
     await db.init()
     await growth.init()
+    await instagram.init()
     screen.banner()
     bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     growth.install(bot)
+    instagram.install(bot)            # после публикации в канале — пост в Instagram на английском
     dp = Dispatcher()
     dp.include_router(attribution.router)   # вступления и выходы в канале
     dp.include_router(growth.router)        # раздел «Рост» — раньше основного, чтобы кнопки g:… не ушли в «старые»
+    dp.include_router(instagram.router)     # кнопки ig:…
     dp.include_router(router)
 
     @dp.error()
@@ -144,8 +150,10 @@ async def main():
                   day_of_week=config.DIGEST_DOW, hour=config.DIGEST_HOUR, id="digest")
     sched.add_job(guarded(bot, "очистка", cleanup), "cron", hour=4, minute=30, id="cleanup")
     growth.schedule(sched, bot, guarded)
+    instagram.schedule(sched, bot, guarded)
     sched.start()
 
+    await instagram.start_server()   # Instagram забирает фото по публичной ссылке
     await slots.reschedule()   # посты, чей слот прошёл или исчез из расписания, пока бот не работал
     await bot.set_my_commands([
         BotCommand(command="menu", description="Экран бота"),
@@ -155,7 +163,7 @@ async def main():
         BotCommand(command="cancel", description="Отменить ввод"),
     ])
     asyncio.create_task(guarded(bot, "запуск", startup, bot)())
-    log.info("AHMAG curator v3.1 запущен · режим %s · слоты %s", await slots.mode(), config.SLOTS)
+    log.info("AHMAG curator v3.2 запущен · режим %s · слоты %s", await slots.mode(), config.SLOTS)
     # chat_member приходит только если явно запрошен — список собирается по подключённым обработчикам
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
