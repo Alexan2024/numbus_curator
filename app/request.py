@@ -974,5 +974,10 @@ def attach(bot_module) -> None:
     screen.VIEWS["home"] = _wrap_home(screen.VIEWS["home"])
     screen.refresh_soon = _wrap_refresh(screen.refresh_soon)
     pipeline.run_collection = _wrap_collection(pipeline.run_collection)
+    try:
+        from app import queue_view
+        queue_view.attach(bot_module)
+    except Exception:
+        log.exception("Очередь публикаций не подключилась")
     _attached = True
     log.info("Пост по запросу подключён (TMDB %s)", "есть" if tmdb.configured() else "нет ключа")
