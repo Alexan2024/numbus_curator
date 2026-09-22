@@ -19,8 +19,11 @@ Are.na: /arena — список каналов, /arena add <ссылка или 
 
 Подключается из app/__init__.py после загрузки app.bot. Сами sources.py, pipeline.py, slots.py,
 media.py, screen.py и bot.py не менялись — к ним добавлены обёртки."""
+import asyncio
 import contextvars
+import io
 from datetime import timedelta
+from pathlib import Path
 import html
 import json
 import logging
@@ -30,6 +33,7 @@ import re
 import urllib.parse
 
 import httpx
+from PIL import Image
 from aiogram import Bot, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
@@ -88,6 +92,8 @@ PDR_LATEST, PDR_DEEP = 3, 6
 API_PER_RUN = int(os.getenv("FINDS_API_PER_RUN", "2"))   # объектов за сбор у каждого API
 ARENA_PER_RUN = int(os.getenv("ARENA_PER_RUN", "6"))
 EUROPEANA_KEY = os.getenv("EUROPEANA_KEY", "api2demo")
+CINEMA_SOURCES = {"filmgrab", "cinephilia"}      # у кадров из фильмов пропорции шире
+CINEMA_MAX_RATIO = float(os.getenv("CINEMA_MAX_RATIO", "2.45"))   # обычная проверка — 2.2
 FIND_RESERVE = 2                   # столько находок держим для слота находки
 FIND_STOCK = 4                     # меньше — при оценке добираем материалы из нишевых источников
 
@@ -110,6 +116,7 @@ ARENA_DEFAULT = ["architecture-drawings-and-speculations", "architecture-drawing
                  "photobook-5rge5873ke0", "exhibition-design-8ztvkq3su_u"]
 
 _FIND = contextvars.ContextVar("ahmag_find_slot", default=False)
+_WIDE = contextvars.ContextVar("ahmag_wide_ok", default=False)
 _attached = False
 
 
@@ -463,6 +470,52 @@ def _wrap_extract(orig):
 
 # ======================= обёртки: сбор, подготовка, отбор =======================
 
+def _wrap_download(orig):
+    """Для кино — та же загрузка фото, но с мягкой проверкой пропорций (скоуп 2.39 проходит)."""
+    async def download_images(client, urls, dest):
+        if not _WIDE.get():
+            return await orig(client, urls, dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        sem = asyncio.Semaphore(6)
+
+        async def fetch(i, u):
+            async with sem:
+                try:
+                    r = await client.get(u, timeout=40, follow_redirects=True)
+                    r.raise_for_status()
+                    im = Image.open(io.BytesIO(r.content))
+                    im.load()
+                    return i, im
+                except Exception:
+                    return i, None
+
+        results = sorted(await asyncio.gather(*(fetch(i, u) for i, u in enumerate(urls))), key=lambda x: x[0])
+        saved, hashes = [], []
+        for _, im in results:
+            if im is None:
+                continue
+            w, h = im.size
+            if max(w, h) < config.MIN_LONG_SIDE or min(w, h) < config.MIN_SHORT_SIDE:
+                continue
+            if max(w, h) / min(w, h) > CINEMA_MAX_RATIO:
+                continue
+            hsh = media._ahash(im)
+            if any(bin(hsh ^ x).count("1") <= 5 for x in hashes):
+                continue
+            hashes.append(hsh)
+            im = im.convert("RGB")
+            im.thumbnail((2560, 2560))
+            p = Path(dest) / f"{len(saved):02d}.jpg"
+            im.save(p, "JPEG", quality=90)
+            saved.append(p)
+            if len(saved) >= 14:
+                break
+        return saved
+
+    download_images.__wrapped__ = orig
+    return download_images
+
+
 def _wrap_source_names(orig):
     async def source_names():
         names = await orig()
@@ -497,7 +550,11 @@ def _wrap_museum_text(orig):
 
 def _wrap_prepare(orig):
     async def _prepare(client, cand, force: bool = False):
-        res = await orig(client, cand, force)
+        tok = _WIDE.set(cand["source"] in CINEMA_SOURCES)
+        try:
+            res = await orig(client, cand, force)
+        finally:
+            _WIDE.reset(tok)
         if isinstance(res, dict) and not force:
             payload = json.loads(cand["payload"] or "{}")
             if cand["source"] in MINI_ONLY or (cand["source"] == "arena" and "meta" in payload):
@@ -745,6 +802,7 @@ def attach(bot_module) -> None:
     sources.source_names = _wrap_source_names(sources.source_names)
     sources.prefilter = _wrap_prefilter(sources.prefilter)
     media.extract_article = _wrap_extract(media.extract_article)
+    media.download_images = _wrap_download(media.download_images)
     pipeline._museum_text = _wrap_museum_text(pipeline._museum_text)
     pipeline._prepare = _wrap_prepare(pipeline._prepare)
     pipeline._select_pool = _wrap_select_pool(pipeline._select_pool)
