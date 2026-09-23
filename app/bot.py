@@ -12,7 +12,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-from app import cards, config, curator, db, formatter, notes, pipeline, screen, slots, sources, voice
+from app import (cards, config, curator, db, finds, formatter, notes, pipeline, queue_view, request, screen, slots,
+                 sources, ui, voice)
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -52,20 +53,8 @@ def _background(bot: Bot, coro, what: str) -> None:
     asyncio.create_task(run())
 
 
-async def _drop(bot: Bot, *ids) -> None:
-    for mid in ids:
-        if mid:
-            try:
-                await bot.delete_message(config.ADMIN_ID, mid)
-            except Exception:
-                pass
-
-
-async def _list(bot: Bot, **arg) -> None:
-    """Показать пост на экране в текущем режиме просмотра (или в указанном)."""
-    view, cur = await screen.current()
-    base = cur if view == "list" else {"mode": "one"}
-    await screen.show(bot, "list", **{**base, "kb": None, **arg})
+_drop = ui.drop
+_list = ui.show_post
 
 
 # ======================= команды =======================
@@ -130,6 +119,12 @@ async def cmd_diag(msg: Message):
     lines.append(f"💵 Сегодня ${await db.cost_today():.2f}, из них фоном ${await db.cost_today(True):.2f} "
                  f"из ${config.DAILY_BUDGET_USD:.2f} · вызовов {await db.calls_today()}")
     lines.append(f"🧠 Модели: оценка {config.CLAUDE_MODEL} · фильтр {config.TRIAGE_MODEL} · тексты {config.WRITER_MODEL}")
+    fs = slots.find_slot()
+    async with db.connect() as c:
+        prints = (await (await c.execute("SELECT COUNT(*) n FROM post_prints")).fetchone())["n"]
+    lines.append(f"⚙️ v{config.VERSION} · страховка полуавтомата {'вкл' if config.SEMI_FALLBACK else 'выкл'} · "
+                 f"слот находки {'%02d:%02d' % fs if fs else 'выкл'} · повторы: {config.REPEAT_DAYS} дн., "
+                 f"отпечатков {prints}")
     await wait.edit_text("\n\n".join(lines))
 
 
@@ -147,6 +142,7 @@ async def cmd_purge(msg: Message, command: CommandObject, bot: Bot):
 
 async def _collect(bot: Bot) -> None:
     s = await pipeline.run_collection(manual=True)
+    request.after_collection()
     stock = sum(sum(v.values()) for v in (await db.stock_counts()).values())
     lines = [f"🔎 Сбор: новых {s['added']}, отсеяно по заголовку и дублям {s['dropped'] + s['dups']}, "
              f"фильтр пропустил {s['yes']} из {s['yes'] + s['no']}."]
@@ -223,7 +219,12 @@ async def on_home(cb: CallbackQuery, bot: Bot, state: FSMContext):
     if action == "collect":
         await cb.answer("Собираю. Пришлю сводку", show_alert=False)
         return _background(bot, _collect(bot), "Сбор")
-    if action in ("stats", "digest", "src", "voice"):
+    if action == "perfr":
+        await cb.answer("Обновляю цифры…")
+        from app import stats
+        await stats.refresh(bot)
+        return await screen.show(bot, "perf")
+    if action in ("stats", "digest", "src", "voice", "perf"):
         await cb.answer()
         return await screen.show(bot, action)
     if action == "srct":
@@ -488,6 +489,11 @@ async def on_post(cb: CallbackQuery, bot: Bot, state: FSMContext):
             m = await bot.send_message(config.ADMIN_ID, post["caption"][:4000], disable_web_page_preview=True)
             return await screen.add_temp([m.message_id])
 
+        if action == "sbg":
+            await cb.answer("Собираю фон…")
+            from app import stories
+            await stories.send_background(bot, pid)
+            return
         if action == "ig":
             await cb.answer("Собираю пакет…")
             await cards.instagram_pack(bot, pid)
@@ -519,11 +525,7 @@ async def on_post(cb: CallbackQuery, bot: Bot, state: FSMContext):
 
 # ======================= ввод текста =======================
 
-async def _ask(bot: Bot, state: FSMContext, st, text: str, **data) -> None:
-    await state.set_state(st)
-    m = await bot.send_message(config.ADMIN_ID, text)
-    await state.update_data(prompt=m.message_id, **data)
-    await screen.add_temp([m.message_id])
+_ask = ui.ask
 
 
 async def _finish(msg: Message, state: FSMContext, bot: Bot) -> dict:
@@ -661,5 +663,10 @@ async def on_stale(cb: CallbackQuery):
         pass
 
 
+# порядок важен: сначала свои обработчики этого роутера (пост по ссылке, ввод в диалогах), потом дочерние;
+# «пост по запросу» ловит любой обычный текст, поэтому идёт после заметок, а «старые кнопки» — последними
 router.include_router(notes.router)
+router.include_router(finds.router)
+router.include_router(queue_view.router)
+router.include_router(request.router)
 router.include_router(stale)

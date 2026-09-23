@@ -16,16 +16,16 @@ import re
 import secrets
 import shutil
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import httpx
 from aiogram import Bot, F, Router
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import CallbackQuery
 from aiohttp import web
 from PIL import Image, ImageOps
 
-from app import cards, config, curator, db, formatter, igtags, screen
+from app import brand, cards, config, curator, db, formatter, igfit, igtags, screen, stories
 
 log = logging.getLogger(__name__)
 router = Router(name="instagram")
@@ -122,26 +122,38 @@ async def start_server() -> None:
 
 
 def _fit(im: Image.Image, w: int, h: int) -> Image.Image:
-    """Фото в холст w×h: почти той же пропорции — лёгкая обрезка, иначе целиком с полями."""
+    """Фото в кадр w×h и логотип в левый нижний угол снимка. Обычно снимок уже обрезан под пропорцию
+    карусели (см. _photos), и остаётся только масштаб. Если пропорция всё же другая — снимок целиком
+    с полями, знак тогда встаёт в угол самого снимка, а не полей."""
     im = ImageOps.exif_transpose(im).convert("RGB")
     r, R = im.width / im.height, w / h
     if abs(r - R) / R < 0.03:
-        return ImageOps.fit(im, (w, h), Image.LANCZOS)
-    scale = min(w / im.width, h / im.height)
-    small = im.resize((max(1, round(im.width * scale)), max(1, round(im.height * scale))), Image.LANCZOS)
-    canvas = Image.new("RGB", (w, h), PAD)
-    canvas.paste(small, ((w - small.width) // 2, (h - small.height) // 2))
-    return canvas
+        out, box = ImageOps.fit(im, (w, h), Image.LANCZOS), None
+    else:
+        scale = min(w / im.width, h / im.height)
+        small = im.resize((max(1, round(im.width * scale)), max(1, round(im.height * scale))), Image.LANCZOS)
+        out = Image.new("RGB", (w, h), PAD)
+        box = ((w - small.width) // 2, (h - small.height) // 2, small.width, small.height)
+        out.paste(small, box[:2])
+    if not brand.enabled():
+        return out
+    try:
+        return brand.stamp(out, box)
+    except Exception:
+        log.warning("Логотип: фото для Instagram ушло без знака", exc_info=True)
+        return out
 
 
 async def _photos(bot: Bot, post) -> tuple[str, list[str]]:
-    """Фото поста → JPEG одной пропорции в публичной папке. → (токен папки, ссылки)"""
+    """Фото поста → JPEG одной пропорции в публичной папке, без полей. → (токен папки, ссылки)
+    Пропорция карусели и какие кадры в неё влезают без полей — app/igfit.py."""
     images = json.loads(post["images"] or "[]")
     fids = cards._fids(post)
     token = secrets.token_urlsafe(18)
     folder = PUBLIC_DIR / token
     folder.mkdir(parents=True, exist_ok=True)
-    raw = []
+
+    raw: list[Path] = []
     for n, i in enumerate(cards.photo_plan(post)[:10]):
         src = Path(images[i]) if i < len(images) else None
         tmp = folder / f"src{n:02d}"
@@ -152,19 +164,36 @@ async def _photos(bot: Bot, post) -> tuple[str, list[str]]:
         else:
             continue
         raw.append(tmp)
-    if not raw:
+
+    files, ratios = [], []
+    for p in raw:
+        try:
+            ratios.append(igfit.read_ratio(p))
+            files.append(p)
+        except Exception:
+            log.warning("Instagram: файл %s не открылся, кадр пропущен", p.name, exc_info=True)
+            p.unlink(missing_ok=True)
+    if not files:
         shutil.rmtree(folder, ignore_errors=True)
         raise RuntimeError("у поста не нашлось фото — ни на диске, ни в Telegram")
-    with Image.open(raw[0]) as first:
-        first = ImageOps.exif_transpose(first)
-        ratio = min(max(first.width / first.height, 0.8), 1.91)   # Instagram: от 4:5 до 1.91:1
-    w, h = WIDTH, round(WIDTH / ratio)
-    urls, base = [], public_url()
-    for n, p in enumerate(raw):
-        with Image.open(p) as im:
-            _fit(im, w, h).save(folder / f"{n:02d}.jpg", "JPEG", quality=92)
+
+    target, keep = igfit.plan(ratios)
+    w = WIDTH
+    h = max(1, round(w / target))
+    exact = w / h                                        # пропорция готового кадра, с учётом округления
+    if len(keep) < len(files):
+        log.info("Instagram: пропорция %.3f, в карусель идут %d из %d кадров (остальные не влезают без полей)",
+                 exact, len(keep), len(files))
+
+    urls, base, out = [], public_url(), 0
+    for n, p in enumerate(files):
+        if n in keep:
+            with Image.open(p) as im:
+                # обрезка до точной пропорции кадра: дальше _fit только масштабирует и ставит логотип
+                _fit(igfit.crop(im, exact), w, h).save(folder / f"{out:02d}.jpg", "JPEG", quality=92)
+            urls.append(f"{base}/ig/{token}/{out:02d}.jpg")
+            out += 1
         p.unlink(missing_ok=True)
-        urls.append(f"{base}/ig/{token}/{n:02d}.jpg")
     return token, urls
 
 
@@ -368,6 +397,8 @@ async def publish(bot: Bot, pid: int) -> None:
             await _set(pid, status="done", media_id=media_id, permalink=link, error=None)
             await db.set_setting("ig_last_ok", db.now())
             log.info("Instagram: пост %s опубликован %s", pid, link)
+            from app import stories
+            asyncio.create_task(stories.after_post(bot, pid))    # фон для сторис или сама сторис
         except Exception as exc:
             msg = str(exc) if isinstance(exc, IGError) else curator.explain(exc)
             log.warning("Instagram: пост %s не ушёл: %s", pid, msg)
@@ -418,36 +449,20 @@ async def process_pending(bot: Bot) -> None:
 
 
 def install(bot: Bot) -> None:
-    """После каждой публикации в канале — пост в очередь Instagram; кнопка статуса — на пульт."""
+    """Вид «📸 Instagram» — в экран. Кнопка на пульте — в screen._home, зеркало публикации — в cards.publish_post."""
     global _bot
     _bot = bot
-    original = cards.publish_post
+    screen.VIEWS["ig"] = _v_ig
 
-    async def publish_and_mirror(bot_: Bot, pid: int, *args, **kwargs) -> bool:
-        ok = await original(bot_, pid, *args, **kwargs)
-        if ok and configured() and await enabled():
-            post = await db.get_post(pid)
-            if post and (post["source"] or "") != "digest":
-                await enqueue(pid)
-                asyncio.create_task(_safe_publish(bot_, pid))
-        return ok
 
-    cards.publish_post = publish_and_mirror
-
-    home = screen.VIEWS["home"]
-
-    async def home_with_ig(arg: dict):
-        photo, text, kb, arg = await home(arg)
-        rows = [list(r) for r in kb.inline_keyboard]
-        b = btn(f"📸 Instagram {await status_icon()}", "ig:home")
-        row = next((r for r in rows if any(getattr(x, "callback_data", "") == "g:home" for x in r)), None)
-        if row is not None:
-            row.append(b)
-        else:
-            rows.insert(max(len(rows) - 1, 0), [b])
-        return photo, text, InlineKeyboardMarkup(inline_keyboard=rows), arg
-
-    screen.VIEWS.update({"home": home_with_ig, "ig": _v_ig})
+async def mirror(bot: Bot, pid: int) -> None:
+    """После публикации в канале — пост в очередь Instagram (подборки со ссылками на Telegram туда не идут)."""
+    if not configured() or not await enabled():
+        return
+    post = await db.get_post(pid)
+    if post and (post["source"] or "") != "digest":
+        await enqueue(pid)
+        asyncio.create_task(_safe_publish(bot, pid))
 
 
 async def _safe_publish(bot: Bot, pid: int) -> None:
@@ -566,6 +581,9 @@ async def _v_ig(arg: dict):
         lines.append(f"<i>Проверено {h['at'][5:16].replace('T', ' ')}</i>")
     if arg.get("note"):
         lines += ["", f"<b>{html.escape(arg['note'])}</b>"]
+    sl = await stories.last_line()
+    if sl:
+        lines.append(html.escape(sl))
     rows_ig = await recent()
     if rows_ig:
         lines += ["", "<b>Последние</b>"]
@@ -590,7 +608,8 @@ async def _v_ig(arg: dict):
                  else "Отметки аккаунтов выключены.")
     rows = [[btn("⏸ Выключить автопостинг" if on else "▶️ Включить автопостинг", "ig:toggle"),
              btn("🔄 Проверить", "ig:check")],
-            [btn("🏷 Отметки: вкл" if tags_on else "🏷 Отметки: выкл", "ig:tags")]]
+            [btn("🏷 Отметки: вкл" if tags_on else "🏷 Отметки: выкл", "ig:tags"),
+             btn(f"📖 Сторис: {stories.MODES[await stories.mode()]} ▸", "ig:stories")]]
     if failed:
         rows.append([btn(f"🔁 Повторить неудачные · {len(failed)}", "ig:retryall")])
     rows.append([btn("📤 Отправить последний пост из канала", "ig:last")])
@@ -618,6 +637,13 @@ async def on_ig(cb: CallbackQuery, bot: Bot):
         await db.set_setting("ig_enabled", now_on)
         await cb.answer("Автопостинг в Instagram включён" if now_on else "Автопостинг выключен: в Instagram ничего не уходит",
                         show_alert=True)
+        return await screen.show(bot, "ig")
+    if a == "stories":
+        new = stories.NEXT[await stories.mode()]
+        await db.set_setting("ig_story_mode", new)
+        await cb.answer({"bg": f"Фон для сторис — тебе, к постам с оценкой от {stories.MIN_SCORE}",
+                         "auto": "Бот сам публикует сторис к большим постам",
+                         "off": "Сторис выключены"}[new], show_alert=True)
         return await screen.show(bot, "ig")
     if a == "tags":
         now_on = not await tags_enabled()

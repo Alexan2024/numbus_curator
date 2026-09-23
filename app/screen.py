@@ -11,7 +11,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
 from PIL import Image, ImageDraw, ImageFont
 
-from app import cards, config, db, formatter, reports, slots, voice
+from app import cards, config, db, formatter, niche, reports, slots, voice
 
 log = logging.getLogger(__name__)
 
@@ -132,9 +132,34 @@ async def _home(arg: dict):
         [mode_btn("manual", "✋ Ручной"), mode_btn("semi", "🤝 Полуавто"), mode_btn("auto", "🤖 Авто")],
         [btn("📝 #ahmagnotes", "h:notes"), btn("🔎 Собрать сейчас", "h:collect")],
         [btn("📊 Статистика", "h:stats"), btn("📡 Источники", "h:src")],
-        [btn("✍️ Голос", "h:voice"), btn("▶️ Снять с паузы" if ps else "⏸ Пауза", "h:pause")],
     ]
+    rows += await _home_extras()
+    rows.append([btn("✍️ Голос", "h:voice"), btn("▶️ Снять с паузы" if ps else "⏸ Пауза", "h:pause")])
     return banner(), "\n".join(lines), _kb(rows), arg
+
+
+async def _home_extras() -> list[list]:
+    """Разделы, у которых своя логика в отдельных модулях: запрос и отложенные, очередь, находки, рост, Instagram.
+    Модули импортируются здесь, а не наверху: они сами пользуются экраном."""
+    from app import finds, instagram, request
+    rows = []
+    try:
+        n = len(await request.wishlist())
+        rows.append([btn("✍️ Пост по запросу", "rq:ask"), btn(f"🕓 Отложенные · {n}" if n else "🕓 Отложенные", "rq:wl")])
+    except Exception:
+        log.warning("Кнопка «Пост по запросу»", exc_info=True)
+    rows.append([btn("🗂 Очередь публикаций", "qv:show")])
+    try:
+        rows.append([btn(await finds.home_label(), "fa:info")])
+    except Exception:
+        log.warning("Кнопка «Находки»", exc_info=True)
+    try:
+        ig = f"📸 Instagram {await instagram.status_icon()}"
+    except Exception:
+        log.warning("Кнопка «Instagram»", exc_info=True)
+        ig = "📸 Instagram"
+    rows.append([btn("📈 Рост", "g:home"), btn(ig, "ig:home")])
+    return rows
 
 
 async def _slot(arg: dict):
@@ -230,7 +255,8 @@ async def _plan(arg: dict):
 
 
 async def _stats(arg: dict):
-    return banner(), await reports.stats_text(), _kb([[btn("📈 Итоги недели", "h:digest"), btn("← Пульт", "h:home")]]), arg
+    return banner(), await reports.stats_text(), _kb([[btn("🏆 Что заходит", "h:perf"), btn("📈 Итоги недели", "h:digest")],
+                                                       [btn("← Пульт", "h:home")]]), arg
 
 
 async def _digest(arg: dict):
@@ -342,6 +368,8 @@ async def _post_kb(post, mode: str, idx: int, n: int, clipped: bool, sub: str | 
         nums = [btn(f"{i + 1}" + ("★" if i == cover else "") + (" ✕" if i in excluded else ""),
                     f"v:{'pcs' if sub == 'cover' else 'px'}:{pid}:{i}") for i in range(len(images))]
         rows = [nums[i:i + 5] for i in range(0, len(nums), 5)]
+        if sub == "photos" and st in ("ready", "sent", "approved", "announced"):
+            rows.append([btn("🔄 Ещё кадры", f"rq:more:{pid}")])
         rows.append([btn("← К фото", f"v:ph:{pid}")] if sub == "cover"
                     else [btn("⭐ Обложка", f"v:pc:{pid}"), btn("Готово", f"v:back:{pid}")])
         return _kb(rows)
@@ -360,9 +388,11 @@ async def _post_kb(post, mode: str, idx: int, n: int, clipped: bool, sub: str | 
                 if other["id"] != pid:
                     rows.append([btn(f"⇄ {slots.human_key(other['slot_key'])} · {slots.headline(other, 22)}",
                                      f"v:ps:{pid}:{slots.enc(other['slot_key'])}")])
-        return _kb(rows + [[btn("← Назад", f"v:back:{pid}")]])
+        return _kb(await _bump_rows(post) + rows + [[btn("← Назад", f"v:back:{pid}")]])
 
     rows = []
+    if post["source"] in niche.FINDS:        # метка видна только в боте, в канале её нет
+        rows.append([btn(f"🔍 Находка · {niche.LABELS.get(post['source'], post['source'])}", "v:noop")])
     needs_text = fmt == "std" and not formatter.has_body(json.loads(post["data"]))
     if st == "sent":
         if needs_text:
@@ -380,7 +410,8 @@ async def _post_kb(post, mode: str, idx: int, n: int, clipped: bool, sub: str | 
         rows.append([btn("🗓 Выбрать слот", f"v:pick:{pid}")])
     elif st == "published":
         link = cards.post_link(post)
-        rows.append([btn("📸 Пакет для Instagram", f"v:ig:{pid}")]
+        rows.append([btn("📸 Пакет для Instagram", f"v:ig:{pid}"), btn("📖 Фон для сторис", f"v:sbg:{pid}")])
+        rows.append([]
                     + ([InlineKeyboardButton(text="🔗 В канале", url=link)] if link else []))
     elif st in ("rejected", "auto_rejected"):
         rows.append([btn("↩️ Вернуть в запас", f"v:restore:{pid}")])
@@ -401,6 +432,22 @@ async def _post_kb(post, mode: str, idx: int, n: int, clipped: bool, sub: str | 
         rows.append([btn("◀", f"v:nav:{pid}:-1"), btn(f"{idx + 1} / {n}", "v:noop"), btn("▶", f"v:nav:{pid}:1")])
     rows.append(([btn("← Запас", "h:stock")] if mode == "stock" else []) + [btn("🏠 Пульт", "h:home")])
     return _kb(rows)
+
+
+async def _bump_rows(post) -> list[list]:
+    """Выбор слота: первой строкой ⚡️ ближайший слот, даже занятый; для поста без слота — ещё и занятые слоты
+    (у одобренного они уже есть строками «⇄ поменять»). Занявший слот пост сдвигается, см. slots.place."""
+    pid, st = post["id"], post["status"]
+    if st not in ("ready", "sent", "approved"):
+        return []
+    rows = []
+    key = await slots.nearest_key()
+    if key and not (st == "approved" and post["slot_key"] == key):
+        rows.append([btn(f"⚡️ {slots.human_key(key)} · даже если занят", f"rq:bump:{pid}")])
+    if st in ("ready", "sent"):
+        busy = [c for c in await slots.slot_choices() if c["post"] and c["key"] != key]
+        rows += [[btn(slots.slot_label(c, short=True), f"rq:put:{pid}:{slots.enc(c['key'])}")] for c in busy[:6]]
+    return rows
 
 
 async def _list(arg: dict):

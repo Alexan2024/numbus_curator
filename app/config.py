@@ -14,6 +14,8 @@ def _hm(raw: str) -> tuple[int, int]:
     return int(h), int(m or 0)
 
 
+VERSION = "4.1"
+
 BOT_TOKEN = _req("BOT_TOKEN")
 ADMIN_ID = int(_req("ADMIN_ID"))
 CHANNEL_ID = _req("CHANNEL_ID")  # @username или -100...
@@ -54,6 +56,8 @@ PLAN_TIME = _hm(os.getenv("PLAN_TIME", "21:00"))          # план на зав
 AUTO_MIN_SCORE = int(os.getenv("AUTO_MIN_SCORE", "8"))    # автомат публикует сам только от этой оценки
 MAX_OFFERS = int(os.getenv("MAX_OFFERS", "2"))            # сколько раз предлагать пост, прежде чем снять
 INBOX_TTL_HOURS = int(os.getenv("INBOX_TTL_HOURS", "48")) # сколько пост ждёт решения во входящих
+SEMI_FALLBACK = os.getenv("SEMI_FALLBACK", "1").strip().lower() not in ("0", "off", "false", "no")  # страховка полуавтомата
+FIND_EVERY_DAYS = int(os.getenv("FIND_EVERY_DAYS", "1"))  # слот находки: каждый день (1), через день (2)…
 
 # Ручной режим: когда класть посты во входящие и сколько в день
 DAILY_MAX = int(os.getenv("DAILY_MAX", "10"))
@@ -64,6 +68,7 @@ COLLECT_TIMES = [_hm(t) for t in os.getenv("COLLECT_TIMES", "06:00,16:00").split
 STOCK_DAYS = float(os.getenv("STOCK_DAYS", "2"))            # запас готовых постов — на сколько дней слотов
 MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "12"))           # сколько материалов оценивать за проход
 TRIAGE_MAX = int(os.getenv("TRIAGE_MAX", "80"))             # сколько новых материалов фильтровать за проход
+REPEAT_DAYS = int(os.getenv("REPEAT_DAYS", "365"))       # один и тот же объект снова — не раньше, дней
 CANDIDATE_TTL_DAYS = int(os.getenv("CANDIDATE_TTL_DAYS", "10"))  # отобранное, но не оценённое — сколько живёт
 EVAL_PHOTOS = int(os.getenv("EVAL_PHOTOS", "8"))            # сколько фото смотрит Claude при оценке
 THUMB_SIZE = int(os.getenv("THUMB_SIZE", "480"))            # размер превью для Claude, px

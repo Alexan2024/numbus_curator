@@ -15,34 +15,37 @@
 «🔄 Ещё кадры» в разделе фото карточки: докачивает новые фото (TMDB, страницы, Commons), без повторов
 того, что уже есть, и даёт выбрать, какие добавить.
 
-Подключается из app/__init__.py после загрузки app.bot: хэндлеры регистрируются на его router,
-кнопки добавляются к экрану обёртками. Сами bot.py, screen.py, pipeline.py не менялись."""
+Обработчики — свой роутер, он подключён в bot.py последним перед «старыми кнопками»: ссылки раньше
+забирает «пост по ссылке», ввод в диалогах — свои обработчики. Кнопки на пульте и карточке — в screen.py,
+выбор слотов (ближайший, даже занятый) — в slots.py, отложенные после сбора — main.collect."""
 import asyncio
 import html
-import io
 import itertools
 import json
 import logging
 import re
 import shutil
 import time
-from datetime import timedelta
 from pathlib import Path
 from urllib.parse import quote
 
 import httpx
-from aiogram import Bot, F
+from aiogram import Bot, F, Router
 from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardMarkup, InputMediaPhoto, Message
 from PIL import Image
 
-from app import commons, config, curator, db, formatter, media, pipeline, screen, slots, tmdb
+from app import commons, config, curator, db, media, pipeline, screen, slots, tmdb, ui
 
 log = logging.getLogger(__name__)
+router = Router()
+router.message.filter(F.from_user.id == config.ADMIN_ID)
+router.callback_query.filter(F.from_user.id == config.ADMIN_ID)
+NOT_CMD = ~F.text.regexp(r"^/(?!later\b|потом\b)")
+NOT_FWD = F.func(lambda m: getattr(m, "forward_origin", None) is None)
 
-BUMP_MIN_LEAD = 2          # минут до слота: ближе — берём следующий
 PHOTO_WAIT = 1.5           # секунд ждём остальные фото альбома
 PENDING_TTL = 50           # сколько последних запросов помнить
 MORE_MAX = 9               # сколько новых кадров показывать за раз
@@ -51,14 +54,11 @@ FORMATS = {"std": "большой", "mini": "мини", "notes": "#ahmagnotes"}
 NEXT_FMT = {"std": "mini", "mini": "notes", "notes": "std"}
 LATER_RE = re.compile(r"^\s*(?:/later|/потом|потом)\s*[:\-—]?\s+(.+)$", re.I | re.S)
 
-_bot_mod = None            # app.bot — берём оттуда _list, _drop, _ask
-_bot: Bot | None = None    # для уведомлений из фоновых задач
 _pending: dict[str, dict] = {}
 _albums: dict[str, dict] = {}
 _more: dict[int, dict] = {}
 _ids = itertools.count(1)
 _wl_lock = asyncio.Lock()
-_attached = False
 
 
 class Req(StatesGroup):
@@ -72,82 +72,6 @@ def btn(text: str, data: str):
 
 def kb(rows) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-# ======================= ближайший слот, даже занятый =======================
-
-async def nearest_key() -> str | None:
-    """Ближайший будущий слот любого формата, кроме пропущенных и тех, до которых меньше пары минут."""
-    sk = await slots.skipped()
-    edge = slots._now() + timedelta(minutes=BUMP_MIN_LEAD)
-    for dt, _ in slots.upcoming(None, 20):
-        key = slots.key_of(dt)
-        if dt > edge and key not in sk:
-            return key
-    return None
-
-
-async def slot_choices(limit_today_min: int = 3) -> list[dict]:
-    """Оставшиеся слоты сегодня (если их меньше трёх — плюс завтрашние): ключ, формат и кто там стоит."""
-    sk = await slots.skipped()
-    edge = slots._now() + timedelta(minutes=BUMP_MIN_LEAD)
-    today = slots._now().date()
-    out = [{"key": slots.key_of(dt), "fmt": f, "dt": dt} for dt, f in slots.upcoming(None, 20)
-           if dt > edge and slots.key_of(dt) not in sk]
-    todays = [c for c in out if c["dt"].date() == today]
-    if len(todays) >= limit_today_min:
-        out = todays
-    else:
-        out = todays + [c for c in out if c["dt"].date() == today + timedelta(days=1)]
-    rows = await db.posts_in_slots([c["key"] for c in out])
-    for c in out:
-        here = [r for r in rows if r["slot_key"] == c["key"] and r["status"] in ("approved", "announced")]
-        c["post"] = here[0] if here else None
-    return out
-
-
-def slot_label(c: dict, short: bool = False) -> str:
-    t = f"{c['dt']:%H:%M}" if c["dt"].date() == slots._now().date() else f"завтра {c['dt']:%H:%M}"
-    fmt = "мини" if c["fmt"] == "mini" else "большой"
-    if c["post"]:
-        return f"⤵ {t} · вместо «{slots.headline(c['post'], 18 if short else 24)}»"
-    return f"⚪️ {t} · свободен · {fmt}"
-
-
-async def place(pid: int, key: str) -> str:
-    """Ставит пост в слот key. Занявший его пост сдвигается. → строка для экрана."""
-    if slots.key_dt(key) <= slots._now():
-        raise RuntimeError("этот слот уже прошёл — выбери другой")
-    moved = []
-    for p in await db.posts_in_slots([key]):
-        if p["id"] == pid:
-            continue
-        if p["status"] == "announced":          # автопост к этому слоту — во входящие
-            await db.update_post(p["id"], status="sent", slot_key=None, sent_at=db.now())
-            moved.append(f"«{slots.headline(p, 30)}» → во входящие")
-        elif p["status"] == "approved":
-            fmt = p["format"] if p["format"] in ("std", "mini") else "std"
-            nk = await slots.next_free(fmt)     # сам key ещё занят этим постом, поэтому next_free его не вернёт
-            await db.update_post(p["id"], slot_key=nk)
-            moved.append(f"«{slots.headline(p, 30)}» → {slots.human_key(nk) if nk else 'первый свободный слот'}")
-    post = await db.get_post(pid)
-    if post["format"] == "std" and not formatter.has_body(json.loads(post["data"])):
-        await pipeline.ensure_text(pid)
-    await db.update_post(pid, status="approved", decided_at=db.now(), slot_key=key)
-    note = f"Выйдет {slots.human_key(key)}"
-    if await slots.paused():
-        note += " (сейчас пауза)"
-    if moved:
-        note += ". Сдвинут: " + "; ".join(moved)
-    return note
-
-
-async def bump(pid: int) -> str:
-    """В ближайший слот, даже занятый."""
-    key = await nearest_key()
-    if not key:
-        raise RuntimeError("впереди нет ни одного слота — проверь SLOTS и пропуски")
-    return "⚡️ " + await place(pid, key)
 
 
 REQUEST_SYSTEM = """Ты помогаешь редактору Telegram-канала AHMAG (архитектура, интерьеры, искусство, фотография, архивы, кино) собрать материал для поста по запросу автора. Автор пишет коротко: название фильма, здания, имя художника или фотографа, иногда с уточнением. Найди в интернете, о чём именно речь, и собери проверенные факты для поста в один-два абзаца.
@@ -361,7 +285,7 @@ async def _card(bot: Bot, tok: str, edit: Message | None = None) -> None:
                 "Бот соберёт материал и пришлёт план на утверждение, как обычно у заметок.")
         rows.append([btn("📝 Собрать материал", f"rq:go:{tok}")])
     else:
-        key = await nearest_key()
+        key = await slots.nearest_key()
         rows.append([btn("📥 Во входящие", f"rq:go:{tok}")])
         rows.append([btn(f"⚡️ Ближайший слот{' · ' + slots.human_key(key) if key else ''}", f"rq:now:{tok}")])
         rows.append([btn("🗓 Выбрать слот, даже занятый", f"rq:slots:{tok}")])
@@ -375,7 +299,7 @@ async def _card(bot: Bot, tok: str, edit: Message | None = None) -> None:
 
 async def _slots_card(msg: Message, tok: str) -> None:
     it = _pending[tok]
-    rows = [[btn(slot_label(c), f"rq:at:{tok}:{slots.enc(c['key'])}")] for c in await slot_choices()]
+    rows = [[btn(slots.slot_label(c), f"rq:at:{tok}:{slots.enc(c['key'])}")] for c in await slots.slot_choices()]
     rows.append([btn("← Назад", f"rq:back:{tok}")])
     await msg.edit_text(f"<b>Пост по запросу</b>\n«{html.escape(it['q'])}»\n\n"
                         "Куда поставить? Если слот занят, стоявший там пост переедет в следующий свободный слот "
@@ -456,7 +380,7 @@ async def _build(bot: Bot, msg: Message, tok: str) -> None:
     if not pid:
         return await _status(msg, f"Пост не собрался: {html.escape(note)}")
 
-    await _bot_mod._drop(bot, msg.message_id, *it.get("msgs", []))
+    await ui.drop(bot, msg.message_id, *it.get("msgs", []))
     _pending.pop(tok, None)
     if it.get("wl"):
         await _wl_remove(it["wl"])
@@ -464,11 +388,11 @@ async def _build(bot: Bot, msg: Message, tok: str) -> None:
     post = await db.get_post(pid)
     if target and post["status"] in ("ready", "sent", "approved"):
         try:
-            done = await (bump(pid) if target == "nearest" else place(pid, target))
+            done = await (slots.bump(pid) if target == "nearest" else slots.place(pid, target))
         except Exception as exc:
             log.exception("слот для поста по запросу")
             try:     # слот успел пройти, пока собирался пост, — тогда в ближайший
-                done = await bump(pid)
+                done = await slots.bump(pid)
             except Exception:
                 done = f"В слот не встал: {curator.explain(exc)}"[:200]
                 await slots.propose(pid, None)
@@ -528,6 +452,14 @@ async def _wl_view(bot: Bot, msg: Message | None = None, note: str = "") -> None
         await bot.send_message(config.ADMIN_ID, text, reply_markup=kb(rows))
 
 
+def after_collection() -> None:
+    """После каждого сбора: если запас меньше нормы, из отложенных в фоне собирается один пост."""
+    try:
+        asyncio.get_running_loop().create_task(wishlist_tick())
+    except Exception:
+        log.warning("Отложенные не запустились", exc_info=True)
+
+
 async def wishlist_tick() -> None:
     """После сбора: запас меньше нормы → один отложенный пост в запас, без черновика."""
     if _wl_lock.locked():
@@ -564,16 +496,16 @@ async def wishlist_tick() -> None:
                 if i["id"] == item["id"]:
                     i["note"] = reason[:80]
             await _wl_save(items_all)
-            if _bot:
-                await screen.notify(_bot, f"🕓 Отложенный «{item['q']}» сам не собрался: {reason}. "
+            if ui.BOT:
+                await screen.notify(ui.BOT, f"🕓 Отложенный «{item['q']}» сам не собрался: {reason}. "
                                           "Запусти его вручную.", [("🕓 Отложенные", "rq:wl")])
             return
         await _wl_remove(item["id"])
-        if _bot:
+        if ui.BOT:
             post = await db.get_post(pid)
-            await screen.notify(_bot, f"🕓 Из отложенного собран пост в запас: {slots.headline(post, 60)}",
+            await screen.notify(ui.BOT, f"🕓 Из отложенного собран пост в запас: {slots.headline(post, 60)}",
                                 [("👁 Открыть", f"n:open:{pid}")])
-            screen.refresh_soon(_bot)
+            screen.refresh_soon(ui.BOT)
 
 
 # ======================= ещё кадры =======================
@@ -643,7 +575,7 @@ async def _more_clear(bot: Bot, pid: int, keep_files: set[str] = frozenset()) ->
     m = _more.pop(pid, None)
     if not m:
         return
-    await _bot_mod._drop(bot, *m["msgs"])
+    await ui.drop(bot, *m["msgs"])
     for f in m["files"]:
         if str(f) not in keep_files:
             Path(f).unlink(missing_ok=True)
@@ -661,7 +593,7 @@ async def _more_show(bot: Bot, pid: int) -> None:
         _more[pid] = {"files": [], "sel": set(), "msgs": [wait.message_id]}
         return await _status(wait, "Новых кадров не нашлось — всё, что было в источниках, уже показано. "
                                    "Можно прислать свои фото с подписью.", [[btn("OK", f"rq:mx:{pid}")]])
-    await _bot_mod._drop(bot, wait.message_id)
+    await ui.drop(bot, wait.message_id)
     if len(files) == 1:
         album = [await bot.send_photo(config.ADMIN_ID, FSInputFile(files[0]), caption="+1")]
     else:
@@ -683,20 +615,20 @@ async def _more_add(bot: Bot, pid: int, idx: list[int]) -> None:
     images = json.loads(post["images"] or "[]") + chosen
     await db.update_post(pid, images=images)
     await _more_clear(bot, pid, keep_files=set(chosen))
-    await _bot_mod._list(bot, pid=pid, kb="photos", note=f"Добавлено кадров: {len(chosen)} — они в конце и включены")
+    await ui.show_post(bot, pid=pid, kb="photos", note=f"Добавлено кадров: {len(chosen)} — они в конце и включены")
 
 
 # ======================= сообщения =======================
 
+@router.message(StateFilter(Req.query, Req.fix), F.text, NOT_CMD)
+@router.message(StateFilter(None), F.text, NOT_CMD, NOT_FWD)
 async def on_query_text(msg: Message, state: FSMContext, bot: Bot):
-    global _bot
-    _bot = bot
     cur = await state.get_state()
     data = await state.get_data()
     await state.clear()
     if cur == Req.fix.state:           # уточнение к запросу
         tok = data.get("tok")
-        await _bot_mod._drop(bot, msg.message_id, data.get("prompt"))
+        await ui.drop(bot, msg.message_id, data.get("prompt"))
         it = _pending.get(tok)
         if not it:
             return await bot.send_message(config.ADMIN_ID, "Запрос устарел — напиши его заново.")
@@ -707,16 +639,16 @@ async def on_query_text(msg: Message, state: FSMContext, bot: Bot):
     m = LATER_RE.match(msg.text or "")
     if m:
         n = await wl_add(m.group(1))
-        await _bot_mod._drop(bot, msg.message_id)
+        await ui.drop(bot, msg.message_id)
         return await screen.notify(bot, f"🕓 Отложил: «{m.group(1).strip()[:100]}». В списке: {n}",
                                    [("🕓 Отложенные", "rq:wl")])
     await _card(bot, _remember(msg.text, [], [msg.message_id]))
 
 
+@router.message(Req.query, F.photo)
+@router.message(StateFilter(None), F.photo, NOT_FWD)
 async def on_photo(msg: Message, state: FSMContext, bot: Bot):
     """Фото с подписью (или альбом) → пост на этих фото. Альбом приходит пачкой сообщений — ждём остальные."""
-    global _bot
-    _bot = bot
     await state.clear()
     gid = msg.media_group_id or f"single{msg.message_id}"
     g = _albums.setdefault(gid, {"photos": [], "caption": "", "msgs": [], "task": None})
@@ -740,16 +672,15 @@ async def on_photo(msg: Message, state: FSMContext, bot: Bot):
 
 # ======================= кнопки =======================
 
+@router.callback_query(F.data.startswith("rq:"))
 async def on_cb(cb: CallbackQuery, state: FSMContext, bot: Bot):
-    global _bot
-    _bot = bot
     p = cb.data.split(":")
     action = p[1]
 
     # --- пульт и отложенные ---
     if action == "ask":
         await cb.answer()
-        return await _bot_mod._ask(bot, state, Req.query,
+        return await ui.ask(bot, state, Req.query,
                                    "О чём пост? Название фильма, здания, имя художника — можно с уточнением. "
                                    "Или пришли фото с подписью. /cancel — отмена.")
     if action == "wl":
@@ -757,7 +688,7 @@ async def on_cb(cb: CallbackQuery, state: FSMContext, bot: Bot):
         return await _wl_view(bot, cb.message if cb.message and cb.message.text and "Отложенные" in cb.message.text else None)
     if action == "wlclose":
         await cb.answer()
-        return await _bot_mod._drop(bot, cb.message.message_id)
+        return await ui.drop(bot, cb.message.message_id)
     if action in ("wlgo", "wldel"):
         item = next((i for i in await wishlist() if i["id"] == p[2]), None)
         if not item:
@@ -767,7 +698,7 @@ async def on_cb(cb: CallbackQuery, state: FSMContext, bot: Bot):
         if action == "wldel":
             await _wl_remove(item["id"])
             return await _wl_view(bot, cb.message, "Убрал")
-        await _bot_mod._drop(bot, cb.message.message_id)
+        await ui.drop(bot, cb.message.message_id)
         return await _card(bot, _remember(item["q"], [], [], item.get("fmt", "std"), wl=item["id"]))
 
     # --- слоты на карточке поста ---
@@ -778,12 +709,12 @@ async def on_cb(cb: CallbackQuery, state: FSMContext, bot: Bot):
             return await cb.answer("Этот пост уже не ждёт решения", show_alert=True)
         await cb.answer("Ставлю в слот")
         try:
-            note = await (bump(pid) if action == "bump" else place(pid, slots.dec(p[3])))
+            note = await (slots.bump(pid) if action == "bump" else slots.place(pid, slots.dec(p[3])))
         except Exception as exc:
             log.exception("слот")
-            return await _bot_mod._list(bot, pid=pid, note=curator.explain(exc)[:200])
+            return await ui.show_post(bot, pid=pid, note=curator.explain(exc)[:200])
         screen.refresh_soon(bot)
-        return await _bot_mod._list(bot, mode="sched", pid=pid, note=note[:200])
+        return await ui.show_post(bot, mode="sched", pid=pid, note=note[:200])
 
     # --- ещё кадры ---
     if action in ("more", "mt", "ma", "mall", "mx"):
@@ -797,7 +728,7 @@ async def on_cb(cb: CallbackQuery, state: FSMContext, bot: Bot):
         m = _more.get(pid)
         if not m:
             await cb.answer("Это устарело — нажми «🔄 Ещё кадры» снова", show_alert=True)
-            return await _bot_mod._drop(bot, cb.message.message_id)
+            return await ui.drop(bot, cb.message.message_id)
         if action == "mt":
             m["sel"].symmetric_difference_update({int(p[3])})
             await cb.answer()
@@ -824,7 +755,7 @@ async def on_cb(cb: CallbackQuery, state: FSMContext, bot: Bot):
     if action == "x":
         await cb.answer()
         _pending.pop(tok, None)
-        return await _bot_mod._drop(bot, cb.message.message_id, *it.get("msgs", []))
+        return await ui.drop(bot, cb.message.message_id, *it.get("msgs", []))
     if action == "fmt":
         it["fmt"] = NEXT_FMT[it["fmt"]]
         await cb.answer(f"Формат: {FORMATS[it['fmt']]}")
@@ -833,7 +764,7 @@ async def on_cb(cb: CallbackQuery, state: FSMContext, bot: Bot):
         n = await wl_add(it["q"], it["fmt"])
         _pending.pop(tok, None)
         await cb.answer(f"Отложил. В списке: {n}")
-        return await _bot_mod._drop(bot, cb.message.message_id, *it.get("msgs", []))
+        return await ui.drop(bot, cb.message.message_id, *it.get("msgs", []))
     if action == "slots":
         await cb.answer()
         return await _slots_card(cb.message, tok)
@@ -867,7 +798,7 @@ async def on_cb(cb: CallbackQuery, state: FSMContext, bot: Bot):
         await cb.answer("Собираю материал")
         from app import notes
         _pending.pop(tok, None)
-        await _bot_mod._drop(bot, *it.get("msgs", []))
+        await ui.drop(bot, *it.get("msgs", []))
         if it.get("wl"):
             await _wl_remove(it["wl"])
         await _status(cb.message, f"📝 Заметка по запросу: «{html.escape(it['q'])}»")
@@ -882,102 +813,3 @@ async def on_cb(cb: CallbackQuery, state: FSMContext, bot: Bot):
         it["target"] = "nearest" if action == "now" else None
     await cb.answer("Ищу")
     asyncio.create_task(_find(bot, cb.message, tok))
-
-
-# ======================= подключение к боту и экрану =======================
-
-def _wrap_post_kb(orig):
-    """Выбор слота: первой строкой ⚡️ ближайший, даже занятый; дальше — занятые слоты сегодня.
-    Раздел фото: «🔄 Ещё кадры»."""
-    async def _post_kb(post, mode, idx, n, clipped, sub):
-        kbd = await orig(post, mode, idx, n, clipped, sub)
-        try:
-            active = post["status"] in ("ready", "sent", "approved", "announced")
-            if sub == "pick" and post["status"] in ("ready", "sent", "approved"):
-                key = await nearest_key()
-                if key and not (post["status"] == "approved" and post["slot_key"] == key):
-                    kbd.inline_keyboard.insert(
-                        0, [btn(f"⚡️ {slots.human_key(key)} · даже если занят", f"rq:bump:{post['id']}")])
-                if post["status"] in ("ready", "sent"):   # у одобренного занятые слоты уже есть — «⇄ поменять»
-                    busy = [c for c in await slot_choices() if c["post"] and c["key"] != key]
-                    for k, c in enumerate(busy[:6]):
-                        kbd.inline_keyboard.insert(
-                            1 + k, [btn(slot_label(c, short=True), f"rq:put:{post['id']}:{slots.enc(c['key'])}")])
-            if sub == "photos" and active:
-                kbd.inline_keyboard.insert(max(len(kbd.inline_keyboard) - 1, 0),
-                                           [btn("🔄 Ещё кадры", f"rq:more:{post['id']}")])
-        except Exception:
-            log.warning("Кнопки запроса не добавились", exc_info=True)
-        return kbd
-
-    _post_kb.__wrapped__ = orig
-    return _post_kb
-
-
-def _wrap_home(orig):
-    async def home(arg: dict):
-        photo, text, kbd, arg = await orig(arg)
-        try:
-            n = len(await wishlist())
-            rows = [list(r) for r in kbd.inline_keyboard]
-            rows.insert(max(len(rows) - 1, 0), [btn("✍️ Пост по запросу", "rq:ask"),
-                                                 btn(f"🕓 Отложенные · {n}" if n else "🕓 Отложенные", "rq:wl")])
-            kbd = kb(rows)
-        except Exception:
-            log.warning("Кнопка «Пост по запросу» не добавилась", exc_info=True)
-        return photo, text, kbd, arg
-
-    home.__wrapped__ = orig
-    return home
-
-
-def _wrap_collection(orig):
-    """После каждого сбора — отложенный запрос в запас, если запас меньше нормы."""
-    async def run_collection(*a, **k):
-        res = await orig(*a, **k)
-        try:
-            asyncio.get_running_loop().create_task(wishlist_tick())
-        except Exception:
-            log.warning("Отложенные не запустились", exc_info=True)
-        return res
-
-    run_collection.__wrapped__ = orig
-    return run_collection
-
-
-def _wrap_refresh(orig):
-    """Запоминаем бота для уведомлений из фоновых задач (refresh_soon вызывается после каждого сбора)."""
-    def refresh_soon(bot, *a, **k):
-        global _bot
-        _bot = bot
-        return orig(bot, *a, **k)
-
-    refresh_soon.__wrapped__ = orig
-    return refresh_soon
-
-
-def attach(bot_module) -> None:
-    global _bot_mod, _attached
-    if _attached:
-        return
-    _bot_mod = bot_module
-    r = bot_module.router
-    not_cmd = ~F.text.regexp(r"^/(?!later\b|потом\b)")
-    not_fwd = F.func(lambda m: getattr(m, "forward_origin", None) is None)
-    r.callback_query.register(on_cb, F.data.startswith("rq:"))
-    r.message.register(on_query_text, StateFilter(Req.query, Req.fix), F.text, not_cmd)
-    r.message.register(on_photo, Req.query, F.photo)
-    # обычные сообщения без ссылки: ссылки раньше забирает «пост по ссылке», ввод в диалогах — свои обработчики
-    r.message.register(on_query_text, StateFilter(None), F.text, not_cmd, not_fwd)
-    r.message.register(on_photo, StateFilter(None), F.photo, not_fwd)
-    screen._post_kb = _wrap_post_kb(screen._post_kb)
-    screen.VIEWS["home"] = _wrap_home(screen.VIEWS["home"])
-    screen.refresh_soon = _wrap_refresh(screen.refresh_soon)
-    pipeline.run_collection = _wrap_collection(pipeline.run_collection)
-    try:
-        from app import queue_view
-        queue_view.attach(bot_module)
-    except Exception:
-        log.exception("Очередь публикаций не подключилась")
-    _attached = True
-    log.info("Пост по запросу подключён (TMDB %s)", "есть" if tmdb.configured() else "нет ключа")

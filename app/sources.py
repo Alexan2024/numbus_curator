@@ -1,6 +1,7 @@
 """Сбор кандидатов из источников. Каждый источник возвращает список словарей
 {url, title, source, payload}. Добавить RSS можно из меню бота (📡 Источники)
-или строкой в FEEDS; другой тип источника — функцией в COLLECTORS."""
+или строкой в FEEDS; другой тип источника — функцией в COLLECTORS.
+Нишевые источники и чтение архивов вглубь — в app/niche.py, их сборщики стоят здесь же, в COLLECTORS."""
 import asyncio
 import logging
 import random
@@ -9,7 +10,7 @@ import re
 import feedparser
 import httpx
 
-from app import config, db
+from app import config, db, niche
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +35,9 @@ FEEDS = {
     "socks": "https://socks-studio.com/feed/",
     # кино
     "cinephilia": "https://cinephiliabeyond.org/feed/",
+    # нишевые ленты (остальные нишевые источники читаются через API — app/niche.py)
+    "inigo": niche.NEW_FEEDS["inigo"],
+    "mubi": niche.NEW_FEEDS["mubi"],
 }
 
 # Подсказка для первичного фильтра: о чём обычно пишет источник
@@ -43,6 +47,7 @@ HINTS = {
     "ignant": "искусство, фото, дизайн", "aperture": "фотография", "featureshoot": "фотография",
     "flashbak": "архив, старые фото", "messynessy": "архив, истории", "socks": "архив, история архитектуры",
     "cinephilia": "кино", "met": "музейный предмет", "cma": "музейный предмет",
+    **niche.HINTS,
 }
 
 # Темы для музейного open access — под профиль канала
@@ -70,6 +75,8 @@ def prefilter(title: str) -> str | None:
     t = (title or "").strip()
     if not t:
         return None
+    if niche.PROTECTED.search(t):
+        return "запись закрыта паролем"
     if LISTICLE.search(t):
         return "подборка"
     m = STOP_TITLE.search(t)
@@ -86,7 +93,8 @@ async def disabled() -> set[str]:
 
 
 async def source_names() -> list[str]:
-    return [*(await all_feeds()), *db.MUSEUMS]
+    names = [*(await all_feeds()), *db.MUSEUMS]
+    return names + [n for n in niche.SOURCE_NAMES if n not in names]
 
 
 async def _get(client: httpx.AsyncClient, url: str, **kw) -> httpx.Response:
@@ -201,7 +209,7 @@ async def collect_cma(client: httpx.AsyncClient) -> list[dict]:
     return items
 
 
-COLLECTORS = [collect_rss, collect_met, collect_cma]
+COLLECTORS = [collect_rss, collect_met, collect_cma, *niche.COLLECTORS]
 
 
 async def collect_all() -> tuple[int, int]:

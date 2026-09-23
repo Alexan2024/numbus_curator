@@ -5,6 +5,7 @@ import io
 import logging
 import re
 from pathlib import Path
+import urllib.parse as urlparse_mod
 from urllib.parse import urljoin
 
 import httpx
@@ -14,6 +15,8 @@ from PIL import Image
 from app import config
 
 log = logging.getLogger(__name__)
+
+MAX_RATIO = 2.2          # обычный предел пропорций кадра
 
 SKIP_IMG = re.compile(r"logo|avatar|icon|sprite|banner|(?<![a-z])ads?[_/-]|pixel|gravatar|placeholder|\.svg|\.gif", re.I)
 
@@ -96,10 +99,12 @@ async def extract_article(client: httpx.AsyncClient, url: str, feed_html: str = 
     parts = []
     if feed_html:
         parts.append(parse_html(feed_html, url))
+    raw = ""
     try:
         r = await client.get(url, timeout=30, follow_redirects=True)
         r.raise_for_status()
-        parts.append(parse_html(r.text, url))
+        raw = r.text
+        parts.append(parse_html(raw, url))
     except Exception as exc:
         log.info("Страница недоступна (%s), работаем по RSS: %s", exc, url)
     if not parts:
@@ -107,7 +112,36 @@ async def extract_article(client: httpx.AsyncClient, url: str, feed_html: str = 
     text = max((p["text"] for p in parts), key=len)
     title = next((p["title"] for p in reversed(parts) if p["title"]), "")
     urls = _dedupe([u for p in parts for u in p["image_urls"]])
+    urls = fix_images(url, urls, raw) or urls   # у некоторых сайтов свои правила, где лежат крупные фото
     return {"title": title, "text": text, "image_urls": urls[:30]}
+
+
+# ======================= фото со страниц: правила по сайтам =======================
+
+WP_SIZE = re.compile(r"-\d{2,4}x\d{2,4}(?=\.(?:jpe?g|png|webp)$)", re.I)
+
+
+def _stem(u: str) -> str:
+    name = urlparse_mod.urlparse(u).path.rsplit("/", 1)[-1]
+    name = WP_SIZE.sub("", name)
+    return re.sub(r"(-\d{1,3})?\.(jpe?g|png|webp)$", "", name, flags=re.I).lower()
+
+
+def fix_images(url: str, urls: list[str], raw_html: str = "") -> list[str]:
+    dom = urlparse_mod.urlparse(url).netloc
+    if "afasiaarchzine.com" in dom:
+        ups = [WP_SIZE.sub("", u.split("?")[0]) for u in urls if "/wp-content/uploads/" in u]
+        base = next((_stem(u) for u in ups if "afasia" in _stem(u)), None)
+        if base:
+            ups = [u for u in ups if _stem(u) == base]
+        return list(dict.fromkeys(ups))
+    if "publicdomainreview.org" in dom:
+        out = [u.split("?")[0] for u in urls if "pdr-assets" in u and "/sources/" not in u]
+        return list(dict.fromkeys(out))
+    if "inigo.com" in dom:
+        found = re.findall(r"https://cdn\.themodernhouse\.com/[^\"'\\\s)]+?_webres\.jpg", raw_html)
+        return list(dict.fromkeys(found + [u for u in urls if "themodernhouse" in u]))
+    return urls
 
 
 def _ahash(im: Image.Image) -> int:
@@ -117,8 +151,11 @@ def _ahash(im: Image.Image) -> int:
     return sum(1 << i for i, p in enumerate(px) if p > avg)
 
 
-async def download_images(client: httpx.AsyncClient, urls: list[str], dest: Path) -> list[Path]:
-    """Качает, отбрасывает мелкие/дубли/странные пропорции, сохраняет JPEG."""
+async def download_images(client: httpx.AsyncClient, urls: list[str], dest: Path,
+                          max_ratio: float = MAX_RATIO, min_short: int | None = None) -> list[Path]:
+    """Качает, отбрасывает мелкие/дубли/странные пропорции, сохраняет JPEG.
+    max_ratio и min_short — для кадров из фильмов мягче: широкий кадр 1280×536 — нормальный кадр."""
+    min_short = config.MIN_SHORT_SIDE if min_short is None else min_short
     dest.mkdir(parents=True, exist_ok=True)
     sem = asyncio.Semaphore(6)
 
@@ -139,9 +176,9 @@ async def download_images(client: httpx.AsyncClient, urls: list[str], dest: Path
         if im is None:
             continue
         w, h = im.size
-        if max(w, h) < config.MIN_LONG_SIDE or min(w, h) < config.MIN_SHORT_SIDE:
+        if max(w, h) < config.MIN_LONG_SIDE or min(w, h) < min_short:
             continue
-        if max(w, h) / min(w, h) > 2.2:
+        if max(w, h) / min(w, h) > max_ratio:
             continue
         hsh = _ahash(im)
         if any(bin(hsh ^ x).count("1") <= 5 for x in hashes):

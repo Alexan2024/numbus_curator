@@ -18,13 +18,10 @@ Instagram держит всю карусель в одной пропорции,
 Полей не остаётся ни в одном случае, IG_PAD_COLOR больше ни на что не влияет.
 В Telegram уходит полный набор фото в своих пропорциях — этот модуль трогает только Instagram.
 
-Сам instagram.py не менялся: app/__init__.py пристёгивает сюда подготовку фото (instagram._photos).
-Обрезка делается до вызова instagram._fit, поэтому логотип по-прежнему встаёт в угол кадра."""
-import json
+Здесь только расчёт: plan — пропорция и какие кадры идут, crop — обрезка. Сами фото готовит
+instagram._photos; обрезка делается до instagram._fit, поэтому логотип встаёт в угол кадра."""
 import logging
 import os
-import secrets
-import shutil
 from pathlib import Path
 
 from PIL import Image, ImageOps
@@ -37,7 +34,6 @@ HARD_CROP = float(os.getenv("IG_HARD_CROP", "0.30"))    # потолок для 
 TOP_BIAS = float(os.getenv("IG_TOP_BIAS", "0.35"))      # вертикальный срез: 0.5 по центру, меньше — ближе к верху
 IG_MIN, IG_MAX = 0.8, 1.91                              # пределы Instagram: 4:5 … 1.91:1
 
-_attached: set[str] = set()
 
 
 # ======================= расчёт =======================
@@ -46,7 +42,7 @@ def _clamp(r: float) -> float:
     return min(max(r, IG_MIN), IG_MAX)
 
 
-def _read_ratio(path: Path) -> float:
+def read_ratio(path: Path) -> float:
     with Image.open(path) as im:
         im = ImageOps.exif_transpose(im)
         return im.width / im.height
@@ -105,81 +101,3 @@ def crop(im: Image.Image, target: float) -> Image.Image:
         nw, nh = w, max(1, round(w / target))
         x, y = 0, round((h - nh) * TOP_BIAS)
     return im.crop((x, y, x + nw, y + nh))
-
-
-# ======================= подготовка фото поста =======================
-
-async def _photos(bot, post) -> tuple[str, list[str]]:
-    """Фото поста → JPEG одной пропорции в публичной папке, без полей. → (токен папки, ссылки)"""
-    from app import cards, instagram
-
-    images = json.loads(post["images"] or "[]")
-    fids = cards._fids(post)
-    token = secrets.token_urlsafe(18)
-    folder = instagram.PUBLIC_DIR / token
-    folder.mkdir(parents=True, exist_ok=True)
-
-    raw: list[Path] = []
-    for n, i in enumerate(cards.photo_plan(post)[:10]):
-        src = Path(images[i]) if i < len(images) else None
-        tmp = folder / f"src{n:02d}"
-        if src and src.exists():
-            shutil.copyfile(src, tmp)
-        elif fids.get(str(i)):
-            await bot.download(fids[str(i)], destination=tmp)
-        else:
-            continue
-        raw.append(tmp)
-
-    files, ratios = [], []
-    for p in raw:
-        try:
-            ratios.append(_read_ratio(p))
-            files.append(p)
-        except Exception:
-            log.warning("Instagram: файл %s не открылся, кадр пропущен", p.name, exc_info=True)
-            p.unlink(missing_ok=True)
-    if not files:
-        shutil.rmtree(folder, ignore_errors=True)
-        raise RuntimeError("у поста не нашлось фото — ни на диске, ни в Telegram")
-
-    target, keep = plan(ratios)
-    w = instagram.WIDTH
-    h = max(1, round(w / target))
-    exact = w / h                                        # пропорция готового кадра, с учётом округления
-    if len(keep) < len(files):
-        log.info("Instagram: пропорция %.3f, в карусель идут %d из %d кадров (остальные не влезают без полей)",
-                 exact, len(keep), len(files))
-
-    urls, base, out = [], instagram.public_url(), 0
-    for n, p in enumerate(files):
-        if n in keep:
-            with Image.open(p) as im:
-                # обрезка до точной пропорции кадра: дальше instagram._fit только масштабирует
-                # и ставит логотип, полей не появляется
-                instagram._fit(crop(im, exact), w, h).save(folder / f"{out:02d}.jpg", "JPEG", quality=92)
-            urls.append(f"{base}/ig/{token}/{out:02d}.jpg")
-            out += 1
-        p.unlink(missing_ok=True)
-    return token, urls
-
-
-# ======================= подключение =======================
-
-def attach(module) -> None:
-    name = module.__name__
-    if name != "app.instagram" or name in _attached:
-        return
-    orig = getattr(module, "_photos", None)
-    if orig is None:
-        log.error("Карусель: в app.instagram нет _photos — фото пойдут по-старому, с полями")
-        return
-    _photos.__wrapped__ = orig
-    module._photos = _photos
-    _attached.add(name)
-    log.info("Карусель Instagram: без полей (обрезка до %d%% площади, кадры сверх того не идут)",
-             round(MAX_CROP * 100))
-
-
-def status() -> str:
-    return ", ".join(sorted(_attached)) or "не подключена"

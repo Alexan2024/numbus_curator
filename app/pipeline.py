@@ -11,7 +11,7 @@ from pathlib import Path
 import httpx
 from bs4 import BeautifulSoup
 
-from app import commons, config, curator, db, formatter, media, sources, voice
+from app import commons, config, curator, db, formatter, media, niche, repeats, sources, voice
 
 log = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ def _excerpt(cand) -> str:
 async def triage_new() -> dict:
     """Новые кандидаты: дубли — сразу мимо, остальное — через Haiku пачками."""
     new = await db.candidates("new", limit=config.TRIAGE_MAX)
-    seen = [_tokens(t) for t in await db.recent_titles()]
+    seen = [_tokens(t) for t in await db.recent_titles(config.REPEAT_DAYS)]
     todo, out = [], {"yes": 0, "no": 0, "dups": 0}
     for c in new:
         toks = _tokens(c["title"])
@@ -118,14 +118,32 @@ async def _select_pool(n: int, target: int) -> list:
         per_source[cand["source"]] = per_source.get(cand["source"], 0) + 1
         have[cat] = have.get(cat, 0) + 1
         chosen.append(cand)
-    return chosen
+    return await _top_up_finds(chosen, n)
+
+
+async def ready_finds() -> list:
+    """Находки в запасе — посты из нишевых источников."""
+    return [p for p in await db.ready_posts() if p["source"] in niche.FINDS and p["format"] != "notes"]
+
+
+async def _top_up_finds(chosen: list, n: int) -> list:
+    """Находок в запасе мало — добираем в оценку пару материалов из нишевых источников."""
+    have = len(await ready_finds()) + sum(1 for c in chosen if c["source"] in niche.FINDS)
+    need = min(2, niche.FIND_STOCK - have)
+    if need <= 0 or n <= 0:
+        return chosen
+    ids = {c["id"] for c in chosen}
+    pool = [c for c in await db.candidates("triaged", limit=400) if c["source"] in niche.FINDS and c["id"] not in ids]
+    pool.sort(key=lambda c: (-(c["tprio"] or 0), -c["id"]))
+    extra = pool[:need]
+    return chosen[:max(0, n - len(extra))] + extra if extra else chosen
 
 
 # ---------- подготовка: текст и фото ----------
 
 def _museum_text(source: str, meta: dict) -> str:
-    return (f"Объект из открытой коллекции {MUSEUM_NAMES.get(source, source)}.\n"
-            + "\n".join(f"{k}: {v}" for k, v in meta.items() if v))
+    intro = niche.META_INTRO.get(source) or f"Объект из открытой коллекции {MUSEUM_NAMES.get(source, source)}."
+    return intro + "\n" + "\n".join(f"{k}: {v}" for k, v in meta.items() if v)
 
 
 async def _prepare(client: httpx.AsyncClient, cand, force: bool = False) -> dict | str:
@@ -144,7 +162,11 @@ async def _prepare(client: httpx.AsyncClient, cand, force: bool = False) -> dict
             min_photos = 1 if force else config.MIN_PHOTOS_MINI
             if len(text) < (80 if force else 300):
                 return "мало текста"
-        images = await media.download_images(client, urls, folder)
+        if source in niche.CINEMA_SOURCES:     # кадры из фильмов: широкие и невысокие — это нормально
+            images = await media.download_images(client, urls, folder, max_ratio=niche.CINEMA_MAX_RATIO,
+                                                 min_short=niche.CINEMA_MIN_SHORT)
+        else:
+            images = await media.download_images(client, urls, folder)
     except Exception as exc:
         shutil.rmtree(folder, ignore_errors=True)
         return f"не открылся: {exc!r}"[:200]
@@ -154,8 +176,11 @@ async def _prepare(client: httpx.AsyncClient, cand, force: bool = False) -> dict
     if len(images) < min_photos:
         shutil.rmtree(folder, ignore_errors=True)
         return f"мало качественных фото: {len(images)}"
+    allow_std = museum or force or len(images) >= config.MIN_PHOTOS_ARTICLE
+    if not force and (source in niche.MINI_ONLY or (source == "arena" and "meta" in payload)):
+        allow_std = False       # кадры из фильма или блок Are.na без источника: фактов мало — только мини
     return {"title": title or "", "text": (text or "")[:6000], "images": [str(p) for p in images],
-            "allow_std": museum or force or len(images) >= config.MIN_PHOTOS_ARTICLE}
+            "allow_std": allow_std}
 
 
 def _params(context: str, cand, prep: dict, forced: bool = False) -> dict:
@@ -192,6 +217,14 @@ async def finish(cid: int, data: dict, forced: bool = False) -> int | None:
         if data.get("already_posted"):
             data["flags"].append("похоже, уже было в канале")
 
+    dup = await repeats.find(data, images)
+    if dup and not forced:
+        await db.mark_candidate(cid, "processed", f"повтор — {dup}"[:300])
+        shutil.rmtree(folder, ignore_errors=True)
+        return None
+    if dup:
+        data["flags"].append(f"похоже, уже было — {dup}")
+
     fmt = "mini" if (data.get("format") == "mini" or not prep.get("allow_std")) else "std"
     data.pop("body", None)  # основной текст пишется позже, когда пост выберут
     line = str(data.get("mini_line") or "").strip()
@@ -223,6 +256,10 @@ async def finish(cid: int, data: dict, forced: bool = False) -> int | None:
         reason=data.get("score_reason", ""), images=ordered, status="ready",
     )
     await db.update_candidate(cid, status="processed", note=f"в запасе {score} ({fmt})", prep=None)
+    try:
+        await repeats.remember(await db.get_post(pid))
+    except Exception:
+        log.warning("Отпечаток поста %s не записался", pid, exc_info=True)
     return pid
 
 
@@ -500,7 +537,28 @@ async def files_ok(post) -> bool:
 
 async def pick_next(fmt: str | None = None, category: str | None = None, exclude: set[int] | None = None,
                     min_score: int = 0, clean_only: bool = False, skip_sources: set[str] | None = None,
-                    planned: list | None = None):
+                    planned: list | None = None, find_slot: bool = False):
+    """Лучший пост из запаса. find_slot — это слот находки: сначала пробуем находку.
+    В остальных слотах последние niche.FIND_RESERVE находок не трогаем — они ждут своего слота."""
+    skip = set(skip_sources or ())
+    kw = dict(category=category, exclude=exclude, min_score=min_score, clean_only=clean_only, planned=planned)
+    if find_slot:
+        others = {p["source"] for p in await db.ready_posts()} - niche.FINDS
+        post = await _pick(fmt, skip_sources=skip | others, **kw)
+        if post:
+            return post
+    else:
+        finds = await ready_finds()
+        if finds and len(finds) <= niche.FIND_RESERVE:
+            post = await _pick(fmt, skip_sources=skip | niche.FINDS, **kw)
+            if post:
+                return post
+    return await _pick(fmt, skip_sources=skip, **kw)
+
+
+async def _pick(fmt: str | None = None, category: str | None = None, exclude: set[int] | None = None,
+                min_score: int = 0, clean_only: bool = False, skip_sources: set[str] | None = None,
+                planned: list | None = None):
     """Лучший пост из запаса с поправкой на баланс рубрик (50% архитектура, 50% остальное).
     Если нужного формата нет, берёт другой: большой сжимается до мини, мини с 3+ фото становится большим."""
     exclude = exclude or set()
@@ -538,11 +596,26 @@ async def pick_next(fmt: str | None = None, category: str | None = None, exclude
     return best
 
 
-async def pick_auto(fmt: str):
-    """Для автомата: только высокая оценка, без флагов, из источников, которым автор доверяет."""
-    untrusted = set()
+async def untrusted_sources() -> set[str]:
+    """Источники, которые автор чаще отклоняет, чем берёт (от 5 решений)."""
+    out = set()
     for src, s in (await db.source_stats()).items():
         decided = s["published"] + s["rejected"]
         if decided >= 5 and s["published"] / decided < 0.5:
-            untrusted.add(src)
-    return await pick_next(fmt, min_score=config.AUTO_MIN_SCORE, clean_only=True, skip_sources=untrusted)
+            out.add(src)
+    return out
+
+
+def auto_ok(post, untrusted: set[str] | None = None) -> bool:
+    """Пост годится выйти без автора: оценка от AUTO_MIN_SCORE, без замечаний, источник не под подозрением."""
+    if not post or post["format"] == "notes" or (post["score"] or 0) < config.AUTO_MIN_SCORE:
+        return False
+    if json.loads(post["data"]).get("flags"):
+        return False
+    return post["source"] not in (untrusted or set())
+
+
+async def pick_auto(fmt: str, find_slot: bool = False):
+    """Для автомата и страховки: только высокая оценка, без флагов, из источников, которым автор доверяет."""
+    return await pick_next(fmt, min_score=config.AUTO_MIN_SCORE, clean_only=True,
+                           skip_sources=await untrusted_sources(), find_slot=find_slot)

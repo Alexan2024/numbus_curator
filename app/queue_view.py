@@ -5,10 +5,9 @@
 открывается на экране со всеми обычными действиями (слот, текст, фото, отклонить…).
 «🔄 Обновить» перерисовывает очередь, «← Назад» удаляет все её сообщения.
 
-Подключается из app/request.py (attach), сами bot.py и screen.py не менялись."""
+Кнопки qv:… — свой роутер, он подключён в bot.py; кнопка на пульте — в screen._home."""
 import asyncio
 import html
-import json
 import logging
 import math
 import shutil
@@ -16,13 +15,15 @@ import time
 from datetime import timedelta
 from pathlib import Path
 
-from aiogram import Bot, F
+from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardMarkup
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from app import cards, config, db, screen, slots
 
 log = logging.getLogger(__name__)
+router = Router()
+router.callback_query.filter(F.from_user.id == config.ADMIN_ID)
 
 HORIZON_DAYS = 14
 CANVAS_W = 1080
@@ -201,6 +202,7 @@ async def show(bot: Bot) -> None:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+@router.callback_query(F.data.startswith("qv:"))
 async def on_cb(cb: CallbackQuery, bot: Bot):
     p = cb.data.split(":")
     a = p[1]
@@ -229,31 +231,3 @@ async def _safe_show(bot: Bot) -> None:
         log.exception("очередь")
         from app import curator
         await bot.send_message(config.ADMIN_ID, f"Очередь не показалась: {curator.explain(exc)}"[:500])
-
-
-def _wrap_home(orig):
-    async def home(arg: dict):
-        photo, text, kbd, arg = await orig(arg)
-        try:
-            rows = [list(r) for r in kbd.inline_keyboard]
-            rows.insert(max(len(rows) - 1, 0), [btn("🗂 Очередь публикаций", "qv:show")])
-            kbd = InlineKeyboardMarkup(inline_keyboard=rows)
-        except Exception:
-            log.warning("Кнопка «Очередь» не добавилась", exc_info=True)
-        return photo, text, kbd, arg
-
-    home.__wrapped__ = orig
-    return home
-
-
-_attached = False
-
-
-def attach(bot_module) -> None:
-    global _attached
-    if _attached:
-        return
-    bot_module.router.callback_query.register(on_cb, F.data.startswith("qv:"))
-    screen.VIEWS["home"] = _wrap_home(screen.VIEWS["home"])
-    _attached = True
-    log.info("Очередь публикаций подключена")

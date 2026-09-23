@@ -7,7 +7,7 @@ from pathlib import Path
 from aiogram import Bot
 from aiogram.types import FSInputFile, InputMediaDocument, InputMediaPhoto
 
-from app import config, db, formatter
+from app import brand, config, db, formatter
 
 log = logging.getLogger(__name__)
 
@@ -70,8 +70,15 @@ def build_album(files: list, captions: list | None = None) -> list[InputMediaPho
 
 
 async def _send_photos(bot: Bot, chat_id, files: list, caption: str | None) -> list:
+    """Фото одним сообщением или альбомом. В канал — со знаком AHMAG, в личку — как есть."""
     if not files:
         return []
+    if str(chat_id) == str(config.CHANNEL_ID) and brand.enabled():
+        return await brand.with_logo(bot, files, lambda out: _send_raw(bot, chat_id, out, caption))
+    return await _send_raw(bot, chat_id, files, caption)
+
+
+async def _send_raw(bot: Bot, chat_id, files: list, caption: str | None) -> list:
     if len(files) == 1:   # альбом в Telegram — от двух фото
         return [await bot.send_photo(chat_id, files[0], caption=caption)]
     return await bot.send_media_group(chat_id, build_album(files, [caption] + [None] * (len(files) - 1)))
@@ -133,6 +140,15 @@ async def publish_post(bot: Bot, pid: int, how: str = "", slot_key: str | None =
     await db.update_post(pid, status="published", decided_at=db.now(), slot_key=slot_key or post["slot_key"],
                          channel_msg_id=first_id)
     log.info("Опубликован пост %s %s", pid, how)
+    from app import instagram, repeats  # здесь: оба модуля сами пользуются cards
+    try:
+        await repeats.remember(await db.get_post(pid))   # отпечаток на год — пока фото ещё на диске
+    except Exception:
+        log.warning("Отпечаток поста %s не записался", pid, exc_info=True)
+    try:
+        await instagram.mirror(bot, pid)
+    except Exception:
+        log.exception("Instagram: пост %s не встал в очередь", pid)
     return True
 
 

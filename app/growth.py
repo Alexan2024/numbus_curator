@@ -41,19 +41,10 @@ async def init() -> None:
 
 
 def install(bot: Bot) -> None:
-    """Виды раздела — в экран, кнопка «📈 Рост» — на пульт (строкой над «Голос / Пауза», рядом встанет «📸 Instagram»)."""
+    """Виды раздела — в экран. Кнопка «📈 Рост» на пульте — в screen._home."""
     global _bot
     _bot = bot
-    home = screen.VIEWS["home"]
-
-    async def home_with_growth(arg: dict):
-        photo, text, kb, arg = await home(arg)
-        rows = list(kb.inline_keyboard)
-        rows.insert(max(len(rows) - 1, 0), [btn("📈 Рост", "g:home")])
-        return photo, text, InlineKeyboardMarkup(inline_keyboard=rows), arg
-
-    screen.VIEWS.update({"home": home_with_growth, "growth": _v_growth, "glinks": _v_links,
-                         "gthemes": _v_themes, "gpart": _v_part})
+    screen.VIEWS.update({"growth": _v_growth, "glinks": _v_links, "gthemes": _v_themes, "gpart": _v_part})
 
 
 def schedule(sched, bot: Bot, guarded) -> None:

@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import anthropic
@@ -26,7 +27,16 @@ def _taste_profile(raw: str) -> str:
 
 PROFILE = _taste_profile(config.PROFILE_PATH.read_text(encoding="utf-8"))
 ARCHIVE = json.loads(config.ARCHIVE_PATH.read_text(encoding="utf-8"))
-ARCHIVE_HEADLINES = [p["headline"] for p in ARCHIVE if p.get("headline")]
+def _within_repeat_window(p: dict) -> bool:
+    """Пост из архива канала вышел не раньше REPEAT_DAYS назад? Старше — объект можно показать снова."""
+    try:
+        day = datetime.strptime(p.get("date", ""), "%d %B %Y").date()
+    except ValueError:
+        return True
+    return day >= date.today() - timedelta(days=config.REPEAT_DAYS)
+
+
+ARCHIVE_HEADLINES = [p["headline"] for p in ARCHIVE if p.get("headline") and _within_repeat_window(p)]
 NOTES_HEADLINES = [p["headline"] for p in ARCHIVE if "ahmagnotes" in (p.get("tags") or []) and p.get("headline")]
 # Примеры заголовков и тегов из архива — только формат, без текстов
 HEADLINE_EXAMPLES = "\n".join(
