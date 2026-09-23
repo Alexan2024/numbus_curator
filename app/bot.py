@@ -12,8 +12,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-from app import (cards, config, curator, dates, db, finds, formatter, notes, pipeline, queue_view, request, screen, slots,
-                 sources, taste, ui, voice)
+from app import (cards, config, curator, dates, db, finds, formatter, notes, pipeline, queue_view, reels, request, screen,
+                 slots, sources, taste, ui, voice)
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -125,6 +125,11 @@ async def cmd_diag(msg: Message):
     lines.append(f"⚙️ v{config.VERSION} · страховка полуавтомата {'вкл' if config.SEMI_FALLBACK else 'выкл'} · "
                  f"слот находки {'%02d:%02d' % fs if fs else 'выкл'} · повторы: {config.REPEAT_DAYS} дн., "
                  f"отпечатков {prints}")
+    from app import reelrender
+    ok = await asyncio.to_thread(reelrender.ffmpeg_ok)
+    lines.append(f"🎬 Рилсы: {'ffmpeg есть' if ok else '❌ нет ffmpeg — видео не соберётся'} · "
+                 f"{', '.join(reels.DOW)} в {reels.TIME[0]:02d}:{reels.TIME[1]:02d}"
+                 + ("" if reels.ENABLED else " · выключены (REELS=0)"))
     await wait.edit_text("\n\n".join(lines))
 
 
@@ -670,5 +675,6 @@ router.include_router(finds.router)
 router.include_router(taste.router)
 router.include_router(dates.router)
 router.include_router(queue_view.router)
+router.include_router(reels.router)      # до «поста по запросу»: тот ловит любой текст
 router.include_router(request.router)
 router.include_router(stale)

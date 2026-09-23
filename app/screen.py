@@ -156,6 +156,11 @@ async def _home_extras() -> list[list]:
         log.warning("Кнопка «Даты»", exc_info=True)
         rows.append([btn("🗂 Очередь публикаций", "qv:show")])
     try:
+        from app import reels
+        rows.append([btn(await reels.home_label(), "rl:home")])
+    except Exception:
+        log.warning("Кнопка «Рилсы»", exc_info=True)
+    try:
         rows.append([btn(await finds.home_label(), "fa:info")])
     except Exception:
         log.warning("Кнопка «Находки»", exc_info=True)

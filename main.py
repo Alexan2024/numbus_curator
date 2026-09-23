@@ -14,7 +14,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app import (attribution, config, curator, db, growth, instagram, pipeline, repeats, reports, request, screen,
                  slots, stats, stories, taste, ui)
-from app import dates
+from app import dates, reels
 from app.bot import router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -109,6 +109,7 @@ async def main():
     await stories.init()
     await taste.init()
     await dates.init()
+    await reels.init()
     await growth.init()
     await instagram.init()
     screen.banner()
@@ -116,6 +117,7 @@ async def main():
     ui.BOT = bot                      # для уведомлений из фоновых задач
     growth.install(bot)               # виды раздела «📈 Рост»
     dates.install(bot)                # экран «📅 Даты»
+    reels.install(bot)                # экран «🎬 Рилсы»
     taste.install(bot)                # экран «🧠 Вкус»
     stats.install(bot)                # экран «🏆 Что заходит»
     instagram.install(bot)            # вид «📸 Instagram»; сам пост уходит туда из cards.publish_post
@@ -167,6 +169,7 @@ async def main():
     stats.schedule(sched, bot, guarded)
     taste.schedule(sched, bot, guarded)
     dates.schedule(sched, bot, guarded)
+    reels.schedule(sched, bot, guarded)
     sched.start()
 
     await instagram.start_server()   # Instagram забирает фото по публичной ссылке
