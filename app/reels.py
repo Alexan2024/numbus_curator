@@ -35,7 +35,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardMarkup, Message
 from PIL import Image, ImageDraw, ImageOps
 
-from app import config, db, reelrender, screen, slots, ui
+from app import config, db, reelrender, screen, slots, tts, ui
 from app.screen import btn
 
 log = logging.getLogger(__name__)
@@ -301,8 +301,7 @@ async def verify(client: httpx.AsyncClient, works: list[dict], background: bool,
     for n, ((w, c), t) in enumerate(zip(pairs, thumbs), 1):
         content.append({"type": "text", "text": f"Sheet {n}: {w.get('title')} — {w.get('author')}, {w.get('year')}"})
         content.append(_img_block(_sheet(t), 1400, 80))
-    data = await curator._call(content, system=PICK_SYSTEM, model=config.CLAUDE_MODEL, max_tokens=400,
-                               background=background)
+    data = await _ask(content, system=PICK_SYSTEM, max_tokens=1500, background=background)
     picks = {}
     for p in data.get("picks") or []:
         try:
@@ -369,8 +368,10 @@ Return ONLY JSON:
 FRAMES_SYSTEM = f"""You write the on-screen text for an AHMAG Instagram reel that walks through the details of the painting in the image. Coordinates are fractions of the image width and height from its top-left corner (0 to 1).
 
 Write:
-- intro: the line shown over the whole painting at the start, up to 70 characters. It opens the story, e.g. "At first, this looks like a tired clown taking a break."
-- frames: 4–6 details in viewing order. box [x0, y0, x1, y1] — tight around a detail that is clearly visible in this image (a face, a hand, an object, a figure, a window). text — one line, up to 80 characters: what we see there and why it matters. Together the lines tell one story and end on a fact, not a moral.
+The lines are read aloud by a narrator and appear on screen word by word, so write them to be spoken: short sentences, natural spoken English, no parentheses, no abbreviations, no lists. The whole narration takes 35–55 seconds.
+
+- intro: the line spoken over the whole painting at the start, one or two sentences, up to 120 characters. It opens the story, e.g. "At first, this looks like a tired clown taking a break from a party."
+- frames: 4–6 details in viewing order. box [x0, y0, x1, y1] — tight around a detail that is clearly visible in this image (a face, a hand, an object, a figure, a window). text — one or two sentences, up to 150 characters: what we see there and why it matters. Together the lines tell one story and end on a fact, not a moral.
 - caption: the Instagram caption. First line: "Title (year), Author". Then 2–4 short paragraphs telling the story plainly. Last line: museum and city.
 - hashtags: 5–8 lowercase words without #.
 
@@ -379,6 +380,21 @@ Use only the facts given; add nothing you are not sure of.
 {EN_RULES}
 
 Return ONLY JSON: {{"intro": "...", "frames": [{{"box": [0.1, 0.2, 0.3, 0.5], "text": "..."}}], "caption": "...", "hashtags": ["..."]}}"""
+
+
+async def _ask(content, *, system: str, max_tokens: int, background: bool, tools: list | None = None) -> dict:
+    """Вызов Claude для рилса. Пустой ответ (весь запас токенов ушёл на размышления или поиск) — ещё раз
+    с запасом втрое больше: так было с «Claude вернул не JSON: ''»."""
+    from app import curator
+    for n in range(2):
+        try:
+            return await curator._call(content, system=system, model=config.CLAUDE_MODEL,
+                                       max_tokens=max_tokens * (3 if n else 1), tools=tools, background=background)
+        except ValueError as exc:
+            if n or "не JSON" not in str(exc):
+                raise ReelError("Claude ответил не по формату — попробуй ещё раз") from exc
+            log.warning("Рилс: пустой или битый ответ Claude, повторяю с большим запасом: %s", exc)
+    return {}
 
 
 async def _avoid(kind: str) -> list[str]:
@@ -437,19 +453,17 @@ async def _collection(rid: int, d: dict, background: bool, client: httpx.AsyncCl
         prompt = ((f"Theme requested by the author: {req}\n" if req else
                    f"Area for this reel: {topic} — {TOPIC_HINT.get(topic, topic)}.\n")
                   + "Avoid these earlier reel titles:\n" + ("\n".join(await _avoid("collection")) or "—"))
-        plan = await curator._call(prompt, system=COLLECTION_SYSTEM, model=config.CLAUDE_MODEL, max_tokens=2500,
-                                   background=background)
+        plan = await _ask(prompt, system=COLLECTION_SYSTEM, max_tokens=4000, background=background)
         works = [w for w in plan.get("works") or [] if w.get("title")]
         if not works:
             raise ReelError("Claude не предложил работ")
         good = await verify(client, works[:12], background)
         if len(good) < MIN_ITEMS:
-            more = await curator._call(
+            more = await _ask(
                 f"Theme: {plan.get('title')}\nAlready in the reel: " + "; ".join(f"{w['title']} — {w['author']}" for w in good)
                 + "\nNot found on Commons: " + "; ".join(w["title"] for w in works
                                                            if w["title"] not in {g["title"] for g in good})
-                + f"\nGive {MAX_ITEMS} more works.", system=MORE_SYSTEM, model=config.CLAUDE_MODEL,
-                max_tokens=1200, background=background)
+                + f"\nGive {MAX_ITEMS} more works.", system=MORE_SYSTEM, max_tokens=2500, background=background)
             good += await verify(client, (more.get("works") or [])[:MAX_ITEMS], background)
         if len(good) < MIN_ITEMS:
             raise ReelError(f"хороших картинок нашлось только {len(good)} из {MIN_ITEMS} нужных — попробуй другую тему")
@@ -477,8 +491,7 @@ async def _details(rid: int, d: dict, background: bool, client: httpx.AsyncClien
         prompt = ((f"The author asks for: {req}\n" if req else "")
                   + "Avoid these paintings (already done):\n" + ("\n".join(await _avoid("details")) or "—"))
         tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
-        p = await curator._call(prompt, system=PAINTING_SYSTEM, model=config.CLAUDE_MODEL, max_tokens=2500,
-                                tools=tools, background=background)
+        p = await _ask(prompt, system=PAINTING_SYSTEM, max_tokens=4000, tools=tools, background=background)
         if not p.get("title"):
             raise ReelError("Claude не выбрал картину")
         good = await verify(client, [p], background, per=4)
@@ -500,8 +513,8 @@ async def _details(rid: int, d: dict, background: bool, client: httpx.AsyncClien
                 + "\n".join(f"- {f}" for f in d.get("facts") or [])
                 + ("\n\nThe previous version used these details, choose others where possible:\n"
                    + "\n".join(avoid) if avoid else ""))
-        fr = await curator._call([block, {"type": "text", "text": text}], system=FRAMES_SYSTEM,
-                                 model=config.CLAUDE_MODEL, max_tokens=2000, background=background)
+        fr = await _ask([block, {"type": "text", "text": text}], system=FRAMES_SYSTEM, max_tokens=4000,
+                        background=background)
         frames = [f for f in fr.get("frames") or [] if isinstance(f.get("box"), list) and len(f["box"]) == 4
                   and f.get("text")][:6]
         if len(frames) < 3:
@@ -510,10 +523,40 @@ async def _details(rid: int, d: dict, background: bool, client: httpx.AsyncClien
                  hashtags=fr.get("hashtags") or [])
     end = [f"{pt['title']}" + (f", {pt['year']}" if pt.get("year") else ""), pt.get("author") or "",
            pt.get("museum") or ""]
+    voice = await _voice(folder, d)
     video = folder / f"reel_{int(datetime.now().timestamp())}.mp4"
-    d["duration"] = await asyncio.to_thread(reelrender.details, path, d.get("intro") or "", d["frames"], end, video)
+    d["duration"] = await asyncio.to_thread(reelrender.details, path, d.get("intro") or "", d["frames"], end, video,
+                                            voice)
     d["video"] = str(video)
     return d
+
+
+async def _voice(folder: Path, d: dict) -> dict | None:
+    """Озвучить вступление и фразы деталей. Уже озвученное (тот же текст, тот же голос) не синтезируется заново.
+    Не вышло — рилс собирается без звука, а в d["voice_note"] — почему."""
+    d.pop("voice_note", None)
+    if tts.provider() == "off":
+        return None
+    cache = d.get("voice") or {}
+    texts = [d.get("intro") or ""] + [f.get("text") or "" for f in d.get("frames") or []]
+    out = []
+    try:
+        for text in texts:
+            key = hashlib.md5(f"{tts.provider()}|{tts.EDGE_VOICE}|{tts.EL_VOICE}|{text}".encode()).hexdigest()[:12]
+            hit = cache.get(key)
+            if hit and Path(hit["audio"]).exists():
+                out.append(hit)
+                continue
+            res = await tts.speak(text, folder / "voice" / f"{key}.mp3")
+            if res:
+                cache[key] = res
+            out.append(res)
+    except Exception as exc:
+        log.warning("Рилс: озвучка не получилась", exc_info=True)
+        d["voice_note"] = f"голос не получился ({str(exc)[:80]}) — видео без озвучки"
+        return None
+    d["voice"] = {k: v for k, v in cache.items() if v in out}
+    return {"intro": out[0], "frames": out[1:]}
 
 
 async def generate(bot: Bot, rid: int, background: bool = True) -> None:
@@ -585,12 +628,15 @@ def _card_text(r, d: dict, note: str | None = None) -> str:
         pt = d.get("painting") or {}
         lines.append(f"\n<b>{html.escape(pt.get('title') or '')}</b> — {html.escape(pt.get('author') or '')}"
                      + (f", {html.escape(str(pt['year']))}" if pt.get("year") else ""))
-        lines.append(f"<i>{html.escape(d.get('intro') or '')}</i>")
+        cut = lambda x: x if len(x) <= 95 else x[:92].rsplit(" ", 1)[0] + "…"
+        lines.append(f"<i>{html.escape(cut(d.get('intro') or ''))}</i>")
         for n, fr in enumerate(d.get("frames") or [], 1):
-            lines.append(f"{n}. {html.escape(fr['text'])}")
+            lines.append(f"{n}. {html.escape(cut(fr['text']))}")
     mus = _music_lines(d)
     if mus:
         lines += ["", "🎵 Музыка:"] + mus
+    if r["kind"] == "details":
+        lines.append("\n" + (f"⚠️ {html.escape(d['voice_note'])}" if d.get("voice_note") else f"🎙 {tts.label()}"))
     lines.append(f"\n⏱ {d.get('duration', 0):.0f} с · подпись на английском придёт в день выхода")
     text = "\n".join(lines)
     return text if len(text) <= 1024 else text[:1020] + "…"
@@ -660,6 +706,8 @@ async def send_package(bot: Bot, rid: int) -> None:
     text = ("<b>Подпись</b> — нажми на блок, чтобы скопировать:\n"
             f"<pre>{html.escape(cap)}</pre>"
             + ("\n\n🎵 " + "\n".join(mus) if mus else "")
+            + ("\n\nВ видео уже есть голос: музыку в Instagram ставь потише, около 20–30%."
+               if r["kind"] == "details" and d.get("voice") and not d.get("voice_note") else "")
             + "\n\nInstagram → Reels → это видео → музыка → подпись. Обложку выбери сам.")
     if len(text) > 4000:
         text = text[:3990] + "…</pre>"
@@ -942,8 +990,8 @@ async def _replacement(d: dict, background: bool) -> dict | None:
         d["spare"] = spare[1:]
         return spare[0]
     have = "; ".join(f"{w['title']} — {w['author']}" for w in d.get("items") or [])
-    more = await curator._call(f"Theme: {d.get('title')}\nAlready in the reel: {have}\nGive 4 more works.",
-                               system=MORE_SYSTEM, model=config.CLAUDE_MODEL, max_tokens=800, background=background)
+    more = await _ask(f"Theme: {d.get('title')}\nAlready in the reel: {have}\nGive 4 more works.",
+                      system=MORE_SYSTEM, max_tokens=2500, background=background)
     async with httpx.AsyncClient(headers=UA, follow_redirects=True) as client:
         good = await verify(client, (more.get("works") or [])[:4], background)
     authors = {w["author"] for w in d.get("items") or []}

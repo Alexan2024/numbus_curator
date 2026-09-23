@@ -13,6 +13,7 @@
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -55,10 +56,11 @@ def ffmpeg_ok() -> bool:
 _fonts: dict = {}
 
 
-def font(size: int, medium: bool = True):
-    key = (size, medium)
+def font(size: int, medium: bool = True, bold: bool = False):
+    key = (size, medium, bold)
     if key not in _fonts:
-        name = "IBMPlexSans-Medium.ttf" if medium else "IBMPlexSans-Regular.ttf"
+        name = ("IBMPlexSans-Bold.ttf" if bold else "IBMPlexSans-Medium.ttf" if medium
+                else "IBMPlexSans-Regular.ttf")
         try:
             _fonts[key] = ImageFont.truetype(str(FONTS / name), size)
         except OSError:
@@ -238,14 +240,14 @@ def encode(shots: list[dict], out: Path, logo: bool = True) -> float:
     total = 0.0
     try:
         for shot in shots:
-            layers = [(_alpha_cache(im), xy, t0, t1, fi, fo) for im, xy, t0, t1, fi, fo in shot.get("layers", [])]
+            layers = [(_alpha_cache(ly[0]), *ly[1:6], ly[6] if len(ly) > 6 else FADE) for ly in shot.get("layers", [])]
             n = max(1, round(shot["dur"] * FPS))
             for i in range(n):
                 t = i / FPS
                 frame = shot["stage"].view(*_at(shot["keys"], t, shot.get("eased", True)))
-                for cache, xy, t0, t1, fi, fo in layers:
+                for cache, xy, t0, t1, fi, fo, fd in layers:
                     if t0 <= t < t1:
-                        k = min(1.0, (t - t0) / FADE if fi else 1.0, (t1 - t) / FADE if fo else 1.0)
+                        k = min(1.0, (t - t0) / fd if fi else 1.0, (t1 - t) / fd if fo else 1.0)
                         _paste(frame, cache, xy, k)
                 if lg:
                     frame.paste(lg[0], lg[2], lg[1])
@@ -330,9 +332,106 @@ def collection(title: str, items: list[dict], out: Path) -> float:
     return encode(shots, out)
 
 
+# ======================= слова по одному =======================
+
+WORD_SIZE = int(os.getenv("REEL_WORD_SIZE", "70"))
+WORD_FADE = 0.09
+WORD_STEP = 0.32                # без голоса: пауза между словами, с
+CAPTION_Y = float(os.getenv("REEL_CAPTION_Y", "0.63"))   # центр подписи по высоте кадра
+
+
+def _word_img(word: str, f) -> Image.Image:
+    """Одно слово: белое, жирное, с мягкой тенью и тонкой тёмной обводкой — читается на любом фоне."""
+    d = ImageDraw.Draw(Image.new("L", (10, 10)))
+    asc, desc = f.getmetrics()
+    w = int(d.textlength(word, font=f)) + 1
+    pad = 24
+    ink = Image.new("L", (w + 2 * pad, asc + desc + 2 * pad), 0)
+    ImageDraw.Draw(ink).text((pad, pad), word, font=f, fill=255)
+    edge = Image.new("L", ink.size, 0)
+    ImageDraw.Draw(edge).text((pad, pad), word, font=f, fill=255, stroke_width=3, stroke_fill=255)
+    sh = edge.filter(ImageFilter.GaussianBlur(9))
+    im = Image.new("RGBA", ink.size, (0, 0, 0, 0))
+    im.paste((0, 0, 0, 255), (0, 0), sh.point(lambda a: int(a * 0.62)))
+    im.paste((0, 0, 0, 255), (0, 0), edge.point(lambda a: int(a * 0.35)))
+    im.paste((255, 255, 255, 255), (0, 0), ink)
+    return im
+
+
+def _chunks(words: list[str], f, width: int, max_lines: int = 2) -> list[list[int]]:
+    """Слова → группы, которые помещаются в две строки; группа заканчивается и на конце предложения."""
+    out, cur = [], []
+    for i, w in enumerate(words):
+        test = cur + [i]
+        if cur and len(_wrap(" ".join(words[k] for k in test), f, width, 99)) > max_lines:
+            out.append(cur)
+            test = [i]
+        cur = test
+        if re.search(r"[.!?…:;]$", w) and len(cur) >= 3:
+            out.append(cur)
+            cur = []
+    if cur:
+        out.append(cur)
+    return out
+
+
+def word_layers(text: str, starts: list[float], t_end: float, width: int = 920) -> list[tuple]:
+    """Слова появляются по одному в моменты starts; группа из двух строк держится до первой слова следующей."""
+    f = font(WORD_SIZE, bold=True)
+    words = str(text).split()
+    if not words:
+        return []
+    starts = (list(starts) + [starts[-1] if starts else 0.0] * len(words))[:len(words)]
+    d = ImageDraw.Draw(Image.new("L", (10, 10)))
+    asc, desc = f.getmetrics()
+    lh = asc + desc + 6
+    groups = _chunks(words, f, width)
+    layers = []
+    for g, idx in enumerate(groups):
+        t_off = starts[groups[g + 1][0]] - 0.02 if g + 1 < len(groups) else t_end
+        lines = _balanced(" ".join(words[k] for k in idx), f, width)
+        top = int(H * CAPTION_Y) - (lh * len(lines)) // 2
+        k = 0
+        for ln_no, line in enumerate(lines):
+            parts = line.split()
+            x0 = (W - d.textlength(line, font=f)) / 2
+            for n, part in enumerate(parts):
+                wi = idx[min(k, len(idx) - 1)]
+                k += 1
+                x = x0 + (d.textlength(" ".join(parts[:n]) + " ", font=f) if n else 0)
+                img = _word_img(part, f)
+                t0 = min(starts[wi], t_off - 0.05)
+                layers.append((img, (int(x) - 24, top + ln_no * lh - 24), t0, t_off, True, False, WORD_FADE))
+    return layers
+
+
+def _timed(text: str, start: float, voice: dict | None) -> tuple[list[float], float]:
+    """→ (время каждого слова от начала ролика, длительность речи)."""
+    n = len(str(text).split())
+    if voice and voice.get("starts"):
+        return [start + x for x in voice["starts"]], float(voice["dur"])
+    return [start + i * WORD_STEP for i in range(n)], n * WORD_STEP + 0.3
+
+
+def mux(video: Path, audio: list[tuple[float, str]], dur: float, out: Path) -> None:
+    """Видео + фразы голоса в своих местах → out. Громкость выравнивается под соцсети."""
+    exe = ffmpeg_exe()
+    cmd = [exe, "-y", "-loglevel", "error", "-i", str(video)]
+    for _, path in audio:
+        cmd += ["-i", path]
+    parts = [f"[{n + 1}:a]aresample=44100,adelay={int(t * 1000)}:all=1[a{n}]" for n, (t, _) in enumerate(audio)]
+    mix = "".join(f"[a{n}]" for n in range(len(audio)))
+    graph = ";".join(parts) + f";{mix}amix=inputs={len(audio)}:normalize=0,apad,loudnorm=I=-16:TP=-1.5:LRA=11[a]"
+    cmd += ["-filter_complex", graph, "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
+            "-ar", "44100", "-t", f"{dur:.2f}", "-movflags", "+faststart", str(out)]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg (звук): {r.stderr[-300:]}")
+
+
 # ======================= детали =======================
 
-HOLD = float(os.getenv("REEL_HOLD", "3.8"))      # сколько держим деталь
+HOLD = float(os.getenv("REEL_HOLD", "3.4"))      # минимум на деталь, с (с голосом — сколько длится фраза)
 MOVE = 1.3                                       # переезд между деталями
 
 
@@ -352,40 +451,55 @@ def _detail_rect(stage: Stage, off: tuple[int, int], size: tuple[int, int], box:
     return clamp_rect(stage, cx, cy, w)
 
 
-def details(image: Path, intro: str, frames: list[dict], end_lines: list[str], out: Path) -> float:
-    """frames: [{box: [x0, y0, x1, y1] (доли), text}]. intro — фраза на общем плане."""
+def details(image: Path, intro: str, frames: list[dict], end_lines: list[str], out: Path,
+            voice: dict | None = None) -> float:
+    """frames: [{box: [x0, y0, x1, y1] (доли), text}]. intro — фраза на общем плане.
+    voice: {"intro": tts.speak(...) | None, "frames": [...]} — звук и время слов; без него слова идут в своём темпе."""
+    voice = voice or {}
+    vf = list(voice.get("frames") or []) + [None] * len(frames)
     im = load(image)
     st, off = padded_stage(im)
     full = full_rect(st)
-    txt_y = int(H * 0.60)
+    keys, layers, audio = [], [], []
 
-    def caption(text: str) -> tuple[Image.Image, tuple[int, int]]:
-        b = text_block([(text, font(48), 0)], width=860)
-        return b, ((W - b.width) // 2, txt_y - b.height // 2)
-
-    keys, layers, t = [], [], 0.0
     # общий план с лёгким наездом
-    near_full = (full[0], full[1], full[2] / 1.05)
-    keys += [(0.0, full), (HOLD + 0.6, near_full)]
-    b, xy = caption(intro)
-    layers.append((b, xy, 0.25, HOLD + 0.4, True, True))
-    t = HOLD + 0.6
-    for fr in frames:
+    s0 = 0.4
+    starts, speech = _timed(intro, s0, voice.get("intro"))
+    t = max(HOLD + 0.6, s0 + speech + 0.7)
+    keys += [(0.0, full), (t, (full[0], full[1], full[2] / 1.05))]
+    layers += word_layers(intro, starts, t - 0.05)
+    if voice.get("intro"):
+        audio.append((s0, voice["intro"]["audio"]))
+    for fr, v in zip(frames, vf):
         r = _detail_rect(st, off, im.size, fr.get("box") or [])
+        s0 = t + MOVE - 0.25                      # голос начинает, пока камера доезжает
+        starts, speech = _timed(fr.get("text") or "", s0, v)
+        end = max(t + MOVE + HOLD, s0 + speech + 0.6)
         drift = clamp_rect(st, r[0], r[1] - r[2] * 0.03, r[2] / 1.04)
-        keys += [(t + MOVE, r), (t + MOVE + HOLD, drift)]
-        b, xy = caption(fr.get("text") or "")
-        layers.append((b, xy, t + MOVE + 0.15, t + MOVE + HOLD - 0.1, True, True))
-        t += MOVE + HOLD
+        keys += [(t + MOVE, r), (end, drift)]
+        layers += word_layers(fr.get("text") or "", starts, end - 0.05)
+        if v:
+            audio.append((s0, v["audio"]))
+        t = end
     # финал: снова вся картина и подпись
-    keys += [(t + MOVE + 0.2, full), (t + MOVE + 0.2 + HOLD, full)]
-    end = text_block([(end_lines[0], font(54), 0)] + [(ln, font(34, False), 16) for ln in end_lines[1:] if ln],
-                     width=900)
-    layers.append((gradient(False, 900, 0.7), (0, H - 900), t + MOVE, t + MOVE + 0.2 + HOLD, True, False))
-    layers.append((end, ((W - end.width) // 2, int(H * 0.70) - end.height // 2), t + MOVE + 0.3,
-                   t + MOVE + 0.2 + HOLD, True, False))
-    dur = t + MOVE + 0.2 + HOLD
-    return encode([{"stage": st, "keys": keys, "dur": dur, "layers": layers}], out)
+    fin = HOLD + 0.4
+    keys += [(t + MOVE + 0.2, full), (t + MOVE + 0.2 + fin, full)]
+    endb = text_block([(end_lines[0], font(58, bold=True), 0)]
+                      + [(ln, font(36, False), 16) for ln in end_lines[1:] if ln], width=900)
+    layers.append((gradient(False, 900, 0.7), (0, H - 900), t + MOVE, t + MOVE + 0.2 + fin, True, False))
+    layers.append((endb, ((W - endb.width) // 2, int(H * 0.70) - endb.height // 2), t + MOVE + 0.3,
+                   t + MOVE + 0.2 + fin, True, False))
+    dur = t + MOVE + 0.2 + fin
+    shots = [{"stage": st, "keys": keys, "dur": dur, "layers": layers}]
+    if not audio:
+        return encode(shots, out)
+    silent = out.with_name(out.stem + "_silent.mp4")
+    total = encode(shots, silent)
+    try:
+        mux(silent, audio, total, out)
+    finally:
+        silent.unlink(missing_ok=True)
+    return total
 
 
 def cover(video_frame_src: Path, dest: Path) -> Path:
