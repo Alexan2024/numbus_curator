@@ -2,6 +2,10 @@
 появляются на экране одно за другим.
 
 Голоса (выбор — кнопкой «🎙 Голос» на экране «🎬 Рилсы», там же можно послушать):
+  OpenAI     — если в Railway задан OPENAI_API_KEY. Единственный с живой интонацией: к каждой фразе Claude
+               пишет указание, как её читать («тише, медленно, с горечью»). Модель — OPENAI_TTS_MODEL
+               (gpt-4o-mini-tts). Время слов OpenAI не отдаёт — бот получает его распознаванием речи (whisper-1).
+               С ключом это голос по умолчанию.
   Kokoro     — открытая модель, работает прямо на сервере бота: без аккаунта, оплаты и ключа. По умолчанию.
                Модель (~330 МБ) скачивается на диск Railway при первой озвучке и дальше лежит там.
   Edge       — голоса Microsoft через пакет edge-tts, бесплатно, но синтетичнее.
@@ -29,6 +33,11 @@ ENABLED = os.getenv("REEL_TTS", "1").strip().lower() not in ("0", "off", "false"
 EDGE_RATE = os.getenv("REEL_VOICE_RATE", "-4%")
 SPEED = float(os.getenv("REEL_VOICE_SPEED", "0.95"))      # темп Kokoro
 EL_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
+OA_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OA_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+OA_STT = os.getenv("OPENAI_STT_MODEL", "whisper-1")
+NARRATOR = ("You narrate a short art documentary for Instagram. Intelligent, calm, close to the microphone, "
+            "natural and human — not an announcer, not a salesman, never theatrical. English, neutral accent.")
 EL_VOICE = os.getenv("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")
 EL_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_multilingual_v2")
 
@@ -41,17 +50,26 @@ KOKORO_FILES = {
 
 # голос → (название на кнопке, описание)
 VOICES = {
-    "kokoro:af_heart": ("Heart", "американский женский, тёплый — лучший у Kokoro"),
-    "kokoro:af_bella": ("Bella", "американский женский, чуть ярче"),
-    "kokoro:bf_emma": ("Emma", "британский женский, ровный"),
-    "kokoro:bm_george": ("George", "британский мужской, низкий"),
-    "kokoro:bm_fable": ("Fable", "британский мужской, мягче"),
-    "kokoro:am_michael": ("Michael", "американский мужской, спокойный"),
-    "kokoro:am_fenrir": ("Fenrir", "американский мужской, плотный"),
-    "edge:en-GB-RyanNeural": ("Ryan · Edge", "британский мужской, Microsoft"),
-    "edge:en-US-AndrewNeural": ("Andrew · Edge", "американский мужской, Microsoft"),
+    "openai:onyx": ("Onyx", "OpenAI · мужской, низкий, весомый"),
+    "openai:ash": ("Ash", "OpenAI · мужской, тёплый"),
+    "openai:ballad": ("Ballad", "OpenAI · мужской, мягкий, выразительный"),
+    "openai:verse": ("Verse", "OpenAI · мужской, живой"),
+    "openai:sage": ("Sage", "OpenAI · женский, спокойный"),
+    "openai:coral": ("Coral", "OpenAI · женский, тёплый"),
+    "openai:shimmer": ("Shimmer", "OpenAI · женский, мягкий"),
+    "kokoro:af_heart": ("Heart", "Kokoro · женский, тёплый"),
+    "kokoro:bf_emma": ("Emma", "Kokoro · британский женский"),
+    "kokoro:bm_george": ("George", "Kokoro · британский мужской"),
+    "edge:en-GB-RyanNeural": ("Ryan", "Edge · британский мужской"),
 }
-DEFAULT = os.getenv("REEL_VOICE", "kokoro:af_heart")
+
+
+def available() -> list[str]:
+    """Голоса для экрана выбора: голоса OpenAI — только когда задан ключ."""
+    return [k for k in VOICES if OA_KEY or not k.startswith("openai:")]
+
+
+DEFAULT = os.getenv("REEL_VOICE", "openai:onyx" if OA_KEY else "kokoro:af_heart")
 if ":" not in DEFAULT:                       # старое значение REEL_VOICE=en-GB-RyanNeural
     DEFAULT = f"edge:{DEFAULT}"
 SAMPLE_TEXT = ("At first, this looks like a tired clown taking a break from a party. "
@@ -59,8 +77,15 @@ SAMPLE_TEXT = ("At first, this looks like a tired clown taking a break from a pa
 
 
 async def voice() -> str:
-    v = await db.get_setting("reel_voice", DEFAULT)
-    return v if v in VOICES or v.startswith(("kokoro:", "edge:")) else DEFAULT
+    if OA_KEY and not await db.get_setting("reel_voice_openai_on"):
+        # ключ OpenAI появился — один раз переключаемся на его голос; дальше решает выбор на экране
+        await db.set_setting("reel_voice_openai_on", True)
+        if not str(await db.get_setting("reel_voice", "") or "").startswith("openai:"):
+            await db.set_setting("reel_voice", DEFAULT if DEFAULT.startswith("openai:") else "openai:onyx")
+    v = await db.get_setting("reel_voice", None)
+    if not v or (v.startswith("openai:") and not OA_KEY):
+        v = DEFAULT if (OA_KEY or not DEFAULT.startswith("openai:")) else "kokoro:af_heart"
+    return v if v.startswith(("kokoro:", "edge:", "openai:")) else "kokoro:af_heart"
 
 
 async def provider() -> str:
@@ -76,7 +101,7 @@ async def label() -> str:
     if p == "elevenlabs":
         return "голос ElevenLabs"
     v = await voice()
-    return f"голос {VOICES.get(v, (v.split(':')[1], ''))[0]}"
+    return f"голос {VOICES.get(v, (v.split(':')[1], ''))[0]}" + (" (OpenAI)" if v.startswith("openai:") else "")
 
 
 def tokens(text: str) -> list[str]:
@@ -253,7 +278,49 @@ async def _elevenlabs(text: str, dest: Path) -> list[tuple[float, str]]:
     return words
 
 
-async def _speak_with(v: str, text: str, dest_base: Path) -> dict:
+# ======================= OpenAI =======================
+
+async def _openai(text: str, name: str, dest: Path, how: str | None) -> tuple[float, list[tuple[float, str]]]:
+    """Озвучка с указанием, как читать, + время слов распознаванием речи."""
+    head = {"Authorization": f"Bearer {OA_KEY}"}
+    body = {"model": OA_MODEL, "voice": name, "input": text, "response_format": "mp3",
+            "instructions": NARRATOR + (f" This line: {how}" if how else "")}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30, read=180)) as client:
+        r = await client.post("https://api.openai.com/v1/audio/speech", headers=head, json=body)
+        if r.status_code == 401:
+            raise RuntimeError("OpenAI: ключ не подходит (OPENAI_API_KEY)")
+        if r.status_code == 429 and "quota" in r.text.lower():
+            raise RuntimeError("OpenAI: на счёте API закончились деньги")
+        if r.status_code >= 400:
+            raise RuntimeError(f"OpenAI TTS {r.status_code}: {r.text[:200]}")
+        dest.write_bytes(r.content)
+        words: list[tuple[float, str]] = []
+        try:
+            t = await client.post("https://api.openai.com/v1/audio/transcriptions", headers=head,
+                                  data={"model": OA_STT, "response_format": "verbose_json", "language": "en",
+                                        "timestamp_granularities[]": "word", "prompt": text[:400]},
+                                  files={"file": (dest.name, dest.read_bytes(), "audio/mpeg")})
+            t.raise_for_status()
+            words = [(float(w["start"]), str(w["word"])) for w in t.json().get("words") or []]
+        except Exception:
+            log.warning("OpenAI: время слов не получено, распределяю по длине", exc_info=True)
+    return duration(dest), words
+
+
+def _by_length(text: str, total: float) -> list[float]:
+    """Запасной вариант без времени слов: по длине слов, с паузами на знаках препинания."""
+    toks = tokens(text)
+    weights = [len(_norm(t)) + 2 + (4 if re.search(r"[.!?…]$", t) else 2 if re.search(r"[,;:—]$", t) else 0)
+               for t in toks]
+    total_w = sum(weights) or 1
+    out, acc = [], 0.1
+    for w in weights:
+        out.append(acc)
+        acc += (total - 0.3) * w / total_w
+    return out
+
+
+async def _speak_with(v: str, text: str, dest_base: Path, how: str | None = None) -> dict:
     engine, _, name = v.partition(":")
     dest_base.parent.mkdir(parents=True, exist_ok=True)
     if engine == "elevenlabs":
@@ -261,6 +328,11 @@ async def _speak_with(v: str, text: str, dest_base: Path) -> dict:
         spoken = await _elevenlabs(text, dest)
     elif engine == "kokoro":
         return await _kokoro_speak(text, name, dest_base.with_suffix(".wav"))
+    elif engine == "openai":
+        dest = dest_base.with_suffix(".mp3")
+        dur, spoken = await _openai(text, name, dest, how)
+        return {"audio": str(dest), "dur": dur,
+                "starts": align(text, spoken, dur) if spoken else _by_length(text, dur)}
     else:
         dest = dest_base.with_suffix(".mp3")
         spoken = await _edge(text, name, dest)
@@ -274,20 +346,25 @@ async def current_key() -> str:
     return f"elevenlabs:{EL_VOICE}" if p == "elevenlabs" else await voice()
 
 
-async def speak(text: str, dest_base: Path) -> dict | None:
+async def speak(text: str, dest_base: Path, how: str | None = None) -> dict | None:
     """Озвучить фразу → {audio, dur, starts} (starts — начало каждого экранного слова, с) или None.
-    dest_base — путь без расширения. Выбранный голос не сработал — пробуем Edge."""
+    dest_base — путь без расширения; how — как читать (понимает только OpenAI).
+    Выбранный голос не сработал — пробуем Kokoro, потом Edge."""
     if await provider() == "off" or not str(text).strip():
         return None
     dest_base.parent.mkdir(parents=True, exist_ok=True)
     v = await current_key()
-    try:
-        return await _speak_with(v, text, dest_base)
-    except Exception:
-        if v.startswith("edge:"):
-            raise
-        log.warning("Голос %s не сработал, пробую Edge", v, exc_info=True)
-        return await _speak_with("edge:en-GB-RyanNeural", text, dest_base)
+    chain = [v] + [x for x in ("kokoro:af_heart", "edge:en-GB-RyanNeural") if x.split(":")[0] != v.split(":")[0]]
+    for n, cand in enumerate(chain):
+        try:
+            res = await _speak_with(cand, text, dest_base, how)
+            if n:
+                res["fallback"] = f"{v} не сработал, прочитал {VOICES.get(cand, (cand,))[0]}"
+            return res
+        except Exception as exc:
+            if n == len(chain) - 1:
+                raise
+            log.warning("Голос %s не сработал (%s), пробую следующий", cand, exc)
 
 
 async def sample(v: str) -> Path:
@@ -297,7 +374,8 @@ async def sample(v: str) -> Path:
     mp3 = folder / f"{re.sub(r'[^A-Za-z0-9_-]', '_', v)}.mp3"
     if mp3.exists():
         return mp3
-    res = await _speak_with(v, SAMPLE_TEXT, folder / f"{re.sub(r'[^A-Za-z0-9_-]', '_', v)}_raw")
+    res = await _speak_with(v, SAMPLE_TEXT, folder / f"{re.sub(r'[^A-Za-z0-9_-]', '_', v)}_raw",
+                            "Quiet intrigue on the first sentence; slow down and let the last sentence land.")
     src = Path(res["audio"])
     if src.suffix != ".mp3":
         subprocess.run([reelrender.ffmpeg_exe(), "-y", "-loglevel", "error", "-i", str(src), "-b:a", "128k",

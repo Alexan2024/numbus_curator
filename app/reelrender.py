@@ -375,9 +375,10 @@ def _chunks(words: list[str], f, width: int, max_lines: int = 2) -> list[list[in
     return out
 
 
-def word_layers(text: str, starts: list[float], t_end: float, width: int = 920) -> list[tuple]:
-    """Слова появляются по одному в моменты starts; группа из двух строк держится до первой слова следующей."""
-    f = font(WORD_SIZE, bold=True)
+def word_layers(text: str, starts: list[float], t_end: float, width: int = 920, size: int | None = None,
+                fade: float = WORD_FADE) -> list[tuple]:
+    """Слова появляются по одному в моменты starts; группа из двух строк держится до первого слова следующей."""
+    f = font(size or WORD_SIZE, bold=True)
     words = str(text).split()
     if not words:
         return []
@@ -401,7 +402,7 @@ def word_layers(text: str, starts: list[float], t_end: float, width: int = 920) 
                 x = x0 + (d.textlength(" ".join(parts[:n]) + " ", font=f) if n else 0)
                 img = _word_img(part, f)
                 t0 = min(starts[wi], t_off - 0.05)
-                layers.append((img, (int(x) - 24, top + ln_no * lh - 24), t0, t_off, True, False, WORD_FADE))
+                layers.append((img, (int(x) - 24, top + ln_no * lh - 24), t0, t_off, fade > 0, False, max(fade, 0.01)))
     return layers
 
 
@@ -451,38 +452,51 @@ def _detail_rect(stage: Stage, off: tuple[int, int], size: tuple[int, int], box:
     return clamp_rect(stage, cx, cy, w)
 
 
-def details(image: Path, intro: str, frames: list[dict], end_lines: list[str], out: Path,
-            voice: dict | None = None) -> float:
-    """frames: [{box: [x0, y0, x1, y1] (доли), text}]. intro — фраза на общем плане.
-    voice: {"intro": tts.speak(...) | None, "frames": [...]} — звук и время слов; без него слова идут в своём темпе."""
-    voice = voice or {}
-    vf = list(voice.get("frames") or []) + [None] * len(frames)
+HOOK_SIZE = int(os.getenv("REEL_HOOK_SIZE", "84"))
+PAUSE_AFTER_HOOK = 0.75
+PAUSE_BEFORE_CLIMAX = 0.9
+
+
+def story(image: Path, beats: list[dict], end_lines: list[str], out: Path, voices: list | None = None) -> float:
+    """Рилс по сюжету: beats — [{kind: hook|context|reveal|climax|final, text, box}] по порядку,
+    box — доли картины [x0, y0, x1, y1] или None (вся картина). voices — tts.speak() на каждую фразу или None.
+
+    Хук: рилс открывается сразу на крупной детали, слова крупнее и без проявления, после — пауза.
+    Перед кульминацией — пауза, после неё кадр держится чуть дольше. Потом финальная фраза и титр."""
+    vs = list(voices or []) + [None] * len(beats)
     im = load(image)
     st, off = padded_stage(im)
     full = full_rect(st)
     keys, layers, audio = [], [], []
-
-    # общий план с лёгким наездом
-    s0 = 0.4
-    starts, speech = _timed(intro, s0, voice.get("intro"))
-    t = max(HOLD + 0.6, s0 + speech + 0.7)
-    keys += [(0.0, full), (t, (full[0], full[1], full[2] / 1.05))]
-    layers += word_layers(intro, starts, t - 0.05)
-    if voice.get("intro"):
-        audio.append((s0, voice["intro"]["audio"]))
-    for fr, v in zip(frames, vf):
-        r = _detail_rect(st, off, im.size, fr.get("box") or [])
-        s0 = t + MOVE - 0.25                      # голос начинает, пока камера доезжает
-        starts, speech = _timed(fr.get("text") or "", s0, v)
-        end = max(t + MOVE + HOLD, s0 + speech + 0.6)
-        drift = clamp_rect(st, r[0], r[1] - r[2] * 0.03, r[2] / 1.04)
-        keys += [(t + MOVE, r), (end, drift)]
-        layers += word_layers(fr.get("text") or "", starts, end - 0.05)
+    t = 0.0
+    for n, (b, v) in enumerate(zip(beats, vs)):
+        kind, text = b.get("kind"), b.get("text") or ""
+        target = _detail_rect(st, off, im.size, b["box"]) if b.get("box") else full
+        if n == 0:
+            s0 = 0.12 if kind == "hook" else 0.4
+            keys.append((0.0, target))
+            arrive = 0.0
+        else:
+            arrive = t + MOVE
+            keys.append((arrive, target))
+            s0 = arrive - 0.25 + (PAUSE_BEFORE_CLIMAX if kind == "climax" else 0.0)
+        starts, speech = _timed(text, s0, v)
+        tail = PAUSE_AFTER_HOOK if kind == "hook" else 1.0 if kind == "climax" else 0.55
+        end = max(arrive + (2.2 if kind == "hook" else 2.8), s0 + speech + tail)
+        if target is full:
+            drift = (full[0], full[1], full[2] / 1.05)
+        else:
+            drift = clamp_rect(st, target[0], target[1] - target[2] * 0.03, target[2] / 1.05)
+        keys.append((end, drift))
+        if kind == "hook":
+            layers += word_layers(text, starts, end - 0.05, size=HOOK_SIZE, fade=0.0)
+        else:
+            layers += word_layers(text, starts, end - 0.05)
         if v:
             audio.append((s0, v["audio"]))
         t = end
-    # финал: снова вся картина и подпись
-    fin = HOLD + 0.4
+    # титр: вся картина, название, автор, музей
+    fin = 3.0
     keys += [(t + MOVE + 0.2, full), (t + MOVE + 0.2 + fin, full)]
     endb = text_block([(end_lines[0], font(58, bold=True), 0)]
                       + [(ln, font(36, False), 16) for ln in end_lines[1:] if ln], width=900)
