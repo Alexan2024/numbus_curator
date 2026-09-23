@@ -289,6 +289,10 @@ async def eval_context() -> str:
     if rej:
         parts.append("# Недавно отклонено автором — учитывай при оценке\n" + "\n".join(
             f"- {json.loads(r['data']).get('headline', '?')} — {r['reject_reason']}" for r in rej))
+    from app import taste
+    rules = await taste.active_text("select")
+    if rules:
+        parts.append(rules)
     return "\n\n".join(parts)
 
 
@@ -393,6 +397,10 @@ async def _voice_context() -> str:
     banned = await voice.banned()
     if banned:
         parts.append("# Автор запретил эти слова и обороты\n" + "; ".join(banned))
+    from app import taste
+    rules = await taste.active_text("write")
+    if rules:
+        parts.append(rules)
     return "\n\n".join(parts)
 
 

@@ -12,8 +12,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-from app import (cards, config, curator, db, finds, formatter, notes, pipeline, queue_view, request, screen, slots,
-                 sources, ui, voice)
+from app import (cards, config, curator, dates, db, finds, formatter, notes, pipeline, queue_view, request, screen, slots,
+                 sources, taste, ui, voice)
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -224,7 +224,7 @@ async def on_home(cb: CallbackQuery, bot: Bot, state: FSMContext):
         from app import stats
         await stats.refresh(bot)
         return await screen.show(bot, "perf")
-    if action in ("stats", "digest", "src", "voice", "perf"):
+    if action in ("stats", "digest", "src", "voice", "perf", "taste"):
         await cb.answer()
         return await screen.show(bot, action)
     if action == "srct":
@@ -667,6 +667,8 @@ async def on_stale(cb: CallbackQuery):
 # «пост по запросу» ловит любой обычный текст, поэтому идёт после заметок, а «старые кнопки» — последними
 router.include_router(notes.router)
 router.include_router(finds.router)
+router.include_router(taste.router)
+router.include_router(dates.router)
 router.include_router(queue_view.router)
 router.include_router(request.router)
 router.include_router(stale)

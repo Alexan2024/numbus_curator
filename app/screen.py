@@ -148,7 +148,13 @@ async def _home_extras() -> list[list]:
         rows.append([btn("✍️ Пост по запросу", "rq:ask"), btn(f"🕓 Отложенные · {n}" if n else "🕓 Отложенные", "rq:wl")])
     except Exception:
         log.warning("Кнопка «Пост по запросу»", exc_info=True)
-    rows.append([btn("🗂 Очередь публикаций", "qv:show")])
+    try:
+        from app import dates
+        n = len(await dates.items("proposed"))
+        rows.append([btn("🗂 Очередь публикаций", "qv:show"), btn(f"📅 Даты · {n} новых" if n else "📅 Даты", "dt:home")])
+    except Exception:
+        log.warning("Кнопка «Даты»", exc_info=True)
+        rows.append([btn("🗂 Очередь публикаций", "qv:show")])
     try:
         rows.append([btn(await finds.home_label(), "fa:info")])
     except Exception:
@@ -290,7 +296,8 @@ async def _voice(arg: dict):
         lines.append("Своих запретов пока нет. Добавь фразу, которая режет глаз, — бот перестанет её писать.")
     dels = [btn(f"✕ {i + 1}", f"h:vdel:{i}") for i in range(len(banned))]
     rows = [dels[i:i + 5] for i in range(0, len(dels), 5)]
-    rows.append([btn("➕ Запретить фразу", "h:vadd"), btn("← Пульт", "h:home")])
+    rows.append([btn("➕ Запретить фразу", "h:vadd"), btn("🧠 Вкус", "h:taste")])
+    rows.append([btn("← Пульт", "h:home")])
     return banner(), "\n".join(lines)[:1000], _kb(rows), arg
 
 

@@ -13,7 +13,8 @@ from aiogram.types import BotCommand, ErrorEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app import (attribution, config, curator, db, growth, instagram, pipeline, repeats, reports, request, screen,
-                 slots, stats, stories, ui)
+                 slots, stats, stories, taste, ui)
+from app import dates
 from app.bot import router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -106,12 +107,16 @@ async def main():
     await repeats.init()
     await stats.init()
     await stories.init()
+    await taste.init()
+    await dates.init()
     await growth.init()
     await instagram.init()
     screen.banner()
     bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     ui.BOT = bot                      # для уведомлений из фоновых задач
     growth.install(bot)               # виды раздела «📈 Рост»
+    dates.install(bot)                # экран «📅 Даты»
+    taste.install(bot)                # экран «🧠 Вкус»
     stats.install(bot)                # экран «🏆 Что заходит»
     instagram.install(bot)            # вид «📸 Instagram»; сам пост уходит туда из cards.publish_post
     dp = Dispatcher()
@@ -160,6 +165,8 @@ async def main():
     growth.schedule(sched, bot, guarded)
     instagram.schedule(sched, bot, guarded)
     stats.schedule(sched, bot, guarded)
+    taste.schedule(sched, bot, guarded)
+    dates.schedule(sched, bot, guarded)
     sched.start()
 
     await instagram.start_server()   # Instagram забирает фото по публичной ссылке
@@ -169,6 +176,7 @@ async def main():
         BotCommand(command="next", description="Следующий пост"),
         BotCommand(command="stats", description="Где сейчас посты"),
         BotCommand(command="diag", description="Проверить, всё ли работает"),
+        BotCommand(command="date", description="Пост к дате: /date 9.03 о чём"),
         BotCommand(command="cancel", description="Отменить ввод"),
     ])
     asyncio.create_task(guarded(bot, "запуск", startup, bot)())
