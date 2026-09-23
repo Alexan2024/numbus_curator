@@ -388,13 +388,15 @@ Structure — 30 to 45 seconds, about 90–120 words in total:
 Tone: restrained and intelligent, but gripping. Plain spoken English, present tense, short sentences; "you" is fine. Concrete details and contrasts carry the emotion — the ball and the empty room, laughter and grief. Use only the facts given; if the drama needs a fact you don't have, change the angle instead of inventing one.
 Never: insane, mind-blowing, crazy, iconic, masterpiece, stunning, breathtaking, haunting, heartbreaking, chilling, "wait for the end", "follow for more", "let that sink in", "not X but Y" constructions, exclamation marks, emoji, parentheses, abbreviations, lists.
 
-delivery — every hook, reveal, the climax, and the context and final lines (context_delivery, final_delivery) get a short direction for the narrator, in English, 6–15 words: tone, emotion, pace, where to pause. Follow the arc: hook — quiet intrigue, a little quicker; context — plain and even; reveals — curiosity that builds; climax — slower, softer, heavier, a real pause between sentences; final — calm and weighty. Directions stay restrained: no shouting, no whispering, nothing theatrical.
+delivery — every hook, reveal, the climax, and the context and final lines (context_delivery, final_delivery) get a short direction for the narrator, in English, 6–15 words: tone, emotion, pace, where to pause. Follow the arc: hook — quiet intrigue, a little quicker; context — plain and even; reveals — curiosity that builds; climax — slower, softer, heavier, a real pause between sentences; final — calm and weighty. Directions are alive and specific, like notes from a director to an actor ("lean on 'only'", "a wry smile here", "let it hang"), but never theatrical: no shouting, no whispering, no trailer voice.
+
+voice_direction — one or two sentences in English for the narrator about this particular story: its mood, where it turns, what to savour (e.g. "Starts with a wry smile, grows uneasy at the letter, the turn is quiet and heavy, the last line almost tender").
 
 caption — the Instagram caption WITHOUT the hook (the hook is put above it automatically): first line "Title (year), Author"; then 2–3 short paragraphs with the story and one or two facts that did not fit the video; last line — museum and city.
 hashtags — 5–8 lowercase words without #.
 
 Return ONLY JSON:
-{"hooks": [{"type": "contradiction|hidden|stakes|challenge|question", "text": "...", "box": [0.1, 0.2, 0.3, 0.5], "delivery": "..."}], "hook_pick": 0, "context": "...", "context_delivery": "...", "reveals": [{"box": [0.1, 0.2, 0.3, 0.5], "text": "...", "delivery": "..."}], "climax": {"text": "...", "box": [0.1, 0.2, 0.3, 0.5], "delivery": "..."}, "final": "...", "final_delivery": "...", "caption": "...", "hashtags": ["..."]}"""
+{"hooks": [{"type": "contradiction|hidden|stakes|challenge|question", "text": "...", "box": [0.1, 0.2, 0.3, 0.5], "delivery": "..."}], "hook_pick": 0, "context": "...", "context_delivery": "...", "reveals": [{"box": [0.1, 0.2, 0.3, 0.5], "text": "...", "delivery": "..."}], "climax": {"text": "...", "box": [0.1, 0.2, 0.3, 0.5], "delivery": "..."}, "final": "...", "final_delivery": "...", "voice_direction": "...", "caption": "...", "hashtags": ["..."]}"""
 
 
 def _box(b) -> list | None:
@@ -580,7 +582,8 @@ async def _details(rid: int, d: dict, background: bool, client: httpx.AsyncClien
         hooks = [hooks[pick]] + [h for i, h in enumerate(hooks) if i != pick]
         d["story"] = {"hooks": hooks, "hook_i": 0, "context": st.get("context") or "", "reveals": reveals,
                       "climax": st.get("climax") or {}, "final": st.get("final") or "",
-                      "context_delivery": st.get("context_delivery") or "", "final_delivery": st.get("final_delivery") or ""}
+                      "context_delivery": st.get("context_delivery") or "", "final_delivery": st.get("final_delivery") or "",
+                      "voice_direction": st.get("voice_direction") or ""}
         d.update(caption=st.get("caption") or "", hashtags=st.get("hashtags") or [])
     end = [f"{pt['title']}" + (f", {pt['year']}" if pt.get("year") else ""), pt.get("author") or "",
            pt.get("museum") or ""]
@@ -592,13 +595,30 @@ async def _details(rid: int, d: dict, background: bool, client: httpx.AsyncClien
     return d
 
 
-async def _voice(folder: Path, d: dict, bs: list[dict]) -> list | None:
+async def _voice(folder: Path, d: dict, bs: list[dict]) -> list | dict | None:
     """Озвучить вступление и фразы деталей. Уже озвученное (тот же текст, тот же голос) не синтезируется заново.
     Не вышло — рилс собирается без звука, а в d["voice_note"] — почему."""
     d.pop("voice_note", None)
     if await tts.provider() == "off":
         return None
     vkey = await tts.current_key()
+    if tts.is_one_take(vkey):
+        parts = [(b["kind"], b["text"], b.get("how") or "") for b in bs]
+        extra = (d.get("story") or {}).get("voice_direction") or ""
+        key = hashlib.md5(f"{vkey}|{json.dumps(parts, ensure_ascii=False)}|{extra}".encode()).hexdigest()[:12]
+        hit = (d.get("voice") or {}).get(key)
+        if hit and Path(hit["audio"]).exists():
+            d["voice_label"] = await tts.label()
+            return hit
+        try:
+            res = await tts.speak_story(parts, folder / "voice" / f"take_{key}", extra)
+            d["voice"] = {key: res}
+            d["voice_label"] = await tts.label()
+            return res
+        except Exception as exc:
+            log.warning("Рилс: дубль OpenAI не получился, читаю по фразам запасным голосом", exc_info=True)
+            d["voice_note"] = f"OpenAI не ответил ({str(exc)[:80]}) — прочитал запасной голос"
+            vkey = "kokoro:af_heart"
     cache = d.get("voice") or {}
     texts = [(b["text"], b.get("how") or "") for b in bs]
     out = []
@@ -609,7 +629,8 @@ async def _voice(folder: Path, d: dict, bs: list[dict]) -> list | None:
             if hit and Path(hit["audio"]).exists():
                 out.append(hit)
                 continue
-            res = await tts.speak(text, folder / "voice" / key, how or None)
+            res = (await tts.speak(text, folder / "voice" / key, how or None) if not vkey.startswith("kokoro:af_heart")
+                   or not d.get("voice_note") else await tts._speak_with(vkey, text, folder / "voice" / key))
             if res and res.get("fallback"):
                 d["voice_note"] = res["fallback"]
             if res and not res.get("fallback"):     # запасной голос не запоминаем — в следующий раз попробуем выбранный

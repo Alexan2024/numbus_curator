@@ -463,6 +463,8 @@ def story(image: Path, beats: list[dict], end_lines: list[str], out: Path, voice
 
     Хук: рилс открывается сразу на крупной детали, слова крупнее и без проявления, после — пауза.
     Перед кульминацией — пауза, после неё кадр держится чуть дольше. Потом финальная фраза и титр."""
+    if isinstance(voices, dict) and voices.get("one_take"):
+        return _story_one_take(image, beats, end_lines, out, voices)
     vs = list(voices or []) + [None] * len(beats)
     im = load(image)
     st, off = padded_stage(im)
@@ -514,6 +516,65 @@ def story(image: Path, beats: list[dict], end_lines: list[str], out: Path, voice
     finally:
         silent.unlink(missing_ok=True)
     return total
+
+
+def _end_card(keys: list, layers: list, full, t: float) -> float:
+    """Титр после рассказа: камера на всю картину, название, автор, музей. → длительность ролика."""
+    fin = 3.0
+    keys += [(t + MOVE + 0.2, full), (t + MOVE + 0.2 + fin, full)]
+    return t + MOVE + 0.2 + fin
+
+
+def _story_one_take(image: Path, beats: list[dict], end_lines: list[str], out: Path, take: dict) -> float:
+    """Весь рассказ — один дубль голоса; камера и слова подстраиваются под него: к каждой детали камера
+    приезжает к началу её фразы, слова идут вместе с голосом, паузы — те, что сделал сам голос."""
+    im = load(image)
+    st, off = padded_stage(im)
+    full = full_rect(st)
+    tb = list(take.get("beats") or []) + [{"start": None, "starts": []}] * len(beats)
+    total = float(take.get("dur") or 0)
+    starts = [b.get("start") for b in tb[:len(beats)]]
+    # время начала каждой части; если чего-то нет — ставим между соседями
+    for i in range(len(starts)):
+        if starts[i] is None:
+            starts[i] = (starts[i - 1] + 2.5) if i else 0.0
+    keys, layers = [], []
+    prev_arrive = 0.0
+    for n, b in enumerate(beats):
+        target = _detail_rect(st, off, im.size, b["box"]) if b.get("box") else full
+        if n == 0:
+            keys.append((0.0, target))
+            arrive = 0.0
+        else:
+            arrive = max(starts[n] - 0.1, prev_arrive + 0.8)
+            move_from = max(arrive - MOVE, prev_arrive + 0.5)
+            prev_target = keys[-1][1]
+            keys.append((move_from, prev_target))
+            keys.append((arrive, target))
+        nxt = starts[n + 1] if n + 1 < len(beats) else total + 0.4
+        hold_end = max(arrive + 0.6, nxt - MOVE)
+        drift = (full[0], full[1], full[2] / 1.04) if target is full else \
+            clamp_rect(st, target[0], target[1] - target[2] * 0.02, target[2] / 1.04)
+        keys.append((hold_end, drift))
+        words = tb[n].get("starts") or [starts[n] + i * WORD_STEP for i in range(len(b["text"].split()))]
+        layers += word_layers(b["text"], words, nxt - 0.05, size=HOOK_SIZE if b.get("kind") == "hook" else None,
+                              fade=0.0 if b.get("kind") == "hook" else WORD_FADE)
+        prev_arrive = arrive
+    t = max(total, keys[-1][0]) + 0.2
+    endb = text_block([(end_lines[0], font(58, bold=True), 0)]
+                      + [(ln, font(36, False), 16) for ln in end_lines[1:] if ln], width=900)
+    dur = _end_card(keys, layers, full, t)
+    layers.append((gradient(False, 900, 0.7), (0, H - 900), t + MOVE, dur, True, False))
+    layers.append((endb, ((W - endb.width) // 2, int(H * 0.70) - endb.height // 2), t + MOVE + 0.1, dur, True, False))
+    keys.sort(key=lambda k: k[0])
+    shots = [{"stage": st, "keys": keys, "dur": dur, "layers": layers}]
+    silent = out.with_name(out.stem + "_silent.mp4")
+    total_v = encode(shots, silent)
+    try:
+        mux(silent, [(0.0, take["audio"])], total_v, out)
+    finally:
+        silent.unlink(missing_ok=True)
+    return total_v
 
 
 def cover(video_frame_src: Path, dest: Path) -> Path:

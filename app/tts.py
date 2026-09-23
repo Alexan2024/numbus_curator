@@ -36,10 +36,13 @@ EL_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
 OA_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OA_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
 OA_STT = os.getenv("OPENAI_STT_MODEL", "whisper-1")
-NARRATOR = ("You narrate a short art documentary for Instagram. Intelligent, calm, close to the microphone, "
-            "natural and human — not an announcer, not a salesman, never theatrical. English, neutral accent.")
-EL_VOICE = os.getenv("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")
-EL_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_multilingual_v2")
+NARRATOR = """Identity: a real person telling a friend about a painting they can't stop thinking about. Warm, curious, alive. Not an announcer, not an audiobook reader, not a movie-trailer voice.
+
+Voice affect: natural and conversational, close to the microphone; the pitch moves the way it does when someone is genuinely telling a story.
+Tone: intrigued at the start, drawn in by each reveal, a quiet smile where there is irony, and real weight at the emotional turn.
+Pacing: lively and varied — quicker through setup, slower where it matters. Never even and metronomic.
+Pauses: a short beat after the opening line; a real pause before the emotional turn; line breaks in the text are breaths.
+Emphasis: lean on the one word in each sentence that carries the surprise or the contrast."""
 
 KOKORO_DIR = config.DATA_DIR / "models" / "kokoro"
 KOKORO_FILES = {
@@ -50,6 +53,8 @@ KOKORO_FILES = {
 
 # голос → (название на кнопке, описание)
 VOICES = {
+    "openai:cedar": ("Cedar", "OpenAI · мужской, самый живой"),
+    "openai:marin": ("Marin", "OpenAI · женский, самый живой"),
     "openai:onyx": ("Onyx", "OpenAI · мужской, низкий, весомый"),
     "openai:ash": ("Ash", "OpenAI · мужской, тёплый"),
     "openai:ballad": ("Ballad", "OpenAI · мужской, мягкий, выразительный"),
@@ -69,7 +74,7 @@ def available() -> list[str]:
     return [k for k in VOICES if OA_KEY or not k.startswith("openai:")]
 
 
-DEFAULT = os.getenv("REEL_VOICE", "openai:onyx" if OA_KEY else "kokoro:af_heart")
+DEFAULT = os.getenv("REEL_VOICE", "openai:cedar" if OA_KEY else "kokoro:af_heart")
 if ":" not in DEFAULT:                       # старое значение REEL_VOICE=en-GB-RyanNeural
     DEFAULT = f"edge:{DEFAULT}"
 SAMPLE_TEXT = ("At first, this looks like a tired clown taking a break from a party. "
@@ -77,11 +82,17 @@ SAMPLE_TEXT = ("At first, this looks like a tired clown taking a break from a pa
 
 
 async def voice() -> str:
+    if OA_KEY and not await db.get_setting("reel_voice_openai_v2"):
+        # 4.9: Onyx, выбранный по умолчанию в 4.8, звучал плоско — один раз переводим на Cedar
+        await db.set_setting("reel_voice_openai_v2", True)
+        if await db.get_setting("reel_voice") in (None, "openai:onyx"):
+            await db.set_setting("reel_voice", DEFAULT if DEFAULT.startswith("openai:") else "openai:cedar")
+            await db.set_setting("reel_voice_openai_on", True)
     if OA_KEY and not await db.get_setting("reel_voice_openai_on"):
         # ключ OpenAI появился — один раз переключаемся на его голос; дальше решает выбор на экране
         await db.set_setting("reel_voice_openai_on", True)
         if not str(await db.get_setting("reel_voice", "") or "").startswith("openai:"):
-            await db.set_setting("reel_voice", DEFAULT if DEFAULT.startswith("openai:") else "openai:onyx")
+            await db.set_setting("reel_voice", DEFAULT if DEFAULT.startswith("openai:") else "openai:cedar")
     v = await db.get_setting("reel_voice", None)
     if not v or (v.startswith("openai:") and not OA_KEY):
         v = DEFAULT if (OA_KEY or not DEFAULT.startswith("openai:")) else "kokoro:af_heart"
@@ -284,7 +295,7 @@ async def _openai(text: str, name: str, dest: Path, how: str | None) -> tuple[fl
     """Озвучка с указанием, как читать, + время слов распознаванием речи."""
     head = {"Authorization": f"Bearer {OA_KEY}"}
     body = {"model": OA_MODEL, "voice": name, "input": text, "response_format": "mp3",
-            "instructions": NARRATOR + (f" This line: {how}" if how else "")}
+            "instructions": (how if how and how.startswith("Identity:") else NARRATOR + (f"\nThis line: {how}" if how else ""))}
     async with httpx.AsyncClient(timeout=httpx.Timeout(30, read=180)) as client:
         r = await client.post("https://api.openai.com/v1/audio/speech", headers=head, json=body)
         if r.status_code == 401:
@@ -305,6 +316,42 @@ async def _openai(text: str, name: str, dest: Path, how: str | None) -> tuple[fl
         except Exception:
             log.warning("OpenAI: время слов не получено, распределяю по длине", exc_info=True)
     return duration(dest), words
+
+
+def is_one_take(v: str) -> bool:
+    """OpenAI читает весь рассказ одним дублем: интонация течёт от фразы к фразе, а не начинается заново."""
+    return v.startswith("openai:")
+
+
+def direction(parts: list[tuple[str, str, str]], extra: str = "") -> str:
+    """Указания для одного дубля: общая манера + как читать каждую часть. parts — [(вид, текст, как)]."""
+    names = {"hook": "opening hook", "context": "context", "reveal": "reveal", "climax": "emotional turn",
+             "final": "closing line"}
+    lines = [NARRATOR]
+    if extra:
+        lines.append(f"This story: {extra}")
+    lines.append("Part by part:")
+    for n, (kind, text, how) in enumerate(parts, 1):
+        lines.append(f"{n}. {names.get(kind, kind)} (\"{' '.join(text.split()[:6])}…\"): {how or 'natural'}")
+    return "\n".join(lines)[:3800]
+
+
+async def speak_story(parts: list[tuple[str, str, str]], dest_base: Path, extra: str = "") -> dict:
+    """Весь рассказ одним дублем OpenAI → {audio, dur, beats: [{start, starts}]} — время каждой части и слова."""
+    v = await current_key()
+    name = v.split(":", 1)[1]
+    text = "\n\n".join(t for _, t, _ in parts)
+    dest = dest_base.with_suffix(".mp3")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dur, spoken = await _openai(text, name, dest, direction(parts, extra))
+    starts = align(text, spoken, dur) if spoken else _by_length(text, dur)
+    beats, pos = [], 0
+    for _, t, _ in parts:
+        n = len(tokens(t))
+        beats.append({"start": starts[pos] if n else (beats[-1]["start"] if beats else 0.0),
+                      "starts": starts[pos:pos + n]})
+        pos += n
+    return {"audio": str(dest), "dur": dur, "beats": beats, "one_take": True}
 
 
 def _by_length(text: str, total: float) -> list[float]:
@@ -371,11 +418,13 @@ async def sample(v: str) -> Path:
     """Образец голоса для кнопки «послушать» (mp3, кэшируется на диске)."""
     from app import reelrender
     folder = config.DATA_DIR / "reels" / "samples"
-    mp3 = folder / f"{re.sub(r'[^A-Za-z0-9_-]', '_', v)}.mp3"
+    mp3 = folder / f"{re.sub(r'[^A-Za-z0-9_-]', '_', v)}_v2.mp3"
     if mp3.exists():
         return mp3
-    res = await _speak_with(v, SAMPLE_TEXT, folder / f"{re.sub(r'[^A-Za-z0-9_-]', '_', v)}_raw",
-                            "Quiet intrigue on the first sentence; slow down and let the last sentence land.")
+    how = (direction([("hook", SAMPLE_TEXT.split(". ")[0], "quiet intrigue, a little quicker, a beat after it"),
+                      ("reveal", SAMPLE_TEXT, "drawn in, lean on 'doorway', let the last sentence land slower")])
+           if is_one_take(v) else None)
+    res = await _speak_with(v, SAMPLE_TEXT, folder / f"{re.sub(r'[^A-Za-z0-9_-]', '_', v)}_v2_raw", how)
     src = Path(res["audio"])
     if src.suffix != ".mp3":
         subprocess.run([reelrender.ffmpeg_exe(), "-y", "-loglevel", "error", "-i", str(src), "-b:a", "128k",
