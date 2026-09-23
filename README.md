@@ -1,7 +1,19 @@
-# AHMAG curator bot · v4.5
+# AHMAG curator bot · v4.6
 
 Личный Telegram-бот: находит материалы, отбирает их по вкусу канала AHMAG, готовит посты, публикует по
 расписанию в канал и в Instagram. Решения — за автором.
+
+## Что нового в 4.6
+
+- **Голос Kokoro** — открытая модель, работает прямо на сервере бота: без аккаунта, оплаты и ключа, из России
+  ничего не блокирует. Теперь это голос по умолчанию. Модель (~350 МБ) скачивается на диск Railway при первой
+  озвучке — первый рилс «деталей» соберётся на минуту дольше.
+- **Выбор голоса в боте**: «🎬 Рилсы» → «🎙 Голос». Семь голосов Kokoro и два Edge; нажал — голос выбран,
+  и приходит образец послушать. По умолчанию Heart (американский женский, тёплый).
+- Время каждого слова Kokoro отдаёт сам, по длительностям звуков, — слова на экране идут вместе с голосом.
+- Выбранный голос не сработал — бот пробует Edge, и только потом собирает рилс без звука.
+- `REEL_VOICE` теперь в виде `kokoro:af_heart` или `edge:en-GB-RyanNeural` — это голос до первого выбора в боте.
+  `ELEVENLABS_API_KEY`, если задан, по-прежнему главнее.
 
 ## Что нового в 4.5
 
@@ -321,7 +333,7 @@ Wellcome Collection, Europeana, Are.na. Кино: Cinephilia & Beyond, Film-Grab
 | `REELS` / `REELS_DAYS` / `REELS_TIME` / `REELS_BUILD_TIME` | 1 / mon,wed,fri / 18:30 / 13:00 | рилсы: `0` — выключить / дни / когда выкладывать / когда собирать накануне |
 | `REEL_TOPICS` | art,architecture,photography,art,architecture,archive | темы подборок по кругу |
 | `REEL_MAX_ITEMS` / `REEL_SEG` / `REEL_HOLD` | 8 / 3.6 / 3.4 | работ в подборке / секунд на работу / минимум секунд на деталь |
-| `REEL_TTS` / `REEL_VOICE` / `REEL_VOICE_RATE` | 1 / en-GB-RyanNeural / -4% | озвучка деталей: `0` — выключить / голос Edge / темп |
+| `REEL_TTS` / `REEL_VOICE` / `REEL_VOICE_SPEED` / `REEL_VOICE_RATE` | 1 / kokoro:af_heart / 0.95 / -4% | озвучка деталей: `0` — выключить / голос по умолчанию / темп Kokoro / темп Edge |
 | `ELEVENLABS_API_KEY` / `ELEVENLABS_VOICE_ID` / `ELEVENLABS_MODEL` | — / George / eleven_multilingual_v2 | голос ElevenLabs вместо Edge |
 | `REEL_WORD_SIZE` / `REEL_CAPTION_Y` | 70 / 0.63 | размер слов на деталях / где подпись по высоте кадра |
 | `REEL_LOGO_BOTTOM` / `REEL_CRF` / `REEL_FPS` | 380 / 22 / 30 | знак: отступ снизу, px / качество видео (меньше — лучше и тяжелее) / кадров в секунду |
@@ -353,7 +365,7 @@ app/dates.py            посты к датам, экран «Даты», /date
 app/taste.py            самообучение вкуса, экран «Вкус»
 app/stats.py            статистика постов, экран «Что заходит»
 app/stories.py          сторис Instagram
-app/reels.py            рилсы: темы, картинки, карточка, публикация, экран; reelrender.py — сборка видео; tts.py — голос
+app/reels.py            рилсы: темы, картинки, карточка, публикация, экран; reelrender.py — сборка видео; tts.py — голос (Kokoro, Edge, ElevenLabs)
 data/fonts/             шрифт для сторис и рилсов (IBM Plex Sans, лицензия OFL)
 app/curator.py          все обращения к Claude; voice.py — голос; formatter.py — подпись
 app/sources.py          RSS и музеи; niche.py — нишевые источники; media.py — текст и фото со страниц

@@ -9,3 +9,4 @@ pillow>=10.1
 APScheduler>=3.10,<4
 imageio-ffmpeg>=0.5
 edge-tts>=7.0
+kokoro-onnx>=0.6

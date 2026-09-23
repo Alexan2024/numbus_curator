@@ -535,19 +535,20 @@ async def _voice(folder: Path, d: dict) -> dict | None:
     """Озвучить вступление и фразы деталей. Уже озвученное (тот же текст, тот же голос) не синтезируется заново.
     Не вышло — рилс собирается без звука, а в d["voice_note"] — почему."""
     d.pop("voice_note", None)
-    if tts.provider() == "off":
+    if await tts.provider() == "off":
         return None
+    vkey = await tts.current_key()
     cache = d.get("voice") or {}
     texts = [d.get("intro") or ""] + [f.get("text") or "" for f in d.get("frames") or []]
     out = []
     try:
         for text in texts:
-            key = hashlib.md5(f"{tts.provider()}|{tts.EDGE_VOICE}|{tts.EL_VOICE}|{text}".encode()).hexdigest()[:12]
+            key = hashlib.md5(f"{vkey}|{tts.SPEED}|{text}".encode()).hexdigest()[:12]
             hit = cache.get(key)
             if hit and Path(hit["audio"]).exists():
                 out.append(hit)
                 continue
-            res = await tts.speak(text, folder / "voice" / f"{key}.mp3")
+            res = await tts.speak(text, folder / "voice" / key)
             if res:
                 cache[key] = res
             out.append(res)
@@ -556,6 +557,7 @@ async def _voice(folder: Path, d: dict) -> dict | None:
         d["voice_note"] = f"голос не получился ({str(exc)[:80]}) — видео без озвучки"
         return None
     d["voice"] = {k: v for k, v in cache.items() if v in out}
+    d["voice_label"] = await tts.label()
     return {"intro": out[0], "frames": out[1:]}
 
 
@@ -636,7 +638,7 @@ def _card_text(r, d: dict, note: str | None = None) -> str:
     if mus:
         lines += ["", "🎵 Музыка:"] + mus
     if r["kind"] == "details":
-        lines.append("\n" + (f"⚠️ {html.escape(d['voice_note'])}" if d.get("voice_note") else f"🎙 {tts.label()}"))
+        lines.append("\n" + (f"⚠️ {html.escape(d['voice_note'])}" if d.get("voice_note") else f"🎙 {html.escape(d.get('voice_label') or '')}"))
     lines.append(f"\n⏱ {d.get('duration', 0):.0f} с · подпись на английском придёт в день выхода")
     text = "\n".join(lines)
     return text if len(text) <= 1024 else text[:1020] + "…"
@@ -789,6 +791,7 @@ def schedule(sched, bot: Bot, guarded) -> None:
 
 def install(bot: Bot) -> None:
     screen.VIEWS["reels"] = _v_reels
+    screen.VIEWS["reelvoice"] = _v_voices
 
 
 async def home_label() -> str:
@@ -824,7 +827,33 @@ async def _v_reels(arg: dict):
         lines.append("Пока рилсов не было.")
     lines.append("\n<i>📥 ждёт решения · 🟡 одобрен · 📤 ждёт публикации · ✅ выложен · ⏳ собирается</i>")
     rows.append([btn("➕ Подборка", "rl:new:collection"), btn("➕ Детали картины", "rl:new:details")])
-    rows.append([btn("✍️ Своя тема или картина", "rl:ask"), btn("← Пульт", "h:home")])
+    rows.append([btn("✍️ Своя тема или картина", "rl:ask")])
+    rows.append([btn(f"🎙 {await tts.label()}", "rl:voices"), btn("← Пульт", "h:home")])
+    return screen.banner(), "\n".join(lines)[:1020], screen._kb(rows), arg
+
+
+VOICE_KEYS = list(tts.VOICES)
+
+
+async def _v_voices(arg: dict):
+    """Выбор голоса для «деталей»: нажал — голос выбран, и приходит образец."""
+    cur = await tts.voice()
+    lines = ["<b>🎙 Голос для «деталей картины»</b>",
+             "Нажми на голос — он станет основным, и я пришлю образец послушать."]
+    if tts.EL_KEY:
+        lines.append("⚠️ Задан ELEVENLABS_API_KEY — пока он есть, звучит ElevenLabs, а не выбор ниже.")
+    if not tts.ENABLED:
+        lines.append("⚠️ Озвучка выключена переменной REEL_TTS=0.")
+    if arg.get("note"):
+        lines.append(f"<b>{html.escape(arg['note'])}</b>")
+    lines.append("")
+    for k in VOICE_KEYS:
+        name, desc = tts.VOICES[k]
+        lines.append(f"{'●' if k == cur else '○'} <b>{name}</b> — {desc}")
+    rows = []
+    b = [btn(("● " if k == cur else "") + tts.VOICES[k][0], f"rl:vs:0:{i}") for i, k in enumerate(VOICE_KEYS)]
+    rows += [b[i:i + 3] for i in range(0, len(b), 3)]
+    rows.append([btn("← Рилсы", "rl:home")])
     return screen.banner(), "\n".join(lines)[:1020], screen._kb(rows), arg
 
 
@@ -851,6 +880,30 @@ async def on_cb(cb: CallbackQuery, bot: Bot, state: FSMContext):
         await cb.answer(f"Собираю {KIND_ACC[kind]} на {human(r['day'])} — пара минут")
         await screen.adopt(cb.message)
         return await screen.show(bot, "reels", note=f"⏳ Собираю {KIND_ACC[kind]}, карточка придёт сообщением")
+    if a == "voices":
+        await cb.answer()
+        await screen.adopt(cb.message)
+        return await screen.show(bot, "reelvoice")
+    if a == "vs":
+        k = VOICE_KEYS[int(p[3])] if 0 <= int(p[3]) < len(VOICE_KEYS) else None
+        if not k:
+            return await cb.answer()
+        await db.set_setting("reel_voice", k)
+        name = tts.VOICES[k][0]
+        await cb.answer(f"Голос: {name}. Готовлю образец — до минуты в первый раз")
+        await screen.adopt(cb.message)
+        await screen.show(bot, "reelvoice", note=f"Выбран {name}")
+        try:
+            path = await tts.sample(k)
+            m = await bot.send_audio(config.ADMIN_ID, FSInputFile(path, filename=f"{name}.mp3"),
+                                     title=f"AHMAG · {name}", performer="образец голоса",
+                                     caption=f"🎙 {name} — {tts.VOICES[k][1]}")
+            await screen.add_temp([m.message_id])
+        except Exception as exc:
+            log.warning("Образец голоса %s", k, exc_info=True)
+            from app import curator
+            await screen.notify(bot, f"🎙 Образец {name} не получился: {str(exc)[:200] or curator.explain(exc)}")
+        return
     if a == "ask":
         await cb.answer()
         await state.set_state(ReelEdit.theme)
