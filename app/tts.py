@@ -144,23 +144,47 @@ def _fill(starts: list, total: float) -> list[float]:
     return res
 
 
-def align(text: str, spoken: list[tuple[float, str]], total: float) -> list[float]:
-    """Время начала каждого экранного слова по словам, которые назвал синтезатор [(начало, слово)]."""
+def align_q(text: str, spoken: list[tuple[float, str]], total: float) -> tuple[list[float], float]:
+    """Время начала каждого экранного слова по словам, которые услышало распознавание [(начало, слово)].
+    Сопоставление — по всей последовательности сразу (difflib), поэтому одно расхождение (число словами,
+    слитное слово, пропуск) не сбивает всё остальное. → (время слов, доля сопоставленных слов)."""
+    import difflib
     toks = tokens(text)
+    tn = [_norm(t) for t in toks]
+    sp = [(float(t), _norm(w)) for t, w in spoken if _norm(w)]
     starts: list[float | None] = [None] * len(toks)
-    j = 0
-    for t, w in spoken:
-        nw = _norm(w)
-        if not nw:
-            continue
-        for k in range(j, min(j + 4, len(toks))):
-            nt = _norm(toks[k])
-            if nt and (nt == nw or nt.startswith(nw) or nw.startswith(nt)):
-                if starts[k] is None:
-                    starts[k] = t
-                j = k + 1
-                break
-    return _fill(starts, total)
+    sm = difflib.SequenceMatcher(None, tn, [w for _, w in sp], autojunk=False)
+    for a, b, size in sm.get_matching_blocks():
+        for k in range(size):
+            starts[a + k] = sp[b + k][0]
+    # время не может идти назад: выбрасываем совпадения, которые нарушают порядок
+    last = -1.0
+    for k, v in enumerate(starts):
+        if v is not None:
+            if v < last:
+                starts[k] = None
+            else:
+                last = v
+    got = sum(v is not None for v in starts)
+    return _fill(starts, total), got / max(1, len(toks))
+
+
+def align(text: str, spoken: list[tuple[float, str]], total: float) -> list[float]:
+    return align_q(text, spoken, total)[0]
+
+
+def _sane(parts_words: list[int], starts: list[float], total: float) -> bool:
+    """Части рассказа не слиплись: у каждой есть время хотя бы на 0,12 с на слово, и ни одна не тянется
+    дольше, чем 1 с на слово."""
+    pos, spans = 0, []
+    for n in parts_words:
+        s0 = starts[pos] if n else None
+        pos += n
+        s1 = starts[pos] if pos < len(starts) else total
+        if s0 is not None:
+            spans.append((n, s1 - s0, pos >= len(starts)))
+    # у последней части верхней границы нет: после неё может быть тишина до конца дорожки
+    return all(0.12 * n <= d and (last or d <= 1.0 * n + 1.5) for n, d, last in spans if n)
 
 
 def duration(path: Path) -> float:
@@ -309,7 +333,7 @@ async def _openai(text: str, name: str, dest: Path, how: str | None) -> tuple[fl
         try:
             t = await client.post("https://api.openai.com/v1/audio/transcriptions", headers=head,
                                   data={"model": OA_STT, "response_format": "verbose_json", "language": "en",
-                                        "timestamp_granularities[]": "word", "prompt": text[:400]},
+                                        "timestamp_granularities[]": "word"},
                                   files={"file": (dest.name, dest.read_bytes(), "audio/mpeg")})
             t.raise_for_status()
             words = [(float(w["start"]), str(w["word"])) for w in t.json().get("words") or []]
@@ -344,14 +368,21 @@ async def speak_story(parts: list[tuple[str, str, str]], dest_base: Path, extra:
     dest = dest_base.with_suffix(".mp3")
     dest.parent.mkdir(parents=True, exist_ok=True)
     dur, spoken = await _openai(text, name, dest, direction(parts, extra))
-    starts = align(text, spoken, dur) if spoken else _by_length(text, dur)
+    starts, q = align_q(text, spoken, dur) if spoken else (None, 0.0)
+    counts = [len(tokens(t)) for _, t, _ in parts]
+    if starts is None or q < 0.6 or not _sane(counts, starts, dur):
+        log.warning("Время слов: распознавание не сошлось с текстом (совпало %.0f%%), распределяю по длине", q * 100)
+        starts = _by_length(text, dur)
+        approx = True
+    else:
+        approx = False
     beats, pos = [], 0
     for _, t, _ in parts:
         n = len(tokens(t))
         beats.append({"start": starts[pos] if n else (beats[-1]["start"] if beats else 0.0),
                       "starts": starts[pos:pos + n]})
         pos += n
-    return {"audio": str(dest), "dur": dur, "beats": beats, "one_take": True}
+    return {"audio": str(dest), "dur": dur, "beats": beats, "one_take": True, "approx": approx}
 
 
 def _by_length(text: str, total: float) -> list[float]:

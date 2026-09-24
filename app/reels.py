@@ -382,7 +382,7 @@ How it sounds:
 Example of the voice (Matejko's "Stańczyk"; do not reuse its lines):
   "This man is paid to make people laugh. Tonight, he's the only one who can't. / It's 1514. The queen is throwing a ball, and her jester has slipped away to sit alone. / Look behind him. The court is dancing. Silk, music, candlelight. Nobody has noticed he's gone. / Now the table. That letter just arrived. Smolensk has fallen to Moscow. The war is lost, and the party goes on. / And through the window, a comet. Back then, comets were warnings. He's reading this one. / Everyone in that room is laughing. The fool is the only one who understands. / Matejko painted this in 1862, when Poland no longer existed on the map. He knew how the story ended."
 
-Structure — 40 to 50 seconds, about 110–130 words in total:
+Structure — 35 to 45 seconds, about 95–115 words in total (the narrator takes their time, so keep it tight):
 
 1. hooks — 4 alternative opening lines, each of a different type:
    contradiction: "This man is paid to make people laugh. Tonight, he's the only one who can't."
@@ -393,7 +393,7 @@ Structure — 40 to 50 seconds, about 110–130 words in total:
    Up to 16 words each. Each has a box: the close-up the reel opens on, and it must show what the hook talks about. A hook is true, specific and visual, and opens a question the story answers. No generic hooks ("This painting hides a dark secret", "You won't believe what's in this painting").
    hook_pick — the index of the strongest: the one you would stop scrolling for, and the one the story pays off best.
 2. context — up to 25 words: the scene. When and where we are, who this is, what is happening. Shown over the whole painting. Not "X painted this in Y" unless that IS the story.
-3. reveals — 3 or 4 details in viewing order, each up to 28 words. Each one is the next step of the story: it answers what the previous line made us wonder and makes us wonder something new. label — 1–3 words naming the detail for the on-screen callout ("The letter", "The comet").
+3. reveals — 3 or 4 details in viewing order, each up to 24 words. Each one is the next step of the story: it answers what the previous line made us wonder and makes us wonder something new. label — 1–3 words naming the detail for the on-screen callout ("The letter", "The comet").
 4. climax — up to 16 words: what it all means for the person in the painting. Short sentences. Here, and only here, the narrator may let one brief human note through. Do not name the emotion with an adjective. box — the detail to hold on (often the face), or null for the whole painting.
 5. final — up to 24 words: the last turn — what happened next, why the painter told this story, what it meant when it was painted. It lands with weight and may echo the hook, so the loop back to the start feels natural. Not a moral, not a slogan.
 
@@ -652,13 +652,16 @@ async def _voice(folder: Path, d: dict, bs: list[dict]) -> list | dict | None:
     if tts.is_one_take(vkey):
         parts = [(b["kind"], b["text"], b.get("how") or "") for b in bs]
         extra = (d.get("story") or {}).get("voice_direction") or ""
-        key = hashlib.md5(f"{vkey}|{json.dumps(parts, ensure_ascii=False)}|{extra}".encode()).hexdigest()[:12]
+        # «v2» — время слов считается по-новому (5.1): старые дубли с ошибочным временем не берём из кэша
+        key = hashlib.md5(f"v2|{vkey}|{json.dumps(parts, ensure_ascii=False)}|{extra}".encode()).hexdigest()[:12]
         hit = (d.get("voice") or {}).get(key)
         if hit and Path(hit["audio"]).exists():
             d["voice_label"] = await tts.label()
             return hit
         try:
             res = await tts.speak_story(parts, folder / "voice" / f"take_{key}", extra)
+            if res.get("approx"):
+                d["voice_note"] = "распознавание не сошлось с текстом — слова идут по голосу приблизительно"
             d["voice"] = {key: res}
             d["voice_label"] = await tts.label()
             return res
