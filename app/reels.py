@@ -228,10 +228,43 @@ async def commons_download(client: httpx.AsyncClient, title: str, dest: Path) ->
 
     def save():
         with Image.open(io.BytesIO(r.content)) as im:
-            im = ImageOps.exif_transpose(im).convert("RGB")
+            im = trim_borders(ImageOps.exif_transpose(im).convert("RGB"))
             im.save(dest, "JPEG", quality=94)
     await asyncio.to_thread(save)
     return dest
+
+
+def trim_borders(im: Image.Image, limit: float = 0.12) -> Image.Image:
+    """Срезать ровные поля скана (белые, серые, чёрные — паспарту, фон фотостудии), не больше limit с каждой стороны.
+    Поле — полоса, где цвет почти не меняется; живопись так ровно не бывает даже у тёмного фона."""
+    import numpy as np
+    small = im.copy()
+    small.thumbnail((800, 800))
+    a = np.asarray(small.convert("L"), dtype=np.float32)
+    h, w = a.shape
+
+    def edge(lines, ref):
+        n = 0
+        for line in lines:
+            if line.std() < 4.0 and abs(float(line.mean()) - ref) < 10:
+                n += 1
+            else:
+                break
+        return n
+    cut = [edge(a, float(a[0].mean())), edge(a[::-1], float(a[-1].mean())),
+           edge(a.T, float(a[:, 0].mean())), edge(a.T[::-1], float(a[:, -1].mean()))]
+    lim = [int(h * limit), int(h * limit), int(w * limit), int(w * limit)]
+    if any(c >= l for c, l in zip(cut, lim)):          # поле шире предела — это часть картины, не трогаем
+        cut = [c if c < l else 0 for c, l in zip(cut, lim)]
+    top, bottom, left, right = cut
+    if not any(cut):
+        return im
+    k = im.width / w
+    pad = 2                                             # на пару пикселей глубже, чтобы не осталась кромка
+    box = (int((left + pad) * k) if left else 0, int((top + pad) * k) if top else 0,
+           im.width - (int((right + pad) * k) if right else 0), im.height - (int((bottom + pad) * k) if bottom else 0))
+    log.info("Рилс: срезаю поля скана %s", box)
+    return im.crop(box)
 
 
 async def _thumbs(client: httpx.AsyncClient, cands: list[dict]) -> list[Image.Image | None]:
@@ -279,19 +312,24 @@ PICK_SYSTEM = """You check pictures for an Instagram reel. For each numbered she
 
 Pick the candidate that shows exactly this work, whole and clean: for a painting or print — the full picture, straight, without a frame or museum wall around it if another candidate has that, not a detail, sketch, copy or engraving after it (unless the work itself is a print); for a building — a clear, well-composed photo of this building; for a photograph — the photograph itself. Prefer the sharper, better-coloured one. If none fits, pick 0.
 
-Also give the centre of the main subject in the picked image (a face, a figure, the building) as fractions of its width and height: fx, fy from 0 to 1 — the video crops the image to a tall frame around it.
+Also give the centre of the main subject in the picked image (a face, a figure, the building) as fractions of its width and height: fx, fy from 0 to 1 — the video slowly pushes in toward it.
 
 Return ONLY JSON: {"picks": [{"i": 1, "pick": 2, "fx": 0.3, "fy": 0.5}]}"""
 
 
-async def verify(client: httpx.AsyncClient, works: list[dict], background: bool, per: int = 3) -> list[dict]:
-    """works: [{title, author, year, commons}] → те, для которых нашлась верная картинка, с полем file."""
+async def verify(client: httpx.AsyncClient, works: list[dict], background: bool, per: int = 3,
+                 max_aspect: float | None = None) -> list[dict]:
+    """works: [{title, author, year, commons}] → те, для которых нашлась верная картинка, с полем file.
+    max_aspect — только картинки не шире этого (ширина / высота): для подборки вертикальных работ."""
     from app import curator
     sem = asyncio.Semaphore(4)
 
     async def cands(w):
         async with sem:
-            return await commons_candidates(client, w.get("commons") or f"{w.get('title')} {w.get('author')}", per)
+            c = await commons_candidates(client, w.get("commons") or f"{w.get('title')} {w.get('author')}", per + 2)
+            if max_aspect:
+                c = [x for x in c if x["w"] / max(1, x["h"]) <= max_aspect]
+            return c[:per]
     found = await asyncio.gather(*(cands(w) for w in works))
     pairs = [(w, c) for w, c in zip(works, found) if c]
     if not pairs:
@@ -339,14 +377,16 @@ A good theme is specific and has a mood or an idea that ties works from differen
 
 {TASTE}
 
-Every work must have a large image on Wikimedia Commons: paintings and prints by artists who died before about 1955, historical photographs, buildings with free-licensed photos. Pick specific works, one per author; mix famous and lesser-known. Give 10 works in viewing order (some may not be found, the reel uses up to 8); the first one opens the reel under the title, so it should be strong.
+Every work must have a large image on Wikimedia Commons: paintings and prints by artists who died before about 1955, historical photographs, buildings with free-licensed photos. Pick specific works, one per author; mix famous and lesser-known.
+
+format — all works in the reel are shown the same way. "vertical": every work fills the whole tall screen, so EVERY work must be a tall portrait-format image (height at least 1.4 times the width): full-length portraits, standing figures, towers, doorways, narrow streets, vertical photographs. Choose it only when the theme suits tall works. "framed": each work is shown whole on a dark wall, any proportions. When unsure — "framed". Give 10 works in viewing order (some may not be found, the reel uses up to 8); the first one opens the reel under the title, so it should be strong.
 
 {EN_RULES}
 
 {MUSIC}
 
 Return ONLY JSON:
-{{"title": "on-screen title, up to 28 characters, sentence case; wrap the one key word in *asterisks* — it is set in italics (\"The art of *melancholy*\")", "theme_ru": "тема по-русски, коротко", "works": [{{"title": "title of the work in English or original", "author": "...", "year": "...", "commons": "query for Wikimedia Commons search: title and author, no year"}}], "caption": "1–3 short sentences for the Instagram caption: what ties these works together", "hashtags": ["5–8 lowercase words without #"], "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}"""
+{{"format": "vertical|framed", "title": "on-screen title, up to 28 characters, sentence case; wrap the one key word in *asterisks* — it is set in italics (\"The art of *melancholy*\")", "theme_ru": "тема по-русски, коротко", "works": [{{"title": "title of the work in English or original", "author": "...", "year": "...", "commons": "query for Wikimedia Commons search: title and author, no year"}}], "caption": "1–3 short sentences for the Instagram caption: what ties these works together", "hashtags": ["5–8 lowercase words without #"], "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}"""
 
 MORE_SYSTEM = f"""You add works to an AHMAG Instagram reel compilation. Same rules: a specific work by an author not yet in the reel, with a large image on Wikimedia Commons (artists who died before about 1955, historical photographs, buildings with free photos), fitting the theme.
 
@@ -356,7 +396,7 @@ Return ONLY JSON: {{"works": [{{"title": "...", "author": "...", "year": "...", 
 
 PAINTING_SYSTEM = f"""You pick a painting for an AHMAG Instagram reel that walks through its details: the camera starts on the whole picture, then moves to 4–6 details one by one, with one short line on each, and the lines tell the painting's story. Example: Matejko's "Stańczyk" — a jester sits alone while the ball goes on next door; the letter on the table; the comet in the window; Poland has lost Smolensk.
 
-Pick a painting (or a fresco, altarpiece, large print) that is in the public domain and has a large image on Wikimedia Commons; has several visible details that carry the story; has a documented story with tension, contrast or a twist — something that makes a good hook. Check the facts with web search. Prefer works that are not the most overexposed. Not from the avoid list.
+Pick a painting (or a fresco, altarpiece, large print) that is in the public domain and has a large image on Wikimedia Commons; has several visible details that carry the story; has a documented story with tension, contrast or a twist that a stranger would care about in three seconds — someone is losing something, hiding something, doesn't know something, or the obvious reading is wrong. The story matters more than fame: a famous painting is fine if its real story is not the one everybody knows. Check the facts with web search. Prefer works that are not the most overexposed. Not from the avoid list.
 
 {TASTE}
 
@@ -368,49 +408,66 @@ Return ONLY JSON:
 HOOK_TYPES = {"contradiction": "противоречие", "hidden": "скрытая деталь", "stakes": "ставки",
               "challenge": "вызов", "question": "вопрос"}
 
-STORY_SYSTEM = """You write the narration for an AHMAG Instagram reel about the painting in the image. A narrator reads it aloud, the words appear on screen as they are spoken, and the camera moves between details. Coordinates are fractions of the image width and height from its top-left corner (0 to 1); every box is tight around something clearly visible in THIS image.
+STORY_SYSTEM = """You write the narration for an AHMAG Instagram reel about the painting in the image. A narrator reads it aloud, the words appear on screen as they are spoken, and the camera moves between details. Coordinates are fractions of the image width and height from its top-left corner (0 to 1).
 
-THIS IS A STORY, NOT A LIST OF FACTS. It should feel like one person telling you, personally, a story they love about this painting — the way you'd tell it to a friend standing next to you in the museum. There is a scene, a person in it, a moment, and something at stake. Every line moves the story forward; a fact only appears as part of the story, never as trivia ("He was twenty-four" on its own is trivia).
+THE JOB: the viewer must not scroll away. They decide in the first two seconds, and they stay only while a question is open. So this is a story with tension, told by one person to a friend standing next to them in the museum — never a list of facts.
+
+The engine of retention:
+- The hook opens ONE main question. The story answers it only at the climax. Until then every line gives part of the answer and opens a smaller new question.
+- Lines are joined by cause and contrast — "but", "so", "which is why", "and that's the problem" — never by "and also", "now look at", "there's more". If a line could be swapped with the next one without breaking anything, the story is a list: rewrite it.
+- Order the details by the logic of the story (cause → contrast → consequence), not by where they sit in the picture.
+- Stakes in human terms: who loses what, who knows and who doesn't, what someone is hiding or afraid of. No art-history vocabulary, no technique talk unless it IS the story.
+- Specific beats general: a name, a number, an object the viewer can see.
+- The final line turns the hook around: after it, the first frame reads differently, so the loop back to the start feels natural.
 
 How it sounds:
-- Set the scene in the present tense: "It's 1514. The queen is throwing a ball…", not "Matejko painted this in 1862."
-- Talk to the viewer and guide their eye: "Look behind him.", "Now the table.", "See his hands?"
-- Use the joints of spoken storytelling: "Now…", "And then…", "Here's the thing.", "Nobody has noticed…", "Which means…"
+- Present tense for the scene: "The queen is throwing a ball." Talk to the viewer and steer their eye: "Look at his hands."
+- Short sentences, varied rhythm, some fragments. Plain spoken English.
 - Let the people in the painting think and feel through what we see: where they look, what they hold, who is missing.
-- Short sentences, varied rhythm, some fragments. Plain words.
 
-Example of the voice (Matejko's "Stańczyk"; do not reuse its lines):
-  "This man is paid to make people laugh. Tonight, he's the only one who can't. / It's 1514. The queen is throwing a ball, and her jester has slipped away to sit alone. / Look behind him. The court is dancing. Silk, music, candlelight. Nobody has noticed he's gone. / Now the table. That letter just arrived. Smolensk has fallen to Moscow. The war is lost, and the party goes on. / And through the window, a comet. Back then, comets were warnings. He's reading this one. / Everyone in that room is laughing. The fool is the only one who understands. / Matejko painted this in 1862, when Poland no longer existed on the map. He knew how the story ended."
+Example of the voice and structure (Matejko's "Stańczyk"; do not reuse its lines):
+  hook: "The only man not laughing at this party is the jester."
+  context: "Everyone else is at the queen's ball. He's sitting alone, in the dark."
+  reveals: "Because of the ^letter on this table. Smolensk has fallen to Moscow. The war is *lost*." / "But next ^door, the court is still dancing. Nobody has read it." / "And in the window, a ^comet. Back then, that meant worse was *coming*."
+  climax: "He's the fool. He's the only one who *sees* it."
+  final: "Matejko painted this in 1862, when Poland no longer existed. He already knew how it *ended*."
 
-Structure — 35 to 45 seconds, about 95–115 words in total (the narrator takes their time, so keep it tight):
+Structure — 25 to 35 seconds, 70–90 words in total:
 
 1. hooks — 4 alternative opening lines, each of a different type:
-   contradiction: "This man is paid to make people laugh. Tonight, he's the only one who can't."
+   contradiction: "The only man not laughing at this party is the jester."
    hidden: "There's a comet in this painting. Almost nobody sees it."
    stakes: "The letter on this table just cost a kingdom a city."
    challenge: "You've seen this jester before. You probably thought he was bored."
    question: "Why is the jester the saddest man at the party?"
-   Up to 16 words each. Each has a box: the close-up the reel opens on, and it must show what the hook talks about. A hook is true, specific and visual, and opens a question the story answers. No generic hooks ("This painting hides a dark secret", "You won't believe what's in this painting").
-   hook_pick — the index of the strongest: the one you would stop scrolling for, and the one the story pays off best.
-2. context — up to 25 words: the scene. When and where we are, who this is, what is happening. Shown over the whole painting. Not "X painted this in Y" unless that IS the story.
-3. reveals — 3 or 4 details in viewing order, each up to 24 words. Each one is the next step of the story: it answers what the previous line made us wonder and makes us wonder something new. label — 1–3 words naming the detail for the on-screen callout ("The letter", "The comet").
-4. climax — up to 16 words: what it all means for the person in the painting. Short sentences. Here, and only here, the narrator may let one brief human note through. Do not name the emotion with an adjective. box — the detail to hold on (often the face), or null for the whole painting.
-5. final — up to 24 words: the last turn — what happened next, why the painter told this story, what it meant when it was painted. It lands with weight and may echo the hook, so the loop back to the start feels natural. Not a moral, not a slogan.
+   The first sentence is at most 10 words and lands in under three seconds; the whole hook at most 14 words. No names, dates or titles in the hook. It talks about what is on screen in the first frame, so its box is the close-up the reel opens on. True, specific, visual. No generic hooks ("This painting hides a dark secret", "You won't believe what's in this painting").
+   Check each hook before you give it: understood in two seconds without sound? about what is on screen? opens a question? concrete? Give only hooks that pass.
+   hook_pick — the index of the strongest: the one you would stop scrolling for and the one the story pays off best.
+2. context — up to 14 words, shown over the whole painting (the viewer sees the whole scene for the first time). It RAISES the stakes of the hook, it does not explain. Who/when only as a half-clause if needed; never "X painted this in Y" here.
+3. reveals — 3 details (4 only if the story truly needs it), each up to 18 words: one step of the story each (see the engine above). label — 1–3 words naming the detail for the on-screen caption ("The letter", "The comet"). Mark with ^ the one word at which the camera should arrive at this detail — the word that names or points at it ("the ^letter", "next ^door"); the ^ is not read aloud.
+4. climax — up to 12 words: the answer to the hook's question, what it all means for the person in the painting. Short sentences. Here, and only here, one brief human note. Do not name the emotion with an adjective. box — the detail to hold on (often the face), or null for the whole painting.
+5. final — up to 20 words: the last turn — what happened next, or why the painter told this story. It lands with weight and echoes the hook. Not a moral, not a slogan, not "and that's why it's a masterpiece".
+
+Boxes — [x0, y0, x1, y1], tight around the thing itself, not around the area it is in (the letter, not the table). target — 2–6 words naming exactly what is inside the box ("the folded letter on the table"); a second pass uses it to refine the box, so be precise. Only things clearly visible in THIS image.
 
 Every word of emphasis — the one word per sentence the narrator leans on — is wrapped in asterisks: "Nobody has *noticed* he's gone." At most one per sentence; the screen sets it in italics.
 
 Use only the facts given; if the story needs a fact you don't have, change the angle instead of inventing one.
-Never: insane, mind-blowing, crazy, iconic, masterpiece, stunning, breathtaking, haunting, heartbreaking, chilling, "wait for the end", "follow for more", "let that sink in", "not X but Y" constructions, exclamation marks, emoji, parentheses, abbreviations, lists.
+Never: insane, mind-blowing, crazy, iconic, masterpiece, stunning, breathtaking, haunting, heartbreaking, chilling, fascinating, intricate, secret, "dive in", "wait for the end", "follow for more", "let that sink in", "not X but Y" constructions, exclamation marks, emoji, parentheses, abbreviations, lists.
 
-delivery — every hook, reveal, the climax, and the context and final lines (context_delivery, final_delivery) get a short direction for the narrator, in English, 6–15 words: tone, emotion, pace, where to pause. Follow the arc: hook — quiet intrigue, a little quicker; context — plain and even; reveals — curiosity that builds; climax — slower, softer, heavier, a real pause between sentences; final — calm and weighty. Directions are alive and specific, like notes from a director to an actor ("lean on 'only'", "a wry smile here", "let it hang"), but never theatrical: no shouting, no whispering, no trailer voice.
+delivery — every hook, reveal, the climax, and the context and final lines (context_delivery, final_delivery) get a short direction for the narrator, in English, 6–15 words: tone, emotion, pace, where to pause. Follow the arc: hook — no warm-up, first word straight away, quiet intrigue, a little quicker; context — lower, the stakes sinking in; reveals — curiosity that builds; climax — slower, softer, heavier, a real pause between sentences; final — calm and weighty. Directions are alive and specific, like notes from a director to an actor ("lean on 'only'", "a wry smile here", "let it hang"), but never theatrical: no shouting, no whispering, no trailer voice.
 
-voice_direction — one or two sentences in English for the narrator about this particular story: its mood, where it turns, what to savour (e.g. "Starts with a wry smile, grows uneasy at the letter, the turn is quiet and heavy, the last line almost tender").
+voice_direction — one or two sentences in English for the narrator about this particular story: its mood, where it turns, what to savour.
 
 caption — the Instagram caption WITHOUT the hook (the hook is put above it automatically): first line "Title (year), Author"; then 2–3 short paragraphs with the story and one or two facts that did not fit the video; last line — museum and city.
 hashtags — 5–8 lowercase words without #.
 
 Return ONLY JSON:
-{"hooks": [{"type": "contradiction|hidden|stakes|challenge|question", "text": "...", "box": [0.1, 0.2, 0.3, 0.5], "delivery": "..."}], "hook_pick": 0, "context": "...", "context_delivery": "...", "reveals": [{"box": [0.1, 0.2, 0.3, 0.5], "label": "...", "text": "...", "delivery": "..."}], "climax": {"text": "...", "box": [0.1, 0.2, 0.3, 0.5], "delivery": "..."}, "final": "...", "final_delivery": "...", "voice_direction": "...", "caption": "...", "hashtags": ["..."]}"""
+{"hooks": [{"type": "contradiction|hidden|stakes|challenge|question", "text": "...", "box": [0.1, 0.2, 0.3, 0.5], "target": "...", "delivery": "..."}], "hook_pick": 0, "context": "...", "context_delivery": "...", "reveals": [{"box": [0.1, 0.2, 0.3, 0.5], "target": "...", "label": "...", "text": "...", "delivery": "..."}], "climax": {"text": "...", "box": [0.1, 0.2, 0.3, 0.5], "target": "...", "delivery": "..."}, "final": "...", "final_delivery": "...", "voice_direction": "...", "caption": "...", "hashtags": ["..."]}"""
+
+REFINE_SYSTEM = """You refine bounding boxes for a video camera. Each image is a crop from a painting with a grid drawn over it: lines every 1/10 of the crop, numbered 0–10 along the top (x) and the left side (y). For each crop you get the thing the camera must frame. Give its tight box in grid units: x0, y0 (top-left) and x1, y1 (bottom-right), decimals allowed, 0 to 10. Tight around the thing itself, not its surroundings. If the thing is not in the crop, or you are not sure which one it is, return null for that crop.
+
+Return ONLY JSON: {"boxes": [{"i": 1, "box": [x0, y0, x1, y1]}, {"i": 2, "box": null}]}"""
 
 
 def _box(b) -> list | None:
@@ -440,10 +497,11 @@ def beats(d: dict) -> list[dict]:
         out.append({"kind": "climax", "text": cl["text"], "box": _box(cl.get("box")), "how": cl.get("delivery")})
     if st.get("final"):
         out.append({"kind": "final", "text": st["final"], "box": None, "how": st.get("final_delivery")})
-    # *слово* — акцент: для экрана Remotion (курсив) он остаётся в "raw", голос и старый рендер получают чистый текст
+    # *слово* — акцент (курсив), ^слово — на нём камера приезжает к детали. Оба знака остаются в "raw" для Remotion,
+    # голос, карточка и старый рендер получают чистый текст
     for b in out:
         b["raw"] = b["text"]
-        b["text"] = b["text"].replace("*", "")
+        b["text"] = b["text"].replace("*", "").replace("^", "")
     return [b for b in out if b["text"].strip()]
 
 
@@ -465,6 +523,73 @@ async def _ask(content, *, system: str, max_tokens: int, background: bool, tools
                 raise ReelError("Claude ответил не по формату — попробуй ещё раз") from exc
             log.warning("Рилс: пустой или битый ответ Claude, повторяю с большим запасом: %s", exc)
     return {}
+
+
+def _grid_crop(im: Image.Image, box: list[float]) -> tuple[Image.Image, tuple[float, float, float, float]]:
+    """Участок вокруг грубой рамки (с запасом) с сеткой 10×10 и подписями → (картинка, участок в долях)."""
+    x0, y0, x1, y1 = box
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    # участок примерно квадратный на картине: в 2,2 раза больше рамки, но не меньше 22% короткой стороны
+    px = max((x1 - x0) * 2.2 * im.width, (y1 - y0) * 2.2 * im.height, 0.22 * min(im.width, im.height))
+    side_w, side_h = min(1.0, px / im.width), min(1.0, px / im.height)
+    cx = min(max(cx, side_w / 2), 1 - side_w / 2)
+    cy = min(max(cy, side_h / 2), 1 - side_h / 2)
+    area = (cx - side_w / 2, cy - side_h / 2, cx + side_w / 2, cy + side_h / 2)
+    crop = im.crop((int(area[0] * im.width), int(area[1] * im.height), int(area[2] * im.width), int(area[3] * im.height)))
+    crop.thumbnail((900, 900))
+    pad = 34
+    out = Image.new("RGB", (crop.width + pad + 22, crop.height + pad + 22), (255, 255, 255))
+    out.paste(crop, (pad, pad))
+    dr = ImageDraw.Draw(out)
+    f = reelrender.font(18)
+    for k in range(11):
+        x = pad + crop.width * k / 10
+        y = pad + crop.height * k / 10
+        for dx, col in ((1, (0, 0, 0)), (0, (255, 235, 0))):
+            dr.line([(x + dx, pad), (x + dx, pad + crop.height)], fill=col, width=1)
+            dr.line([(pad, y + dx), (pad + crop.width, y + dx)], fill=col, width=1)
+        dr.text((x - (10 if k == 10 else 5), 6), str(k), fill=(0, 0, 0), font=f)
+        dr.text((4, y - 10), str(k), fill=(0, 0, 0), font=f)
+    return out, area
+
+
+async def refine_boxes(path: Path, st: dict, background: bool) -> int:
+    """Второй проход по рамкам: Claude смотрит на каждую деталь крупно, с сеткой, и уточняет рамку.
+    Первый проход (по всей картине в 1568 px) ошибается на 5–10% размера картины — для мелкой детали это мимо.
+    Меняет рамки в st на месте. → сколько рамок уточнено."""
+    items = [h for h in st.get("hooks") or []] + list(st.get("reveals") or []) + \
+        ([st["climax"]] if (st.get("climax") or {}).get("box") else [])
+    items = [x for x in items if _box(x.get("box"))]
+    if not items:
+        return 0
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+        crops = [_grid_crop(im, _box(x["box"])) for x in items]
+    content: list = [{"type": "text", "text": f"{len(items)} crops follow."}]
+    for n, (x, (img, _)) in enumerate(zip(items, crops), 1):
+        what = x.get("target") or x.get("label") or x.get("text") or ""
+        content.append({"type": "text", "text": f"Crop {n}: frame {what}"})
+        content.append(_img_block(img, 900, 85))
+    try:
+        data = await _ask(content, system=REFINE_SYSTEM, max_tokens=1500, background=background)
+    except ReelError:
+        log.warning("Рилс: уточнение рамок не удалось, оставляю первые", exc_info=True)
+        return 0
+    done = 0
+    for r in data.get("boxes") or []:
+        try:
+            n = int(r.get("i")) - 1
+            b = [min(10.0, max(0.0, float(v))) / 10 for v in r["box"]]
+        except (TypeError, ValueError, KeyError):
+            continue
+        if not 0 <= n < len(items) or b[2] - b[0] < 0.02 or b[3] - b[1] < 0.02:
+            continue
+        ax0, ay0, ax1, ay1 = crops[n][1]
+        aw, ah = ax1 - ax0, ay1 - ay0
+        items[n]["box"] = [round(ax0 + b[0] * aw, 4), round(ay0 + b[1] * ah, 4),
+                           round(ax0 + b[2] * aw, 4), round(ay0 + b[3] * ah, 4)]
+        done += 1
+    return done
 
 
 async def sfx_on() -> bool:
@@ -532,14 +657,22 @@ async def _collection(rid: int, d: dict, background: bool, client: httpx.AsyncCl
         works = [w for w in plan.get("works") or [] if w.get("title")]
         if not works:
             raise ReelError("Claude не предложил работ")
-        good = await verify(client, works[:12], background)
+        vertical = str(plan.get("format") or "").lower() == "vertical"
+        tall = reelplan.BLEED + 0.03 if vertical else None
+        good = await verify(client, works[:12], background, max_aspect=tall)
         if len(good) < MIN_ITEMS:
             more = await _ask(
-                f"Theme: {plan.get('title')}\nAlready in the reel: " + "; ".join(f"{w['title']} — {w['author']}" for w in good)
+                f"Theme: {plan.get('title')}\nFormat: {'vertical — only tall portrait-format works' if vertical else 'framed'}"
+                + "\nAlready in the reel: " + "; ".join(f"{w['title']} — {w['author']}" for w in good)
                 + "\nNot found on Commons: " + "; ".join(w["title"] for w in works
                                                            if w["title"] not in {g["title"] for g in good})
                 + f"\nGive {MAX_ITEMS} more works.", system=MORE_SYSTEM, max_tokens=2500, background=background)
-            good += await verify(client, (more.get("works") or [])[:MAX_ITEMS], background)
+            good += await verify(client, (more.get("works") or [])[:MAX_ITEMS], background, max_aspect=tall)
+        if vertical and len(good) < MIN_ITEMS:
+            # вертикальных не хватило — подборка станет «целиком», добираем любые
+            log.info("Рилс: вертикальных работ %s — собираю подборку целиком", len(good))
+            have = {g["title"] for g in good}
+            good += await verify(client, [w for w in works[:12] if w["title"] not in have], background)
         if len(good) < MIN_ITEMS:
             raise ReelError(f"хороших картинок нашлось только {len(good)} из {MIN_ITEMS} нужных — попробуй другую тему")
         title_em = str(plan.get("title") or "")[:44]
@@ -620,6 +753,8 @@ async def _details(rid: int, d: dict, background: bool, client: httpx.AsyncClien
                       "context_delivery": st.get("context_delivery") or "", "final_delivery": st.get("final_delivery") or "",
                       "voice_direction": st.get("voice_direction") or ""}
         d.update(caption=st.get("caption") or "", hashtags=st.get("hashtags") or [])
+        n = await refine_boxes(path, d["story"], background)
+        log.info("Рилс: уточнил рамок %s", n)
     end = [f"{pt['title']}" + (f", {pt['year']}" if pt.get("year") else ""), pt.get("author") or "",
            pt.get("museum") or ""]
     bs = beats(d)
@@ -1207,8 +1342,12 @@ async def _replacement(d: dict, background: bool) -> dict | None:
     have = "; ".join(f"{w['title']} — {w['author']}" for w in d.get("items") or [])
     more = await _ask(f"Theme: {d.get('title')}\nAlready in the reel: {have}\nGive 4 more works.",
                       system=MORE_SYSTEM, max_tokens=2500, background=background)
+    tall = None
+    paths = [Path(w["path"]) for w in d.get("items") or [] if w.get("path") and Path(w["path"]).exists()]
+    if paths and reelplan.collection_mode([reelplan._size(x) for x in paths]) == "bleed":
+        tall = reelplan.BLEED + 0.03              # подборка на весь кадр — замена тоже вертикальная
     async with httpx.AsyncClient(headers=UA, follow_redirects=True) as client:
-        good = await verify(client, (more.get("works") or [])[:4], background)
+        good = await verify(client, (more.get("works") or [])[:4], background, max_aspect=tall)
     authors = {w["author"] for w in d.get("items") or []}
     good = [g for g in good if g.get("author") not in authors]
     if not good:
