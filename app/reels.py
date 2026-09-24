@@ -35,7 +35,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardMarkup, Message
 from PIL import Image, ImageDraw, ImageOps
 
-from app import config, db, reelrender, screen, slots, tts, ui
+from app import config, db, reelplan, reelrender, screen, slots, tts, ui
 from app.screen import btn
 
 log = logging.getLogger(__name__)
@@ -346,7 +346,7 @@ Every work must have a large image on Wikimedia Commons: paintings and prints by
 {MUSIC}
 
 Return ONLY JSON:
-{{"title": "on-screen title, up to 28 characters", "theme_ru": "тема по-русски, коротко", "works": [{{"title": "title of the work in English or original", "author": "...", "year": "...", "commons": "query for Wikimedia Commons search: title and author, no year"}}], "caption": "1–3 short sentences for the Instagram caption: what ties these works together", "hashtags": ["5–8 lowercase words without #"], "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}"""
+{{"title": "on-screen title, up to 28 characters, sentence case; wrap the one key word in *asterisks* — it is set in italics (\"The art of *melancholy*\")", "theme_ru": "тема по-русски, коротко", "works": [{{"title": "title of the work in English or original", "author": "...", "year": "...", "commons": "query for Wikimedia Commons search: title and author, no year"}}], "caption": "1–3 short sentences for the Instagram caption: what ties these works together", "hashtags": ["5–8 lowercase words without #"], "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}"""
 
 MORE_SYSTEM = f"""You add works to an AHMAG Instagram reel compilation. Same rules: a specific work by an author not yet in the reel, with a large image on Wikimedia Commons (artists who died before about 1955, historical photographs, buildings with free photos), fitting the theme.
 
@@ -363,29 +363,43 @@ Pick a painting (or a fresco, altarpiece, large print) that is in the public dom
 {MUSIC}
 
 Return ONLY JSON:
-{{"title": "common English title", "author": "...", "year": "...", "museum": "museum, city", "commons": "query for Wikimedia Commons search: title and author", "facts": ["6–10 specific verified facts in English, about what is shown, details, context, what happened"], "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}"""
+{{"title": "common English title", "author": "...", "year": "...", "museum": "museum, city", "medium": "e.g. Oil on canvas, if known", "size": "e.g. 88 × 120 cm, if known", "commons": "query for Wikimedia Commons search: title and author", "facts": ["6–10 specific verified facts in English, about what is shown, details, context, what happened"], "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}"""
 
 HOOK_TYPES = {"contradiction": "противоречие", "hidden": "скрытая деталь", "stakes": "ставки",
               "challenge": "вызов", "question": "вопрос"}
 
 STORY_SYSTEM = """You write the narration for an AHMAG Instagram reel about the painting in the image. A narrator reads it aloud, the words appear on screen as they are spoken, and the camera moves between details. Coordinates are fractions of the image width and height from its top-left corner (0 to 1); every box is tight around something clearly visible in THIS image.
 
-Structure — 30 to 45 seconds, about 90–120 words in total:
+THIS IS A STORY, NOT A LIST OF FACTS. It should feel like one person telling you, personally, a story they love about this painting — the way you'd tell it to a friend standing next to you in the museum. There is a scene, a person in it, a moment, and something at stake. Every line moves the story forward; a fact only appears as part of the story, never as trivia ("He was twenty-four" on its own is trivia).
+
+How it sounds:
+- Set the scene in the present tense: "It's 1514. The queen is throwing a ball…", not "Matejko painted this in 1862."
+- Talk to the viewer and guide their eye: "Look behind him.", "Now the table.", "See his hands?"
+- Use the joints of spoken storytelling: "Now…", "And then…", "Here's the thing.", "Nobody has noticed…", "Which means…"
+- Let the people in the painting think and feel through what we see: where they look, what they hold, who is missing.
+- Short sentences, varied rhythm, some fragments. Plain words.
+
+Example of the voice (Matejko's "Stańczyk"; do not reuse its lines):
+  "This man is paid to make people laugh. Tonight, he's the only one who can't. / It's 1514. The queen is throwing a ball, and her jester has slipped away to sit alone. / Look behind him. The court is dancing. Silk, music, candlelight. Nobody has noticed he's gone. / Now the table. That letter just arrived. Smolensk has fallen to Moscow. The war is lost, and the party goes on. / And through the window, a comet. Back then, comets were warnings. He's reading this one. / Everyone in that room is laughing. The fool is the only one who understands. / Matejko painted this in 1862, when Poland no longer existed on the map. He knew how the story ended."
+
+Structure — 40 to 50 seconds, about 110–130 words in total:
 
 1. hooks — 4 alternative opening lines, each of a different type:
-   contradiction: "This man is paid to make people laugh. He's the only one here who can't."
+   contradiction: "This man is paid to make people laugh. Tonight, he's the only one who can't."
    hidden: "There's a comet in this painting. Almost nobody sees it."
    stakes: "The letter on this table just cost a kingdom a city."
    challenge: "You've seen this jester before. You probably thought he was bored."
    question: "Why is the jester the saddest man at the party?"
-   Up to 14 words each. Each has a box: the close-up the reel opens on, and it must show what the hook talks about. A hook is true, specific and visual, and opens a question the rest of the reel answers. No generic hooks ("This painting hides a dark secret", "You won't believe what's in this painting").
+   Up to 16 words each. Each has a box: the close-up the reel opens on, and it must show what the hook talks about. A hook is true, specific and visual, and opens a question the story answers. No generic hooks ("This painting hides a dark secret", "You won't believe what's in this painting").
    hook_pick — the index of the strongest: the one you would stop scrolling for, and the one the story pays off best.
-2. context — one sentence, up to 25 words: who painted it, when, what we are looking at. Shown over the whole painting.
-3. reveals — 3 or 4 details in viewing order, each up to 28 words. Each answers the question the previous line opened and opens the next one, so the tension grows. Link them the way people talk: "But look at the table." "And then there's the window."
-4. climax — what it all means, up to 14 words, short sentences. Here, and only here, the narrator may let one brief human note through, in their own voice: "It's grief." / "He's the only one who knows how this ends." Do not name the emotion with an adjective. box — the detail to hold on (often the face), or null for the whole painting.
-5. final — up to 22 words: a fact that turns what we just saw — what happened next, what the painter did, the painting's own fate. It lands with weight and may echo the hook, so the loop back to the start feels natural. Not a moral, not a slogan.
+2. context — up to 25 words: the scene. When and where we are, who this is, what is happening. Shown over the whole painting. Not "X painted this in Y" unless that IS the story.
+3. reveals — 3 or 4 details in viewing order, each up to 28 words. Each one is the next step of the story: it answers what the previous line made us wonder and makes us wonder something new. label — 1–3 words naming the detail for the on-screen callout ("The letter", "The comet").
+4. climax — up to 16 words: what it all means for the person in the painting. Short sentences. Here, and only here, the narrator may let one brief human note through. Do not name the emotion with an adjective. box — the detail to hold on (often the face), or null for the whole painting.
+5. final — up to 24 words: the last turn — what happened next, why the painter told this story, what it meant when it was painted. It lands with weight and may echo the hook, so the loop back to the start feels natural. Not a moral, not a slogan.
 
-Tone: restrained and intelligent, but gripping. Plain spoken English, present tense, short sentences; "you" is fine. Concrete details and contrasts carry the emotion — the ball and the empty room, laughter and grief. Use only the facts given; if the drama needs a fact you don't have, change the angle instead of inventing one.
+Every word of emphasis — the one word per sentence the narrator leans on — is wrapped in asterisks: "Nobody has *noticed* he's gone." At most one per sentence; the screen sets it in italics.
+
+Use only the facts given; if the story needs a fact you don't have, change the angle instead of inventing one.
 Never: insane, mind-blowing, crazy, iconic, masterpiece, stunning, breathtaking, haunting, heartbreaking, chilling, "wait for the end", "follow for more", "let that sink in", "not X but Y" constructions, exclamation marks, emoji, parentheses, abbreviations, lists.
 
 delivery — every hook, reveal, the climax, and the context and final lines (context_delivery, final_delivery) get a short direction for the narrator, in English, 6–15 words: tone, emotion, pace, where to pause. Follow the arc: hook — quiet intrigue, a little quicker; context — plain and even; reveals — curiosity that builds; climax — slower, softer, heavier, a real pause between sentences; final — calm and weighty. Directions are alive and specific, like notes from a director to an actor ("lean on 'only'", "a wry smile here", "let it hang"), but never theatrical: no shouting, no whispering, no trailer voice.
@@ -396,7 +410,7 @@ caption — the Instagram caption WITHOUT the hook (the hook is put above it aut
 hashtags — 5–8 lowercase words without #.
 
 Return ONLY JSON:
-{"hooks": [{"type": "contradiction|hidden|stakes|challenge|question", "text": "...", "box": [0.1, 0.2, 0.3, 0.5], "delivery": "..."}], "hook_pick": 0, "context": "...", "context_delivery": "...", "reveals": [{"box": [0.1, 0.2, 0.3, 0.5], "text": "...", "delivery": "..."}], "climax": {"text": "...", "box": [0.1, 0.2, 0.3, 0.5], "delivery": "..."}, "final": "...", "final_delivery": "...", "voice_direction": "...", "caption": "...", "hashtags": ["..."]}"""
+{"hooks": [{"type": "contradiction|hidden|stakes|challenge|question", "text": "...", "box": [0.1, 0.2, 0.3, 0.5], "delivery": "..."}], "hook_pick": 0, "context": "...", "context_delivery": "...", "reveals": [{"box": [0.1, 0.2, 0.3, 0.5], "label": "...", "text": "...", "delivery": "..."}], "climax": {"text": "...", "box": [0.1, 0.2, 0.3, 0.5], "delivery": "..."}, "final": "...", "final_delivery": "...", "voice_direction": "...", "caption": "...", "hashtags": ["..."]}"""
 
 
 def _box(b) -> list | None:
@@ -419,13 +433,17 @@ def beats(d: dict) -> list[dict]:
     h = hooks[st.get("hook_i", 0) % len(hooks)] if hooks else None
     out = [{"kind": "hook", "text": h["text"], "box": _box(h.get("box")), "how": h.get("delivery")}] if h else []
     out.append({"kind": "context", "text": st.get("context") or "", "box": None, "how": st.get("context_delivery")})
-    out += [{"kind": "reveal", "text": r.get("text") or "", "box": _box(r.get("box")), "how": r.get("delivery")}
-            for r in st.get("reveals") or []]
+    out += [{"kind": "reveal", "text": r.get("text") or "", "box": _box(r.get("box")), "how": r.get("delivery"),
+             "label": (r.get("label") or "").strip()[:28]} for r in st.get("reveals") or []]
     cl = st.get("climax") or {}
     if cl.get("text"):
         out.append({"kind": "climax", "text": cl["text"], "box": _box(cl.get("box")), "how": cl.get("delivery")})
     if st.get("final"):
         out.append({"kind": "final", "text": st["final"], "box": None, "how": st.get("final_delivery")})
+    # *слово* — акцент: для экрана Remotion (курсив) он остаётся в "raw", голос и старый рендер получают чистый текст
+    for b in out:
+        b["raw"] = b["text"]
+        b["text"] = b["text"].replace("*", "")
     return [b for b in out if b["text"].strip()]
 
 
@@ -447,6 +465,10 @@ async def _ask(content, *, system: str, max_tokens: int, background: bool, tools
                 raise ReelError("Claude ответил не по формату — попробуй ещё раз") from exc
             log.warning("Рилс: пустой или битый ответ Claude, повторяю с большим запасом: %s", exc)
     return {}
+
+
+async def sfx_on() -> bool:
+    return bool(await db.get_setting("reel_sfx", True))
 
 
 async def _avoid(kind: str) -> list[str]:
@@ -520,7 +542,8 @@ async def _collection(rid: int, d: dict, background: bool, client: httpx.AsyncCl
             good += await verify(client, (more.get("works") or [])[:MAX_ITEMS], background)
         if len(good) < MIN_ITEMS:
             raise ReelError(f"хороших картинок нашлось только {len(good)} из {MIN_ITEMS} нужных — попробуй другую тему")
-        d.update(title=str(plan.get("title") or "")[:40], theme_ru=plan.get("theme_ru") or "",
+        title_em = str(plan.get("title") or "")[:44]
+        d.update(title=title_em.replace("*", ""), title_em=title_em, theme_ru=plan.get("theme_ru") or "",
                  caption=plan.get("caption") or "", hashtags=plan.get("hashtags") or [],
                  music=(plan.get("music") or [])[:3], topic=topic, items=good[:MAX_ITEMS], spare=good[MAX_ITEMS:])
     for n, it in enumerate(d["items"]):
@@ -531,6 +554,18 @@ async def _collection(rid: int, d: dict, background: bool, client: httpx.AsyncCl
     render_items = [{"path": it["path"], "label": it["title"], "sub": f"By {it['author']}",
                      "focus": it.get("focus") or [0.5, 0.5]} for it in d["items"]]
     video = folder / f"reel_{int(datetime.now().timestamp())}.mp4"
+    d.pop("render_note", None)
+    if reelplan.available():
+        try:
+            props = reelplan.collection_props(folder, d, await sfx_on())
+            d["duration"] = await asyncio.to_thread(reelplan.render, "Collection", props, folder, video)
+            d["video"] = str(video)
+            return d
+        except Exception as exc:
+            log.warning("Рилс: Remotion не собрал подборку, беру запасную вёрстку", exc_info=True)
+            d["render_note"] = f"новая вёрстка не собралась ({str(exc)[:80]}) — запасная"
+    else:
+        d["render_note"] = f"новая вёрстка недоступна: {reelplan.why_not()} — запасная"
     d["duration"] = await asyncio.to_thread(reelrender.collection, d["title"], render_items, video)
     d["video"] = str(video)
     return d
@@ -590,6 +625,18 @@ async def _details(rid: int, d: dict, background: bool, client: httpx.AsyncClien
     bs = beats(d)
     voice = await _voice(folder, d, bs)
     video = folder / f"reel_{int(datetime.now().timestamp())}.mp4"
+    d.pop("render_note", None)
+    if reelplan.available():
+        try:
+            props = await asyncio.to_thread(reelplan.story_props, folder, path, bs, voice, pt, await sfx_on())
+            d["duration"] = await asyncio.to_thread(reelplan.render, "Story", props, folder, video)
+            d["video"] = str(video)
+            return d
+        except Exception as exc:
+            log.warning("Рилс: Remotion не собрал детали, беру запасную вёрстку", exc_info=True)
+            d["render_note"] = f"новая вёрстка не собралась ({str(exc)[:80]}) — запасная"
+    else:
+        d["render_note"] = f"новая вёрстка недоступна: {reelplan.why_not()} — запасная"
     d["duration"] = await asyncio.to_thread(reelrender.story, path, bs, end, video, voice)
     d["video"] = str(video)
     return d
@@ -728,6 +775,8 @@ def _card_text(r, d: dict, note: str | None = None) -> str:
     mus = _music_lines(d)
     if mus:
         lines += ["", "🎵 Музыка:"] + mus
+    if d.get("render_note"):
+        lines.append(f"\n⚠️ {html.escape(d['render_note'])}")
     if r["kind"] == "details":
         lines.append("\n" + (f"⚠️ {html.escape(d['voice_note'])}" if d.get("voice_note") else f"🎙 {html.escape(d.get('voice_label') or '')}"))
     lines.append(f"\n⏱ {d.get('duration', 0):.0f} с · подпись на английском придёт в день выхода")
@@ -901,6 +950,8 @@ async def _v_reels(arg: dict):
              "Музыку кладёшь ты при публикации.</i>"]
     if not ENABLED:
         lines.append("⚠️ Выключены переменной REELS=0")
+    if not reelplan.available():
+        lines.append(f"⚠️ Новая вёрстка недоступна ({reelplan.why_not()}) — видео соберётся запасной")
     if not await asyncio.to_thread(reelrender.ffmpeg_ok):
         lines.append("⚠️ Нет ffmpeg — видео не соберётся")
     if arg.get("note"):
@@ -921,7 +972,9 @@ async def _v_reels(arg: dict):
     lines.append("\n<i>📥 ждёт решения · 🟡 одобрен · 📤 ждёт публикации · ✅ выложен · ⏳ собирается</i>")
     rows.append([btn("➕ Подборка", "rl:new:collection"), btn("➕ Детали картины", "rl:new:details")])
     rows.append([btn("✍️ Своя тема или картина", "rl:ask")])
-    rows.append([btn(f"🎙 {await tts.label()}", "rl:voices"), btn("← Пульт", "h:home")])
+    rows.append([btn(f"🎙 {await tts.label()}", "rl:voices"),
+                 btn("🔈 Звуки: вкл" if await sfx_on() else "🔇 Звуки: выкл", "rl:sfx")])
+    rows.append([btn("← Пульт", "h:home")])
     return screen.banner(), "\n".join(lines)[:1020], screen._kb(rows), arg
 
 
@@ -973,6 +1026,12 @@ async def on_cb(cb: CallbackQuery, bot: Bot, state: FSMContext):
         await cb.answer(f"Собираю {KIND_ACC[kind]} на {human(r['day'])} — пара минут")
         await screen.adopt(cb.message)
         return await screen.show(bot, "reels", note=f"⏳ Собираю {KIND_ACC[kind]}, карточка придёт сообщением")
+    if a == "sfx":
+        on = not await sfx_on()
+        await db.set_setting("reel_sfx", on)
+        await cb.answer("Звуки в рилсах включены" if on else "Звуки в рилсах выключены")
+        await screen.adopt(cb.message)
+        return await screen.show(bot, "reels")
     if a == "voices":
         await cb.answer()
         await screen.adopt(cb.message)
