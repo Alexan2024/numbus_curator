@@ -1,19 +1,20 @@
-"""Озвучка рилсов «детали картины». Нужны не только звук, но и время каждого слова: по нему слова
-появляются на экране одно за другим.
+"""Озвучка рилсов. Нужны не только звук, но и время каждого слова: по нему слова появляются на экране
+одно за другим, и камера приезжает к детали на нужном слове.
 
 Голоса (выбор — кнопкой «🎙 Голос» на экране «🎬 Рилсы», там же можно послушать):
-  OpenAI     — если в Railway задан OPENAI_API_KEY. Единственный с живой интонацией: к каждой фразе Claude
-               пишет указание, как её читать («тише, медленно, с горечью»). Модель — OPENAI_TTS_MODEL
-               (gpt-4o-mini-tts). Время слов OpenAI не отдаёт — бот получает его распознаванием речи (whisper-1).
-               С ключом это голос по умолчанию.
-  Kokoro     — открытая модель, работает прямо на сервере бота: без аккаунта, оплаты и ключа. По умолчанию.
-               Модель (~330 МБ) скачивается на диск Railway при первой озвучке и дальше лежит там.
-  Edge       — голоса Microsoft через пакет edge-tts, бесплатно, но синтетичнее.
-  ElevenLabs — если в Railway задан ELEVENLABS_API_KEY, он главнее выбора на экране.
+  ElevenLabs — если в Railway задан ELEVENLABS_API_KEY (напрямую) или FAL_KEY (та же модель Eleven v3 через
+               fal.ai — если сайт ElevenLabs недоступен). Весь рассказ читается одним дублем, а время каждого
+               слова ElevenLabs присылает сам — без распознавания речи. К фразам добавляются теги интонации v3
+               ([softly], [curious]…) по указаниям Claude. С ключом это голос по умолчанию.
+               ELEVENLABS_VOICE_ID — свой голос из библиотеки (по умолчанию George), ELEVENLABS_MODEL — модель
+               (eleven_v3; если модель не отдаёт время слов, бот сам берёт eleven_multilingual_v2).
+  OpenAI     — если задан OPENAI_API_KEY. Один дубль с указаниями, как читать. Время слов — распознаванием (whisper-1).
+  Kokoro     — открытая модель прямо на сервере бота: без аккаунта и ключа. Запасной голос.
+  Edge       — голоса Microsoft через edge-tts, бесплатно, но синтетичнее.
 REEL_TTS=0 — без озвучки: слова появляются в своём темпе.
 
-Если выбранный голос не сработал, бот пробует Edge; не вышло и так — рилс собирается без звука,
-а в карточке об этом написано."""
+Порядок запасных: ElevenLabs напрямую → ElevenLabs через fal → OpenAI → Kokoro → Edge. Какой голос
+в итоге прочитал рилс и почему — в карточке."""
 import asyncio
 import base64
 import logging
@@ -32,7 +33,12 @@ log = logging.getLogger(__name__)
 ENABLED = os.getenv("REEL_TTS", "1").strip().lower() not in ("0", "off", "false", "no")
 EDGE_RATE = os.getenv("REEL_VOICE_RATE", "-4%")
 SPEED = float(os.getenv("REEL_VOICE_SPEED", "0.95"))      # темп Kokoro
-EL_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
+EL_KEY = os.getenv("ELEVENLABS_API_KEY", os.getenv("XI_API_KEY", "")).strip()
+FAL_KEY = os.getenv("FAL_KEY", "").strip()
+EL_VOICE = os.getenv("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb").strip()     # George
+EL_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_v3").strip()
+EL_FALLBACK_MODEL = "eleven_multilingual_v2"
+FAL_URL = "https://fal.run/fal-ai/elevenlabs/tts/eleven-v3"
 OA_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OA_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
 OA_STT = os.getenv("OPENAI_STT_MODEL", "whisper-1")
@@ -51,8 +57,20 @@ KOKORO_FILES = {
     "voices-v1.0.bin": "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin",
 }
 
+# голоса ElevenLabs из общей библиотеки: id → (имя, описание). Имя нужно для fal.ai
+EL_VOICES = {
+    "JBFqnCBsd6RMkjVDRZzb": ("George", "британский мужской, тёплый рассказчик"),
+    "nPczCjzI2devNBz1zQrb": ("Brian", "мужской, низкий, спокойный"),
+    "onwK4e9ZLuTAKqWW03F9": ("Daniel", "британский мужской, ровный"),
+    "Xb7hH8MSUJpSbSDYk0k2": ("Alice", "британский женский, ясный"),
+    "XrExE9yKIg1WjnnlVkGX": ("Matilda", "женский, тёплый"),
+}
+if EL_VOICE not in EL_VOICES:
+    EL_VOICES = {EL_VOICE: ("Свой", "ElevenLabs · голос из ELEVENLABS_VOICE_ID"), **EL_VOICES}
+
 # голос → (название на кнопке, описание)
 VOICES = {
+    **{f"elevenlabs:{k}": (n, f"ElevenLabs · {d}") for k, (n, d) in EL_VOICES.items()},
     "openai:cedar": ("Cedar", "OpenAI · мужской, самый живой"),
     "openai:marin": ("Marin", "OpenAI · женский, самый живой"),
     "openai:onyx": ("Onyx", "OpenAI · мужской, низкий, весомый"),
@@ -69,12 +87,16 @@ VOICES = {
 }
 
 
+def el_ready() -> bool:
+    return bool(EL_KEY or FAL_KEY)
+
+
 def available() -> list[str]:
-    """Голоса для экрана выбора: голоса OpenAI — только когда задан ключ."""
-    return [k for k in VOICES if OA_KEY or not k.startswith("openai:")]
+    """Голоса для экрана выбора: OpenAI и ElevenLabs — только когда задан их ключ."""
+    return [k for k in VOICES if (OA_KEY or not k.startswith("openai:")) and (el_ready() or not k.startswith("elevenlabs:"))]
 
 
-DEFAULT = os.getenv("REEL_VOICE", "openai:cedar" if OA_KEY else "kokoro:af_heart")
+DEFAULT = os.getenv("REEL_VOICE", f"elevenlabs:{EL_VOICE}" if el_ready() else "openai:cedar" if OA_KEY else "kokoro:af_heart")
 if ":" not in DEFAULT:                       # старое значение REEL_VOICE=en-GB-RyanNeural
     DEFAULT = f"edge:{DEFAULT}"
 SAMPLE_TEXT = ("At first, this looks like a tired clown taking a break from a party. "
@@ -93,26 +115,29 @@ async def voice() -> str:
         await db.set_setting("reel_voice_openai_on", True)
         if not str(await db.get_setting("reel_voice", "") or "").startswith("openai:"):
             await db.set_setting("reel_voice", DEFAULT if DEFAULT.startswith("openai:") else "openai:cedar")
+    if el_ready() and not await db.get_setting("reel_voice_el_on"):
+        # ключ ElevenLabs (или fal) появился — один раз переключаемся на его голос; дальше решает выбор на экране
+        await db.set_setting("reel_voice_el_on", True)
+        await db.set_setting("reel_voice", f"elevenlabs:{EL_VOICE}")
     v = await db.get_setting("reel_voice", None)
-    if not v or (v.startswith("openai:") and not OA_KEY):
-        v = DEFAULT if (OA_KEY or not DEFAULT.startswith("openai:")) else "kokoro:af_heart"
-    return v if v.startswith(("kokoro:", "edge:", "openai:")) else "kokoro:af_heart"
+    if not v or (v.startswith("openai:") and not OA_KEY) or (v.startswith("elevenlabs:") and not el_ready()):
+        v = DEFAULT if DEFAULT in available() else ("openai:cedar" if OA_KEY else "kokoro:af_heart")
+    return v if v.startswith(("kokoro:", "edge:", "openai:", "elevenlabs:")) else "kokoro:af_heart"
 
 
 async def provider() -> str:
     if not ENABLED:
         return "off"
-    return "elevenlabs" if EL_KEY else (await voice()).split(":")[0]
+    return (await voice()).split(":")[0]
 
 
 async def label() -> str:
     p = await provider()
     if p == "off":
         return "без озвучки"
-    if p == "elevenlabs":
-        return "голос ElevenLabs"
     v = await voice()
-    return f"голос {VOICES.get(v, (v.split(':')[1], ''))[0]}" + (" (OpenAI)" if v.startswith("openai:") else "")
+    tail = {"openai": " (OpenAI)", "elevenlabs": " (ElevenLabs)"}.get(p, "")
+    return f"голос {VOICES.get(v, (v.split(':')[1], ''))[0]}{tail}"
 
 
 def tokens(text: str) -> list[str]:
@@ -282,35 +307,143 @@ async def _edge(text: str, name: str, dest: Path) -> list[tuple[float, str]]:
     return words
 
 
-async def _elevenlabs(text: str, dest: Path) -> list[tuple[float, str]]:
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{EL_VOICE}/with-timestamps"
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(url, params={"output_format": "mp3_44100_128"},
-                              headers={"xi-api-key": EL_KEY, "Content-Type": "application/json"},
-                              json={"text": text, "model_id": EL_MODEL,
-                                    "voice_settings": {"stability": 0.55, "similarity_boost": 0.75, "style": 0.1}})
-    if r.status_code == 401:
-        raise RuntimeError("ElevenLabs: ключ не подходит (ELEVENLABS_API_KEY)")
-    if r.status_code in (402, 429) or "quota" in r.text.lower():
-        raise RuntimeError("ElevenLabs: закончились кредиты тарифа")
-    r.raise_for_status()
-    data = r.json()
-    dest.write_bytes(base64.b64decode(data["audio_base64"]))
-    al = data.get("alignment") or data.get("normalized_alignment") or {}
-    chars, starts = al.get("characters") or [], al.get("character_start_times_seconds") or []
-    words, cur, t0 = [], "", None
+def _chars_to_words(chars: list, starts: list) -> list[tuple[float, str]]:
+    """Время символов ElevenLabs → [(начало, слово)]. Теги интонации [..] пропускаются."""
+    words, cur, t0, tag = [], "", None, False
     for ch, t in zip(chars, starts):
+        if ch == "[":
+            tag = True
+            continue
+        if tag:
+            tag = ch != "]"
+            continue
         if ch.isspace():
             if cur:
-                words.append((t0, cur))
+                words.append((float(t0), cur))
             cur, t0 = "", None
         else:
             if not cur:
                 t0 = t
             cur += ch
     if cur:
-        words.append((t0, cur))
+        words.append((float(t0), cur))
     return words
+
+
+class ElError(RuntimeError):
+    """Понятная причина, почему ElevenLabs не прочитал."""
+
+
+async def _el_direct(text: str, voice_id: str, dest: Path, model: str) -> list[tuple[float, str]]:
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps"
+    vs = {"stability": 0.5, "similarity_boost": 0.75} if model == "eleven_v3" else \
+        {"stability": 0.45, "similarity_boost": 0.75, "style": 0.15, "use_speaker_boost": True}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30, read=240)) as client:
+        r = await client.post(url, params={"output_format": "mp3_44100_128"},
+                              headers={"xi-api-key": EL_KEY, "Content-Type": "application/json"},
+                              json={"text": text, "model_id": model, "voice_settings": vs})
+    body = r.text[:300].lower()
+    if r.status_code == 401:
+        raise ElError("ElevenLabs: ключ не подходит (ELEVENLABS_API_KEY)")
+    if r.status_code in (402, 429) or "quota" in body:
+        raise ElError("ElevenLabs: закончились кредиты тарифа")
+    if "unusual" in body or "free tier" in body:
+        raise ElError("ElevenLabs не пускает бесплатный тариф с сервера — нужен платный (Starter) или FAL_KEY")
+    if r.status_code in (400, 422) and "model" in body:
+        raise ElError(f"model:{r.text[:200]}")
+    if r.status_code >= 400:
+        raise ElError(f"ElevenLabs {r.status_code}: {r.text[:200]}")
+    data = r.json()
+    dest.write_bytes(base64.b64decode(data["audio_base64"]))
+    al = data.get("alignment") or data.get("normalized_alignment") or {}
+    return _chars_to_words(al.get("characters") or [], al.get("character_start_times_seconds") or [])
+
+
+def _fal_words(ts) -> list[tuple[float, str]]:
+    """Время слов из ответа fal.ai — формат бывает разный: список слов или символы, как у ElevenLabs."""
+    if isinstance(ts, dict):
+        if ts.get("characters"):
+            return _chars_to_words(ts["characters"], ts.get("character_start_times_seconds") or [])
+        ts = ts.get("words") or ts.get("chunks") or []
+    out = []
+    for w in ts or []:
+        if not isinstance(w, dict):
+            continue
+        word = w.get("text") or w.get("word") or ""
+        t = w.get("start", w.get("start_time", w.get("timestamp")))
+        if isinstance(t, (list, tuple)):
+            t = t[0] if t else None
+        if word.strip() and t is not None and not re.fullmatch(r"\[.*\]", word.strip()):
+            out.append((float(t), word.strip()))
+    return out
+
+
+async def _el_fal(text: str, voice_id: str, dest: Path) -> list[tuple[float, str]]:
+    """Та же модель Eleven v3 через fal.ai — если к сайту ElevenLabs не достучаться."""
+    name = EL_VOICES.get(voice_id, (voice_id,))[0]
+    name = voice_id if name == "Свой" else name
+    head = {"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30, read=300), follow_redirects=True) as client:
+        r = await client.post(FAL_URL, headers=head, json={"text": text, "voice": name, "stability": 0.5,
+                                                          "timestamps": True, "apply_text_normalization": "auto"})
+        if r.status_code in (401, 403):
+            raise ElError("fal.ai: ключ не подходит (FAL_KEY)")
+        if r.status_code == 402 or "balance" in r.text.lower():
+            raise ElError("fal.ai: на счёте закончились деньги")
+        if r.status_code >= 400:
+            raise ElError(f"fal.ai {r.status_code}: {r.text[:200]}")
+        data = r.json()
+        url = (data.get("audio") or {}).get("url")
+        if not url:
+            raise ElError("fal.ai не вернул звук")
+        a = await client.get(url)
+        a.raise_for_status()
+        dest.write_bytes(a.content)
+    words = _fal_words(data.get("timestamps"))
+    if not words and OA_KEY:
+        words = await _transcribe(dest)
+    return words
+
+
+EL_TAGS = [(("wry", "smile", "irony", "ironic", "amused"), "[wryly]"), (("soft", "gentle", "tender", "quiet"), "[softly]"),
+           (("curious", "intrigu", "wonder"), "[curious]"), (("heavy", "weight", "slow", "grave", "sombre", "somber"),
+                                                           "[thoughtful]"), (("tense", "urgent", "quicker"), "[tense]")]
+
+
+def el_tag(how: str | None) -> str:
+    """Указание Claude («slower, softer, let it hang») → тег интонации Eleven v3 или пусто."""
+    low = (how or "").lower()
+    for keys, tag in EL_TAGS:
+        if any(k in low for k in keys):
+            return tag
+    return ""
+
+
+async def _elevenlabs(text: str, dest: Path, voice_id: str | None = None, tagged: str | None = None) -> tuple[list[tuple[float, str]], str]:
+    """Озвучка ElevenLabs → ([(начало, слово)], чем прочитано). tagged — тот же текст с тегами v3.
+    Порядок: напрямую (v3, при отказе модели — multilingual v2 без тегов), затем fal.ai."""
+    voice_id = voice_id or EL_VOICE
+    errors = []
+    if EL_KEY:
+        for model in dict.fromkeys([EL_MODEL, EL_FALLBACK_MODEL]):
+            try:
+                src = tagged if (tagged and model == "eleven_v3") else text
+                return await _el_direct(src, voice_id, dest, model), f"ElevenLabs {model}"
+            except ElError as exc:
+                if str(exc).startswith("model:"):
+                    errors.append(f"модель {model} не подошла")
+                    continue
+                errors.append(str(exc))
+                break
+            except httpx.HTTPError as exc:
+                errors.append(f"ElevenLabs недоступен ({type(exc).__name__})")
+                break
+    if FAL_KEY:
+        try:
+            return await _el_fal(tagged or text, voice_id, dest), "Eleven v3 через fal.ai"
+        except (ElError, httpx.HTTPError) as exc:
+            errors.append(str(exc) or type(exc).__name__)
+    raise ElError("; ".join(errors) or "ElevenLabs: нет ключа (ELEVENLABS_API_KEY или FAL_KEY)")
 
 
 # ======================= OpenAI =======================
@@ -329,22 +462,30 @@ async def _openai(text: str, name: str, dest: Path, how: str | None) -> tuple[fl
         if r.status_code >= 400:
             raise RuntimeError(f"OpenAI TTS {r.status_code}: {r.text[:200]}")
         dest.write_bytes(r.content)
-        words: list[tuple[float, str]] = []
-        try:
-            t = await client.post("https://api.openai.com/v1/audio/transcriptions", headers=head,
+    return duration(dest), await _transcribe(dest)
+
+
+async def _transcribe(path: Path) -> list[tuple[float, str]]:
+    """Время слов распознаванием речи (OpenAI whisper-1). Не вышло — пустой список (тогда — по длине слов)."""
+    if not OA_KEY:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30, read=180)) as client:
+            t = await client.post("https://api.openai.com/v1/audio/transcriptions",
+                                  headers={"Authorization": f"Bearer {OA_KEY}"},
                                   data={"model": OA_STT, "response_format": "verbose_json", "language": "en",
                                         "timestamp_granularities[]": "word"},
-                                  files={"file": (dest.name, dest.read_bytes(), "audio/mpeg")})
+                                  files={"file": (path.name, path.read_bytes(), "audio/mpeg")})
             t.raise_for_status()
-            words = [(float(w["start"]), str(w["word"])) for w in t.json().get("words") or []]
-        except Exception:
-            log.warning("OpenAI: время слов не получено, распределяю по длине", exc_info=True)
-    return duration(dest), words
+            return [(float(w["start"]), str(w["word"])) for w in t.json().get("words") or []]
+    except Exception:
+        log.warning("Распознавание: время слов не получено, распределяю по длине", exc_info=True)
+        return []
 
 
 def is_one_take(v: str) -> bool:
-    """OpenAI читает весь рассказ одним дублем: интонация течёт от фразы к фразе, а не начинается заново."""
-    return v.startswith("openai:")
+    """OpenAI и ElevenLabs читают весь рассказ одним дублем: интонация течёт от фразы к фразе."""
+    return v.startswith(("openai:", "elevenlabs:"))
 
 
 def direction(parts: list[tuple[str, str, str]], extra: str = "") -> str:
@@ -360,14 +501,21 @@ def direction(parts: list[tuple[str, str, str]], extra: str = "") -> str:
     return "\n".join(lines)[:3800]
 
 
-async def speak_story(parts: list[tuple[str, str, str]], dest_base: Path, extra: str = "") -> dict:
-    """Весь рассказ одним дублем OpenAI → {audio, dur, beats: [{start, starts}]} — время каждой части и слова."""
-    v = await current_key()
-    name = v.split(":", 1)[1]
+async def speak_story(parts: list[tuple[str, str, str]], dest_base: Path, extra: str = "", v: str | None = None) -> dict:
+    """Весь рассказ одним дублем (OpenAI или ElevenLabs) → {audio, dur, beats: [{start, starts}], by} —
+    время каждой части и слова."""
+    v = v or await current_key()
+    engine, name = v.split(":", 1)
     text = "\n\n".join(t for _, t, _ in parts)
     dest = dest_base.with_suffix(".mp3")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dur, spoken = await _openai(text, name, dest, direction(parts, extra))
+    if engine == "elevenlabs":
+        tagged = "\n\n".join((el_tag(how) + " " if el_tag(how) else "") + t for _, t, how in parts)
+        spoken, by = await _elevenlabs(text, dest, name, tagged)
+        dur = duration(dest)
+    else:
+        dur, spoken = await _openai(text, name, dest, direction(parts, extra))
+        by = "OpenAI"
     starts, q = align_q(text, spoken, dur) if spoken else (None, 0.0)
     counts = [len(tokens(t)) for _, t, _ in parts]
     if starts is None or q < 0.6 or not _sane(counts, starts, dur):
@@ -382,7 +530,7 @@ async def speak_story(parts: list[tuple[str, str, str]], dest_base: Path, extra:
         beats.append({"start": starts[pos] if n else (beats[-1]["start"] if beats else 0.0),
                       "starts": starts[pos:pos + n]})
         pos += n
-    return {"audio": str(dest), "dur": dur, "beats": beats, "one_take": True, "approx": approx}
+    return {"audio": str(dest), "dur": dur, "beats": beats, "one_take": True, "approx": approx, "by": by}
 
 
 def _by_length(text: str, total: float) -> list[float]:
@@ -403,7 +551,7 @@ async def _speak_with(v: str, text: str, dest_base: Path, how: str | None = None
     dest_base.parent.mkdir(parents=True, exist_ok=True)
     if engine == "elevenlabs":
         dest = dest_base.with_suffix(".mp3")
-        spoken = await _elevenlabs(text, dest)
+        spoken, _ = await _elevenlabs(text, dest, name)
     elif engine == "kokoro":
         return await _kokoro_speak(text, name, dest_base.with_suffix(".wav"))
     elif engine == "openai":
@@ -420,8 +568,7 @@ async def _speak_with(v: str, text: str, dest_base: Path, how: str | None = None
 
 async def current_key() -> str:
     """Какой голос сейчас звучит — для кэша озвучки."""
-    p = await provider()
-    return f"elevenlabs:{EL_VOICE}" if p == "elevenlabs" else await voice()
+    return await voice()
 
 
 async def speak(text: str, dest_base: Path, how: str | None = None) -> dict | None:

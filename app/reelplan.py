@@ -86,9 +86,15 @@ def _url(base: str, folder: Path, path: Path | str) -> str:
 # и не приближается сильнее ZOOM_MAX экранных пикселей на пиксель картины (иначе мыло).
 
 ZOOM_MAX = float(os.getenv("REEL_ZOOM_MAX", "1.25"))
-WIN = (270, 1220)            # окно для детали под рассказом: от верхней строки до подписи
+WIN = (290, 1170)            # окно для детали под рассказом: от верхней строки до подписи (безопасные зоны Instagram)
 FULL_H = 1450                # общий план: картина не выше этого
 HOLD_ZOOM = 1.04             # медленный наезд, пока камера стоит на детали
+HOOK_TOP = 290               # хук сверху — ниже шапки Instagram
+HOOK_PUSH = float(os.getenv("REEL_HOOK_PUSH", "1.12"))   # первый кадр чуть шире и сразу наезд: движение с кадра 0
+HOOK_PUSH_T = 0.9
+LOOP = os.getenv("REEL_LOOP", "1").strip().lower() not in ("0", "off", "false", "no")
+LABEL_HOLD = 3.2             # от начала титра до возврата к первому кадру, с
+LOOP_BACK = 0.7              # возврат к первому кадру, с
 SLACK = (60, 220)            # насколько кадр может выйти за край картины (экранные px по x, y): деталь у самого
                              # края лучше показать с полоской тёмного фона, чем уводить под текст или отъезжать
 
@@ -126,10 +132,14 @@ def _full(pw, ph):
 def _hook_win(text: str) -> tuple[int, int]:
     """Хук набран крупно сверху: деталь — под ним."""
     lines = max(1, -(-len(text) // 18))
-    return (min(250 + lines * 108 + 60, 900), 1480)
+    return (min(HOOK_TOP + lines * 108 + 60, 940), 1440)
 
 
-def _fit(pw, ph, box, win):
+HOOK_SLACK = (60, 900)       # на хуке верх кадра всё равно под текстом: деталь у верхнего края картины можно
+                             # опустить в окно под хуком, над ней будет тёмный фон
+
+
+def _fit(pw, ph, box, win, slack=SLACK):
     """Кадр, в котором деталь box (доли) целиком в окне win (y экрана) с полями. → [cx, cy, cw]."""
     x0, y0, x1, y1 = [max(0.0, min(1.0, float(v))) for v in box]
     bx0, by0, bx1, by1 = x0 * pw, y0 * ph, x1 * pw, y1 * ph
@@ -141,7 +151,7 @@ def _fit(pw, ph, box, win):
     # деталь — около двух третей окна: вокруг остаётся картина, видно, в каком она месте
     s = max(min(0.70 * 960 / bw, 0.62 * (wy1 - wy0) / bh, ZOOM_MAX), s_min)
     for _ in range(12):
-        cx, cy, cw = _clamp_cam(pw, ph, bcx, bcy - (wyc - H / 2) / s, W / s, SLACK)
+        cx, cy, cw = _clamp_cam(pw, ph, bcx, bcy - (wyc - H / 2) / s, W / s, slack)
         # у края картины камера упирается — проверяем, что деталь всё ещё в окне и не под текстом
         top = H / 2 + (by0 - cy) * s
         bot = H / 2 + (by1 - cy) * s
@@ -284,7 +294,7 @@ def _mix_voice(clips: list[tuple[float, str, float]], dur: float, dest: Path) ->
         f"amix=inputs={len(clips)}:normalize=0,apad[a]"
     cmd += ["-filter_complex", graph, "-map", "[a]", "-t", f"{dur:.2f}", "-ac", "1", "-ar", "44100", str(raw)]
     subprocess.run(cmd, check=True, capture_output=True, timeout=300)
-    target = "I=-16:TP=-2:LRA=9"
+    target = "I=-14:TP=-1.5:LRA=9"                  # громкость под соцсети (Instagram выравнивает к −14 LUFS)
     r = subprocess.run([exe, "-hide_banner", "-i", str(raw), "-af", f"loudnorm={target}:print_format=json", "-f", "null", "-"],
                        capture_output=True, text=True, timeout=300)
     try:
@@ -299,6 +309,42 @@ def _mix_voice(clips: list[tuple[float, str, float]], dur: float, dest: Path) ->
     return dest
 
 
+# ======================= линии поверх снимка =======================
+
+def _marks(beats: list[dict], out: list[dict], pw: int, ph: int, end_start: float) -> list[dict]:
+    """Схема линий для «Разбора здания» (ось, уровень, сетка, контур, диагонали — на рамке детали) и кольцо
+    вокруг человека в «Масштабе». Линия рисуется, когда камера приезжает к детали, и остаётся до конца
+    кульминации — схема складывается; прошлые линии тише."""
+    res = []
+    climax_end = next((o["end"] for b, o in zip(beats, out) if b["kind"] == "climax"), end_start)
+    for b, o in zip(beats, out):
+        m = b.get("mark")
+        box = m and _box4(m.get("box") or b.get("box"))
+        if not box:
+            continue
+        x0, y0, x1, y1 = box
+        row = {"type": m.get("type") or "frame", "x0": round(x0 * pw, 1), "y0": round(y0 * ph, 1),
+               "x1": round(x1 * pw, 1), "y1": round(y1 * ph, 1), "start": round(o["arrive"] + 0.05, 3),
+               "active": round(o["end"], 3), "label": str(m.get("label") or "")[:18]}
+        if row["type"] == "grid":
+            row.update(cols=max(1, min(24, int(m.get("cols") or 1))), rows=max(1, min(24, int(m.get("rows") or 1))))
+        if m.get("persist"):
+            row.update(start=round(max(0.0, o["start"] + 0.2), 3), end=round(end_start, 3), active=round(end_start, 3),
+                       draw=0.6)
+        else:
+            row["end"] = round(max(climax_end, o["end"]), 3)
+        res.append(row)
+    return res
+
+
+def _box4(b) -> list | None:
+    try:
+        b = [max(0.0, min(1.0, float(x))) for x in b]
+        return b if len(b) == 4 and b[2] > b[0] and b[3] > b[1] else None
+    except (TypeError, ValueError):
+        return None
+
+
 # ======================= «детали картины» =======================
 
 def story_props(folder: Path, image: Path, beats: list[dict], voice, pt: dict, sfx: bool = True) -> dict:
@@ -311,7 +357,8 @@ def story_props(folder: Path, image: Path, beats: list[dict], voice, pt: dict, s
         if not b.get("box"):
             rects.append((full, _hold(pw, ph, full, None, 1.03)))
             continue
-        r0 = _fit(pw, ph, b["box"], _hook_win(b["text"]) if b["kind"] == "hook" else WIN)
+        hook = b["kind"] == "hook"
+        r0 = _fit(pw, ph, b["box"], _hook_win(b["text"]) if hook else WIN, HOOK_SLACK if hook else SLACK)
         rects.append((r0, _hold(pw, ph, r0, b["box"])))
     anchors = [_anchor(b["raw"]) for b in beats]
     plan: list[tuple[float, float, int]] = []          # (уезжает, приезжает, 1 — растворение) для каждой части
@@ -396,9 +443,12 @@ def story_props(folder: Path, image: Path, beats: list[dict], voice, pt: dict, s
 
     # камера: [время, cx, cy, cw, растворение]. Приехать к arrive, медленно наезжать, уехать к следующей части
     cam = []
+    start_view = _clamp_cam(pw, ph, rects[0][0][0], rects[0][0][1], min(rects[0][0][2] * HOOK_PUSH, full[2] * 1.02),
+                            HOOK_SLACK if beats[0].get("box") else (0, 0))
     for i, (r0, r1) in enumerate(rects):
         if i == 0:
-            cam.append([0.0, *r0, 0])
+            cam.append([0.0, *start_view, 0])
+            cam.append([HOOK_PUSH_T, *r0, 0])
         else:
             leave, a, cut = plan[i]
             cam.append([leave, *rects[i - 1][1], 0])
@@ -418,26 +468,349 @@ def story_props(folder: Path, image: Path, beats: list[dict], voice, pt: dict, s
     cwe = W / s_end
     end_start = max(end_start, cam[-1][0] + 0.1)
     cam.append([end_start, *cam[-1][1:4], 0])
-    cam.append([end_start + 1.6, cwe / 2 - M / s_end, cwe * A / 2 - 300 / s_end, cwe, 0])
-    dur = end_start + 4.0
+    label_cam = [cwe / 2 - M / s_end, cwe * A / 2 - 300 / s_end, cwe]
+    cam.append([end_start + 1.6, *label_cam, 0])
+    loop_start = None
+    if LOOP:
+        # этикетка, потом камера возвращается к первому кадру — повтор ролика начинается без стыка
+        loop_start = end_start + LABEL_HOLD
+        cam.append([loop_start, *label_cam, 0])
+        cam.append([loop_start + LOOP_BACK, *start_view, 0])
+        dur = loop_start + LOOP_BACK
+    else:
+        dur = end_start + 4.0
     # звуки: мягкий проход воздуха на каждом переезде — его пик на середине переезда, где камера быстрее всего;
     # на титре — перелистнутая страница
     ev = [((pl[0] + pl[1]) / 2, "move", True) for pl in plan[1:] if pl[1] - pl[0] >= 1.0]
     events = _sfx(folder, ev + [(end_start + 0.15, "close", False)], str(image)) if sfx else []
+    marks = _marks(beats, out, pw, ph, end_start)
 
     voice_path = None
     if clips:
         voice_path = folder / "voice_mix.wav"
         _mix_voice(clips, dur, voice_path)
     year = str(pt.get("year") or "").strip()
-    meta = [[k, v] for k, v in (("Medium", pt.get("medium")), ("Size", pt.get("size")),
-                                ("Collection", pt.get("museum"))) if v]
+    names = pt.get("meta_names") or ("Medium", "Size", "Collection")
+    meta = [[k, v] for k, v in zip(names, (pt.get("medium"), pt.get("size"), pt.get("museum"))) if v]
     return {"fps": FPS, "duration": round(dur * FPS), "pw": pw, "ph": ph,
-            "cam": [[round(x, 3) for x in k] for k in cam],
-            "beats": out, "sfx": events, "slack": list(SLACK), "endStart": round(end_start, 3), "labelTop": round(300 + ph * s_end + 60),
+            "cam": [[round(x, 3) for x in k] for k in cam], "marks": marks,
+            "loopStart": round(loop_start, 3) if loop_start else None, "coverT": round(max(0.8, out[0]["end"] - 0.35), 2),
+            "beats": out, "sfx": events, "slack": list(HOOK_SLACK), "endStart": round(end_start, 3), "labelTop": round(300 + ph * s_end + 60),
             "title": pt.get("title") or "", "sub": ", ".join(x for x in (pt.get("author"), year) if x),
-            "rubric": RUBRIC, "series": " · ".join(x for x in (pt.get("title"), year) if x), "meta": meta,
+            "rubric": pt.get("rubric") or RUBRIC, "series": " · ".join(x for x in (pt.get("title"), year) if x), "meta": meta,
             "image": str(image), "voice": str(voice_path) if voice_path else None, "_dur": dur}
+
+
+# ======================= время частей рассказа (пары, подборки) =======================
+
+def _timeline(beats: list[dict], voice, min_part: float = 1.6) -> tuple[list[dict], list, float]:
+    """Когда звучит каждая часть и каждое слово — без камеры. beats — [{kind, raw}]; voice — один дубль (dict),
+    фразы по одной (list) или None. → (части [{kind, start, end, words, arrive}], дорожки голоса, конец голоса).
+    arrive — слово-якорь ^ (на нём происходит переход), иначе чуть после начала части."""
+    out, clips = [], []
+    one = voice if isinstance(voice, dict) and voice.get("one_take") else None
+    per = list(voice) if isinstance(voice, list) else []
+    per += [None] * len(beats)
+    if one:
+        tb = list(one.get("beats") or []) + [{"start": None, "starts": []}] * len(beats)
+        first = (tb[0].get("starts") or [0.0])[0] if tb else 0.0
+        lead = max(0.0, float(first or 0.0) - 0.06)
+        starts, wss = [], []
+        for i, b in enumerate(beats):
+            st = tb[i].get("start")
+            st = float(st) - lead if st is not None else (starts[-1] + 2.5 if starts else 0.0)
+            n = len(b["raw"].split())
+            wss.append([float(x) - lead for x in tb[i].get("starts") or []] or [st + k * 0.32 for k in range(n)])
+            starts.append(st)
+        voice_end = float(one["dur"]) - lead
+        for i, b in enumerate(beats):
+            end = starts[i + 1] - 0.05 if i + 1 < len(beats) else voice_end + 0.3
+            out.append({"kind": b["kind"], "start": starts[i], "end": max(end, starts[i] + 0.8),
+                        "words": _words(b["raw"], wss[i])})
+        clips = [(0.0, one["audio"], lead)]
+    else:
+        t = 0.0
+        for i, b in enumerate(beats):
+            v = per[i]
+            n = len(b["raw"].split())
+            trim = max(0.0, float(v["starts"][0]) - 0.06) if v and v.get("starts") else 0.0
+            s0 = 0.0 if i == 0 else t + (0.6 if b["kind"] == "climax" else 0.2)
+            speech = (float(v["dur"]) - trim) if v else n * 0.32 + 0.3
+            ws = [s0 + x - trim for x in v["starts"]] if v and v.get("starts") else [s0 + k * 0.32 for k in range(n)]
+            tail = 0.5 if b["kind"] == "hook" else 1.0 if b["kind"] == "climax" else 0.3
+            e = max(s0 + min_part, s0 + speech + tail)
+            out.append({"kind": b["kind"], "start": s0, "end": e, "words": _words(b["raw"], ws)})
+            if v:
+                clips.append((s0, v["audio"], trim))
+            t = e
+        voice_end = out[-1]["end"] if out else 0.0
+    for b, o in zip(beats, out):
+        a = _anchor(b["raw"])
+        ws = [w["t"] for w in o["words"]]
+        o["arrive"] = round(ws[a] if a is not None and a < len(ws) else o["start"] + 0.25, 3)
+    return out, clips, voice_end
+
+
+# ======================= пары =======================
+# Каждая картинка — окно на экране (вне его обрезана) и камера (как в «Деталях»: центр и ширина кадра в пикселях
+# картинки). Состояния: одна картинка на экране (a / b), обе (both): в сравнении — одна над другой или рядом,
+# в шторке — половина на половину, в растворении — B поверх A. Переход — на слове-якоре ^.
+
+PAIR_TR = {"wipe": 1.4, "dissolve": 1.3, "split": 1.0}
+SPLIT_TOP, SPLIT_BOTTOM = 300, 1300                    # сравнение — в этом поясе экрана
+END_BOX = (M, 330, W - 2 * M, 700)                     # две картинки рядом на титре
+
+
+def _view_at(pw, ph, x, y, w, h):
+    """Камера, при которой вся картинка стоит в прямоугольнике x, y, w, h экрана (по ширине w)."""
+    s = w / pw
+    return [(W / 2 - x) / s, (H / 2 - y) / s, W / s]
+
+
+def _contain(pw, ph, x, y, w, h):
+    """Картинка целиком внутри области, по центру → её прямоугольник на экране."""
+    s = min(w / pw, h / ph)
+    return x + (w - pw * s) / 2, y + (h - ph * s) / 2, pw * s, ph * s
+
+
+def _cover_view(pw, ph, rect, focus=(0.5, 0.5), box=None):
+    """Камера, при которой картинка закрывает окно rect целиком; box — приблизить к детали внутри окна."""
+    rx, ry, rw, rh = rect
+    s = max(rw / pw, rh / ph)
+    fx, fy = focus[0] * pw, focus[1] * ph
+    if box:
+        x0, y0, x1, y1 = [max(0.0, min(1.0, float(v))) for v in box]
+        bw, bh = max((x1 - x0) * pw, pw * 0.02), max((y1 - y0) * ph, ph * 0.02)
+        s = max(min(0.7 * rw / bw, 0.62 * rh / bh, ZOOM_MAX), s)
+        fx, fy = (x0 + x1) / 2 * pw, (y0 + y1) / 2 * ph
+    # точка фокуса — в центр окна, но картинка не отходит от краёв окна
+    left = rx + rw / 2 - fx * s
+    top = ry + rh / 2 - fy * s
+    left = min(max(left, rx + rw - pw * s), rx)
+    top = min(max(top, ry + rh - ph * s), ry)
+    return [(W / 2 - left) / s, (H / 2 - top) / s, W / s]
+
+
+def _zoom(view, k, pw, ph):
+    """Та же камера, приближенная в k раз к центру кадра (медленный наезд)."""
+    return [view[0], view[1], view[2] / k]
+
+
+def _pair_rect(sizes) -> tuple:
+    """Общее окно для шторки и растворения: по средней пропорции двух картинок."""
+    r = sum(w / h for w, h in sizes) / len(sizes)
+    rh = min(W / max(0.56, min(1.7, r)), FULL_H)
+    wy = (WIN[0] + WIN[1]) / 2
+    top = max(WIN[0] - 40, wy - rh / 2)
+    return (0.0, top, float(W), rh)
+
+
+def _split_rects(sizes):
+    """Сравнение: обе вертикальные — рядом, иначе — одна над другой. → [(x, y, w, h), (x, y, w, h)]."""
+    if all(w / h < 0.9 for w, h in sizes):
+        gap, cw = 24, (W - 2 * 48 - 24) / 2
+        areas = [(48, SPLIT_TOP, cw, SPLIT_BOTTOM - SPLIT_TOP), (48 + cw + gap, SPLIT_TOP, cw, SPLIT_BOTTOM - SPLIT_TOP)]
+    else:
+        gap, hh = 24, (SPLIT_BOTTOM - SPLIT_TOP - 24) / 2
+        areas = [(0, SPLIT_TOP, W, hh), (0, SPLIT_TOP + hh + gap, W, hh)]
+    return [_contain(w, h, *a) for (w, h), a in zip(sizes, areas)]
+
+
+def _end_rects(sizes):
+    x, y, w, h = END_BOX
+    if all(a / b < 1.1 for a, b in sizes):
+        cw = (w - 28) / 2
+        return [_contain(sizes[0][0], sizes[0][1], x, y, cw, h), _contain(sizes[1][0], sizes[1][1], x + cw + 28, y, cw, h)]
+    hh = (h - 24) / 2
+    return [_contain(sizes[0][0], sizes[0][1], x, y, w, hh), _contain(sizes[1][0], sizes[1][1], x, y + hh + 24, w, hh)]
+
+
+def pair_props(folder: Path, images: list[Path], beats: list[dict], voice, info: dict, layout: str,
+               sfx: bool = True) -> dict:
+    """Пара: images — [A, B]; beats — reels.pair_beats(d) (с raw, show, box, pick); info — {title, rubric, roles,
+    meta, focus, paper, ink}. layout — wipe | dissolve | split. → props для композиции Pair."""
+    sizes = [_size(x) for x in images]
+    out, clips, voice_end = _timeline(beats, voice)
+    FR = (0.0, 0.0, float(W), float(H))
+    R = _pair_rect(sizes) if layout in ("wipe", "dissolve") else FR
+    split = _split_rects(sizes)
+    focus = info.get("focus") or [[0.5, 0.5], [0.5, 0.5]]
+
+    def state(i, b):
+        """Ключ обеих картинок для части b: [[x, y, w, h, cx, cy, cw, op, clip, lab], …]."""
+        show, box = b.get("show") or "a", b.get("box")
+        lab = 0.0 if b["kind"] == "hook" else 1.0
+        res = []
+        for n in (0, 1):
+            pw, ph = sizes[n]
+            me = "ab"[n]
+            if layout == "split":
+                if show == "both":
+                    x, y, w, h = split[n]
+                    op = 1.0 if not b.get("pick") or b["pick"] == me else 0.28
+                    res.append([*FR, *_view_at(pw, ph, x, y, w, h), op, 0.0, lab])
+                elif show == me:
+                    win = _hook_win(b["text"]) if b["kind"] == "hook" else WIN
+                    view = _fit(pw, ph, box, win, HOOK_SLACK if b["kind"] == "hook" else SLACK) if box else _full(pw, ph)
+                    res.append([*FR, *view, 1.0, 0.0, 0.0])
+                else:
+                    x, y, w, h = split[n]
+                    res.append([*FR, *_view_at(pw, ph, x, y, w, h), 0.0, 0.0, 0.0])
+            else:
+                on_box = box if show == me else None
+                view = _cover_view(pw, ph, R, focus[n], on_box)
+                if n == 0:
+                    res.append([*R, *view, 1.0, 0.0, lab])
+                elif layout == "dissolve":
+                    res.append([*R, *view, 1.0 if show in ("b", "both") else 0.0, 0.0, lab])
+                else:
+                    clip = {"a": 1.0, "b": 0.0, "both": 0.5}[show if show in ("a", "b", "both") else "a"]
+                    res.append([*R, *view, 1.0, clip, lab])
+        return res
+
+    TR = PAIR_TR.get(layout, 1.0)
+    keys = [[], []]
+    states = [state(i, b) for i, b in enumerate(beats)]
+    # первый кадр — чуть шире и сразу наезд
+    s0 = states[0]
+    for n in (0, 1):
+        first = list(s0[n])
+        if layout == "split":
+            first[6] = s0[n][6] * HOOK_PUSH           # чуть шире — и наезд
+        else:
+            s0[n][6] = s0[n][6] / 1.07                # картинка закрывает окно целиком — наезд только внутрь
+        keys[n].append([0.0, *first])
+        keys[n].append([HOOK_PUSH_T, *s0[n]])
+    moves = []
+    last_end = HOOK_PUSH_T
+    for i in range(1, len(beats)):
+        a_st, b_st = states[i - 1], states[i]
+        o = out[i]
+        changed = any(abs(x - y) > 1e-3 for n in (0, 1) for x, y in zip(a_st[n], b_st[n]))
+        # до перехода — медленный наезд на прошлом состоянии
+        t0 = max(last_end + 0.3, o["arrive"] - TR * 0.55)
+        for n in (0, 1):
+            held = list(a_st[n])
+            if layout != "split" or beats[i - 1].get("show") != "both":
+                held[6] = held[6] / HOLD_ZOOM
+            keys[n].append([t0, *held])
+        if changed:
+            t1 = t0 + TR
+            for n in (0, 1):
+                keys[n].append([t1, *b_st[n]])
+            moves.append((t0, t1))
+            last_end = t1
+        else:
+            last_end = t0
+        # сравнение не наезжает; последнее состояние держим до конца рассказа
+    end_start = max(out[-1]["end"], voice_end) + 0.3
+    for n in (0, 1):
+        held = list(states[-1][n])
+        if not (layout == "split" and beats[-1].get("show") == "both"):
+            held[6] = held[6] / HOLD_ZOOM
+        keys[n].append([max(end_start, keys[n][-1][0] + 0.3), *held])
+    # титр: обе картинки рядом, под ними — подписи; потом возврат к первому кадру
+    ends = _end_rects(sizes)
+    t_end = max(end_start + 1.4, max(keys[0][-1][0], keys[1][-1][0]) + 0.8)
+    for n in (0, 1):
+        pw, ph = sizes[n]
+        x, y, w, h = ends[n]
+        keys[n].append([t_end, *FR, *_view_at(pw, ph, x, y, w, h), 1.0, 0.0, 0.0])
+    loop_start = None
+    if LOOP:
+        loop_start = max(end_start + LABEL_HOLD, t_end + 1.4)
+        for n in (0, 1):
+            keys[n].append([loop_start, *keys[n][-1][1:]])
+            keys[n].append([loop_start + LOOP_BACK, *keys[n][0][1:]])
+        dur = loop_start + LOOP_BACK
+    else:
+        dur = end_start + 4.0
+    label_top = round(max(y + h for x, y, w, h in ends) + 70)
+
+    reveal_n = 0
+    for b, o in zip(beats, out):
+        if b["kind"] == "reveal":
+            reveal_n += 1
+            o["label"] = b.get("label") or ""
+            o["n"] = reveal_n
+    ev = [((m0 + m1) / 2, "move", True) for m0, m1 in moves] + [(end_start + 0.15, "close", False)]
+    events = _sfx(folder, ev, str(images[0])) if sfx else []
+    voice_path = None
+    if clips:
+        voice_path = folder / "voice_mix.wav"
+        _mix_voice(clips, dur, voice_path)
+    roles = info.get("roles") or ("A", "B")
+    layers = []
+    for n in (0, 1):
+        pw, ph = sizes[n]
+        l = {"src": str(images[n]), "pw": pw, "ph": ph, "tag": (info.get("tags") or roles)[n],
+             "keys": [[round(v, 3) for v in k] for k in keys[n]]}
+        if n == 0 and info.get("ink"):
+            l.update(ink=[0.0, 2.6, 0.62], paper=info.get("paper") or "#EEE8DC")
+        layers.append(l)
+    return {"fps": FPS, "duration": round(dur * FPS), "layers": layers, "beats": out, "sfx": events, "layout": layout,
+            "endStart": round(end_start, 3), "loopStart": round(loop_start, 3) if loop_start else None,
+            "labelTop": label_top, "title": info.get("title") or "", "meta": info.get("meta") or [],
+            "rubric": info.get("rubric") or "", "series": info.get("series") or info.get("title") or "",
+            "coverT": round(max(0.8, out[0]["end"] - 0.35), 2),
+            "voice": str(voice_path) if voice_path else None, "_dur": dur}
+
+
+def align(a: Path, b: Path, dest: Path) -> tuple[Path, Path] | None:
+    """Совместить B с A (две версии одной картины: до и после расчистки, картина и снимок того же кадра):
+    поворот, масштаб и сдвиг по общим точкам (SIFT). Удалось — B, переложенная в кадр A (dest); нет — None,
+    и пара показывается рядом, а не шторкой. Нужен opencv-python-headless."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+    ia, ib = cv2.imread(str(a)), cv2.imread(str(b))
+    if ia is None or ib is None:
+        return None
+    k = 1600 / max(ia.shape[:2])
+    kb = 1600 / max(ib.shape[:2])
+    ga = cv2.cvtColor(cv2.resize(ia, None, fx=k, fy=k, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+    gb = cv2.cvtColor(cv2.resize(ib, None, fx=kb, fy=kb, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+    sift = cv2.SIFT_create(4000)
+    pa, da = sift.detectAndCompute(ga, None)
+    pb, db = sift.detectAndCompute(gb, None)
+    if da is None or db is None or len(pa) < 30 or len(pb) < 30:
+        return None
+    pairs = cv2.BFMatcher().knnMatch(db, da, k=2)
+    good = [m for m, n in (x for x in pairs if len(x) == 2) if m.distance < 0.72 * n.distance]
+    if len(good) < 40:
+        return None
+    src = np.float32([pb[m.queryIdx].pt for m in good]) / kb
+    dst = np.float32([pa[m.trainIdx].pt for m in good]) / k
+    M, inl = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=4.0 / k)
+    if M is None or inl is None or int(inl.sum()) < 30 or int(inl.sum()) < 0.25 * len(good):
+        return None
+    h, w = ia.shape[:2]
+    out = cv2.warpAffine(ib, M, (w, h), flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
+    # общая часть двух кадров: обе картинки обрезаются по ней, чтобы у шторки не было пустых полос
+    hb, wb = ib.shape[:2]
+    c = cv2.transform(np.float32([[[0, 0], [wb, 0], [wb, hb], [0, hb]]]), M)[0]
+    x0, x1 = int(max(c[0][0], c[3][0], 0)) + 3, int(min(c[1][0], c[2][0], w)) - 3
+    y0, y1 = int(max(c[0][1], c[1][1], 0)) + 3, int(min(c[2][1], c[3][1], h)) - 3
+    if x1 - x0 < 0.6 * w or y1 - y0 < 0.6 * h:
+        return None
+    da, db_ = dest.with_name(dest.stem + "_a.jpg"), dest.with_name(dest.stem + "_b.jpg")
+    cv2.imwrite(str(da), ia[y0:y1, x0:x1], [cv2.IMWRITE_JPEG_QUALITY, 94])
+    cv2.imwrite(str(db_), out[y0:y1, x0:x1], [cv2.IMWRITE_JPEG_QUALITY, 94])
+    log.info("Пара: совмещено по %s точкам из %s", int(inl.sum()), len(good))
+    return da, db_
+
+
+def paper_color(path: Path) -> str:
+    """Цвет бумаги чертежа — по светлым пикселям по краям."""
+    import numpy as np
+    with Image.open(path) as im:
+        a = np.asarray(im.convert("RGB").resize((200, 200)), dtype=np.float32)
+    edge = np.concatenate([a[:12].reshape(-1, 3), a[-12:].reshape(-1, 3), a[:, :12].reshape(-1, 3), a[:, -12:].reshape(-1, 3)])
+    light = edge[edge.mean(axis=1) >= np.percentile(edge.mean(axis=1), 50)]
+    r, g, b = [int(x) for x in light.mean(axis=0)]
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 
 # ======================= подборка =======================
@@ -454,29 +827,65 @@ def collection_mode(sizes: list[tuple[int, int]]) -> str:
     return "bleed" if sizes and all(w / h <= BLEED for w, h in sizes) else "frame"
 
 
-def collection_props(folder: Path, d: dict, sfx: bool = True) -> dict:
+def collection_beats(d: dict) -> list[dict]:
+    """Части голоса подборки: вступление на титуле и строка на каждую работу. Нет строки хоть у одной — []."""
+    its = d.get("items") or []
+    if not d.get("intro") or not its or not all((it.get("line") or "").strip() for it in its):
+        return []
+    out = [{"kind": "hook", "raw": d["intro"], "text": d["intro"].replace("*", ""), "how": d.get("intro_delivery")}]
+    for it in its:
+        out.append({"kind": "reveal", "raw": it["line"], "text": it["line"].replace("*", ""), "how": it.get("delivery")})
+    return out
+
+
+def collection_props(folder: Path, d: dict, sfx: bool = True, voice=None) -> dict:
     sizes = [_size(Path(it["path"])) for it in d["items"]]
     mode = collection_mode(sizes)
     items, t = [], 0.0
     n_all = len(d["items"])
+    bs = collection_beats(d)
+    tl, clips, voice_end = _timeline(bs, voice) if bs else ([], [], 0.0)
+    title_end = TITLE_HOLD
+    if tl:
+        # работа сменяется чуть раньше своей строки; титул — пока звучит вступление
+        title_end = max(1.6, tl[1]["start"] - 0.3)
+        starts = [0.0] + [tl[k + 1]["start"] - 0.3 for k in range(1, n_all)]
+        last_end = max(voice_end, tl[-1]["end"]) + 1.0
     for n, (it, (pw, ph)) in enumerate(zip(d["items"], sizes)):
-        dur = SEG * (RHYTHM[(n - 1) % len(RHYTHM)] if n else 1.0) + (TITLE_HOLD if n == 0 else 0) \
-            + (0.8 if n == n_all - 1 else 0)
+        if tl:
+            nxt = starts[n + 1] if n + 1 < n_all else last_end
+            dur = nxt - starts[n]
+            t = starts[n]
+        else:
+            dur = SEG * (RHYTHM[(n - 1) % len(RHYTHM)] if n else 1.0) + (TITLE_HOLD if n == 0 else 0) \
+                + (0.8 if n == n_all - 1 else 0)
         row = {"image": it["path"], "pw": pw, "ph": ph, "start": round(t, 3), "dur": round(dur, 3),
                "title": it.get("title") or "", "author": it.get("author") or "", "year": str(it.get("year") or "")}
+        if tl:
+            row["line"] = tl[n + 1]["words"]
         if mode == "frame":
             k = min(BOX_W / pw, (BOX_BOTTOM - BOX_TOP) / ph)
             fw, fh = pw * k, ph * k
             row["frame"] = [round((W - fw) / 2, 1), round(BOX_BOTTOM - fh, 1), round(fw, 1), round(fh, 1)]
         items.append(row)
         t += dur
+    if tl:
+        t = last_end
     cap = re.split(r"(?<=[.!?])\s", (d.get("caption") or "").strip())[0] if d.get("caption") else ""
     ev = [(0.0, "page")] + [(it["start"] - 0.15, "page") for it in items[1:]]
     events = _sfx(folder, ev, d.get("title") or "") if sfx else []
-    dur = t + 0.3
-    return {"fps": FPS, "duration": round(dur * FPS), "items": items, "mode": mode, "textTop": TEXT_TOP,
-            "titleEnd": TITLE_HOLD, "title": d.get("title_em") or d.get("title") or "",
+    loop_start = t if LOOP else None
+    dur = t + (LOOP_BACK if LOOP else 0.3)
+    voice_path = None
+    if clips:
+        voice_path = folder / "voice_mix.wav"
+        _mix_voice(clips, dur, voice_path)
+    return {"fps": FPS, "duration": round(dur * FPS), "items": items, "mode": mode,
+            "textTop": TEXT_TOP - (60 if tl else 0), "captionBottom": 500 if tl else 430,
+            "titleEnd": round(title_end, 3), "title": d.get("title_em") or d.get("title") or "",
             "subtitle": cap if len(cap) <= 90 else "", "series": (d.get("title") or "").replace("*", ""),
+            "intro": tl[0]["words"] if tl else None, "loopStart": round(loop_start, 3) if loop_start else None,
+            "voice": str(voice_path) if voice_path else None, "coverT": 1.2,
             "sfx": events, "_dur": dur}
 
 
@@ -494,26 +903,54 @@ def render(comp: str, props: dict, folder: Path, out: Path) -> float:
             props["voice"] = fix(props["voice"])
         for it in props.get("items") or []:
             it["image"] = fix(it["image"])
+        for l in props.get("layers") or []:
+            l["src"] = fix(l["src"])
         for e in props.get("sfx") or []:
             e["src"] = fix(e["src"])
         pfile = folder / f"props_{comp}.json"
         pfile.write_text(json.dumps(props, ensure_ascii=False))
         raw = out.with_name(out.stem + "_raw.mp4")
         cmd = ["npx", "remotion", "render", str(BUNDLE), comp, str(raw), f"--props={pfile}",
-               f"--concurrency={CONCURRENCY}", "--crf=20", "--log=error"]
+               f"--concurrency={CONCURRENCY}", "--crf=16", "--color-space=bt709", "--log=error"]
         if os.getenv("REMOTION_BROWSER"):
             cmd.append(f"--browser-executable={os.getenv('REMOTION_BROWSER')}")
         r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=int(os.getenv("REMOTION_TIMEOUT", "1800")))
         if r.returncode != 0 or not raw.exists():
             raise RuntimeError(f"Remotion: {(r.stderr or r.stdout)[-400:]}")
-    # сжать под лимит Telegram и выровнять громкость
-    exe = reelrender.ffmpeg_exe()
-    has_audio = "Audio:" in subprocess.run([exe, "-hide_banner", "-i", str(raw)], capture_output=True, text=True).stderr
-    cmd = [exe, "-y", "-loglevel", "error", "-i", str(raw), "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-           "-maxrate", "9M", "-bufsize", "18M", "-pix_fmt", "yuv420p"]
-    # голос уже выровнен в _mix_voice; здесь только ограничитель пиков — тихие звуки не вытягиваются
-    cmd += (["-af", "alimiter=limit=0.89:level=disabled", "-c:a", "aac", "-b:a", "160k", "-ar", "44100"] if has_audio else ["-an"])
-    cmd += ["-movflags", "+faststart", str(out)]
-    subprocess.run(cmd, check=True, capture_output=True, timeout=900)
+    export(raw, out)
     raw.unlink(missing_ok=True)
     return float(props.get("_dur") or 0)
+
+
+# Экспорт под Instagram: 1080×1920, 30 к/с, H.264 High, битрейт 8–12 Мбит/с (ниже — мыло после пережатия Instagram,
+# выше — Instagram жмёт сильнее), метки цвета BT.709 (без них видео после загрузки «выцветает»), AAC 48 кГц.
+# Файл уходит в Telegram документом — до 50 МБ; не влез — второй проход с битрейтом пониже.
+EXPORT_MAXRATE = os.getenv("REEL_MAXRATE", "12M")
+TG_LIMIT = 49 * 1024 * 1024
+
+
+def export(raw: Path, out: Path) -> None:
+    exe = reelrender.ffmpeg_exe()
+    has_audio = "Audio:" in subprocess.run([exe, "-hide_banner", "-i", str(raw)], capture_output=True, text=True).stderr
+    for crf, maxrate in ((19, EXPORT_MAXRATE), (23, "7M")):
+        cmd = [exe, "-y", "-loglevel", "error", "-i", str(raw), "-c:v", "libx264", "-preset", "medium", "-profile:v", "high",
+               "-crf", str(crf), "-maxrate", maxrate, "-bufsize", "24M", "-pix_fmt", "yuv420p", "-r", "30", "-g", "60",
+               "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"]
+        # голос уже выровнен в _mix_voice; здесь только ограничитель пиков — тихие звуки не вытягиваются
+        cmd += (["-af", "alimiter=limit=0.89:level=disabled", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+                if has_audio else ["-an"])
+        cmd += ["-movflags", "+faststart", str(out)]
+        subprocess.run(cmd, check=True, capture_output=True, timeout=1200)
+        if out.stat().st_size <= TG_LIMIT:
+            return
+
+
+def cover(video: Path, t: float, dest: Path) -> Path | None:
+    """Кадр для обложки: хук уже целиком на экране. Хук стоит ниже шапки, поэтому переживает обрезку сетки до 3:4."""
+    try:
+        subprocess.run([reelrender.ffmpeg_exe(), "-y", "-loglevel", "error", "-ss", f"{max(0.0, t):.2f}", "-i", str(video),
+                        "-frames:v", "1", "-q:v", "2", str(dest)], check=True, capture_output=True, timeout=60)
+        return dest if dest.exists() else None
+    except Exception:
+        log.warning("Обложка рилса не получилась", exc_info=True)
+        return None
