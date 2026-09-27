@@ -25,7 +25,14 @@ def _taste_profile(raw: str) -> str:
     return out
 
 
+def _section(raw: str, n: int) -> str:
+    """Один раздел профиля («## 4. …») целиком — для коротких промптов, где весь профиль не нужен."""
+    m = re.search(rf"\n## {n}\..*?(?=\n## \d+\.|\Z)", "\n" + raw, flags=re.S)
+    return m.group(0).strip() if m else ""
+
+
 PROFILE = _taste_profile(config.PROFILE_PATH.read_text(encoding="utf-8"))
+PROFILE_FORMAT = _section(PROFILE, 4) or PROFILE   # правила заголовка и кредитов
 ARCHIVE = json.loads(config.ARCHIVE_PATH.read_text(encoding="utf-8"))
 def _within_repeat_window(p: dict) -> bool:
     """Пост из архива канала вышел не раньше REPEAT_DAYS назад? Старше — объект можно показать снова."""
@@ -151,6 +158,7 @@ async def _create(params: dict, background: bool) -> str:
         raise BudgetExceeded()
     messages = list(params["messages"])
     text = ""
+    resp = None
     for _ in range(4):  # веб-поиск может вернуть pause_turn — тогда продолжаем тот же ход
         try:
             resp = await client.messages.create(**{**params, "messages": messages})
@@ -161,7 +169,19 @@ async def _create(params: dict, background: bool) -> str:
         if resp.stop_reason != "pause_turn":
             break
         messages.append({"role": "assistant", "content": resp.content})
+    if not text.strip():
+        log.warning("Пустой ответ Claude: model=%s stop_reason=%s max_tokens=%s",
+                    params.get("model"), getattr(resp, "stop_reason", None), params.get("max_tokens"))
     return text
+
+
+async def _ask_json(params: dict, background: bool) -> dict:
+    """Запрос → JSON. Пустой ответ (весь запас токенов ушёл на размышления или поиск) — ещё раз
+    с запасом втрое больше: так было с «Claude вернул не JSON: ''» у рилсов и правил вкуса."""
+    text = await _create(params, background)
+    if not text.strip():
+        text = await _create({**params, "max_tokens": params["max_tokens"] * 3}, background)
+    return _parse_json(text)
 
 
 async def _call(content: list | str, *, system: str, model: str, max_tokens: int = 2000,
@@ -172,7 +192,7 @@ async def _call(content: list | str, *, system: str, model: str, max_tokens: int
               "messages": [{"role": "user", "content": content}]}
     if tools:
         params["tools"] = tools
-    return _parse_json(await _create(params, background))
+    return await _ask_json(params, background)
 
 
 async def ping() -> None:
@@ -280,6 +300,10 @@ photo_order — индексы превью в порядке публикаци
 }}
 Если оценка ниже {config.SCORE_THRESHOLD}, stoplist или already_posted — достаточно полей stoplist, already_posted, score, score_reason и category."""
 
+# Метка поста, который автор заказал сам (по ссылке или по запросу): по ней evaluate() понимает,
+# что оформление нужно полностью, даже если оценка низкая.
+FORCED_NOTE = "Автор канала сам прислал этот материал и хочет пост по нему."
+
 
 async def eval_context() -> str:
     """Общая для всех кандидатов прохода часть: недавние заголовки и отказы автора."""
@@ -302,8 +326,9 @@ def eval_params(context: str, source: str, url: str, title: str, text: str, imag
     if not allow_std:
         extra.append(f"Качественных фото меньше {config.MIN_PHOTOS_ARTICLE}: возможен только формат mini.")
     if forced:
-        extra.append("Автор канала сам прислал эту ссылку. Оценку поставь честно, но заполни все поля, "
-                     "даже при низкой оценке или совпадении со стоп-листом (отметь это во flags).")
+        extra.append(FORCED_NOTE + " Оценку поставь честно, но заполни ВСЕ поля ответа: headline_parts, "
+                     "mini_line, credits, tags, format, photo_order — даже при низкой оценке, совпадении "
+                     "со стоп-листом или повторе (это отметь во flags). Короткий ответ из пяти полей здесь не подходит.")
     content: list = [
         {"type": "text", "text": context, "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": (
@@ -320,8 +345,86 @@ def eval_params(context: str, source: str, url: str, title: str, text: str, imag
 
 
 async def evaluate(params: dict, background: bool = True) -> dict:
-    """Оценка сразу, без пакета: пост по ссылке и срочный сбор при пустом запасе."""
-    return _parse_json(await _create(params, background))
+    """Оценка сразу, без пакета: пост по ссылке и срочный сбор при пустом запасе.
+    У заказанного автором поста недостающее оформление (заголовок, теги, кредиты) дописывается отдельным шагом."""
+    data = await _ask_json(params, background)
+    if _is_forced(params) and _missing_branding(data):
+        data = await _complete_branding(data, params, background)
+    return data
+
+
+# ---------- оформление заказанного поста ----------
+
+BRAND_SYSTEM = f"""Ты оформляешь пост для Telegram-канала AHMAG (архитектура, искусство, фотография, архив, кино): заголовок, кредиты, теги и одну фразу для мини-поста. Автор канала сам заказал этот пост — оформи его полностью, оценка тут не нужна.
+
+# Правила заголовка и кредитов (из профиля канала)
+{PROFILE_FORMAT}
+
+# Заголовок
+headline_parts — части заголовка, как в примерах ниже: название; автор, бюро или режиссёр; город, страна, год (для фильма — страна и год). Неизвестное — null. Только факты из материала, ничего не выдумывай.
+Так выглядят заголовки канала:
+{HEADLINE_EXAMPLES}
+
+# Теги
+2–3, строчными, с префиксом ahmag: сначала рубрика (architecture, interiors, art, sculpture, photography, archive, cinema), затем страна по-английски одним словом. Для исторического материала добавь ahmagarchive.
+
+# Фраза мини-поста
+Одна простая фраза до 140 знаков: что это и что видно на фото, как сказал бы человек в переписке. Без «не X, а Y», без афоризмов и красивостей."""
+
+BRAND_FORMAT = """{
+  "category": "architecture|art|photography|archive|cinema",
+  "format": "std|mini",
+  "headline_parts": ["Название", "Автор/бюро/режиссёр или null", "Город, Страна, Год или null"],
+  "mini_line": "одна простая фраза",
+  "credits": {"pr": null, "pr_url": null, "ph": null, "ph_url": null, "via": null},
+  "tags": ["ahmagcinema", "ahmagitaly"]
+}"""
+
+
+def _is_forced(params: dict) -> bool:
+    content = params["messages"][0]["content"]
+    if isinstance(content, str):
+        return FORCED_NOTE in content
+    return any(isinstance(b, dict) and b.get("type") == "text" and FORCED_NOTE in (b.get("text") or "")
+               for b in content)
+
+
+def _real_parts(data: dict) -> list:
+    return [p for p in (data.get("headline_parts") or []) if p and str(p).strip().lower() != "null"]
+
+
+def _empty(v) -> bool:
+    if isinstance(v, dict):
+        return not any(x and str(x).strip().lower() != "null" for x in v.values())
+    return not v or str(v).strip().lower() == "null"
+
+
+def _missing_branding(data: dict) -> bool:
+    return not _real_parts(data) or not data.get("tags") or data.get("format") not in ("std", "mini")
+
+
+async def _complete_branding(data: dict, params: dict, background: bool) -> dict:
+    content = params["messages"][0]["content"]
+    blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
+    text = "\n\n".join(b["text"] for b in blocks
+                       if b.get("type") == "text" and "# Кандидат" in (b.get("text") or ""))
+    n_img = sum(1 for b in blocks if b.get("type") == "image")
+    log.info("Заказанный пост без оформления (score=%s) — дописываю заголовок и теги", data.get("score"))
+    fill = await _call(f"{text or '—'}\n\nОформи этот пост. Верни ТОЛЬКО JSON:\n{BRAND_FORMAT}",
+                       system=BRAND_SYSTEM, model=config.CLAUDE_MODEL, max_tokens=1000, background=background)
+    if not _real_parts(data) and _real_parts(fill):
+        data["headline_parts"] = fill["headline_parts"]
+    for k in ("mini_line", "credits", "tags", "category"):
+        if _empty(data.get(k)) and not _empty(fill.get(k)):
+            data[k] = fill[k]
+    if data.get("format") not in ("std", "mini"):
+        data["format"] = fill.get("format") if fill.get("format") in ("std", "mini") else (
+            "std" if n_img >= config.MIN_PHOTOS_ARTICLE else "mini")
+    if not data.get("photo_order") and n_img:
+        cap = config.EVAL_PHOTOS if data["format"] == "std" else config.MINI_MAX_PHOTOS
+        data["photo_order"] = list(range(min(n_img, cap)))
+    data["flags"] = list(data.get("flags") or []) + ["заголовок и теги дописаны отдельным шагом — проверь"]
+    return data
 
 
 # ---------- пакеты (Message Batches): вдвое дешевле, ответ — в пределах суток ----------
