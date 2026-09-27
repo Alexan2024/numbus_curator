@@ -28,6 +28,7 @@ DOW = os.getenv("TASTE_DOW", "sun")
 HOUR = int(os.getenv("TASTE_HOUR", "19"))
 MIN_STATS = int(os.getenv("TASTE_MIN_STATS", "20"))
 MAX_ACTIVE = 15
+MAX_TOKENS = 3000   # на 150 решений 1200 не хватало: ответ приходил пустым («Claude вернул не JSON: ''»)
 TARGET = {"select": "отбор", "write": "текст"}
 
 SCHEMA = """
@@ -141,7 +142,7 @@ async def propose() -> tuple[int, str]:
     text, n = await _material()
     if n < 10:
         return 0, f"решений за 60 дней пока {n} — нужно хотя бы 10"
-    data = await curator._call(text, system=SYSTEM, model=config.CLAUDE_MODEL, max_tokens=1200)
+    data = await curator._call(text, system=SYSTEM, model=config.CLAUDE_MODEL, max_tokens=MAX_TOKENS)
     have = {r["text"].strip().lower() for r in await rules()}
     added = 0
     async with db.connect() as c:
