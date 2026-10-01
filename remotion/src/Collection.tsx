@@ -12,20 +12,27 @@ import {Word} from './Narration';
 
 const OUT = 0.3, IN = 0.45;   // уход и появление работы, с
 
+// титул — 150 px; в русском длинное слово («Архитектурные») в такую строку не влезает — кегль меньше
+const titleSize = (title: string, lang?: string) => {
+  if (lang !== 'ru') return 150;
+  const longest = Math.max(...String(title || '').replace(/\*/g, '').split(/\s+/).map((w) => w.length), 1);
+  return Math.max(96, Math.min(150, Math.floor(900 / (0.5 * longest))));
+};
+
 const Line: React.FC<{words?: any[]; t: number}> = ({words, t}) => !words || !words.length ? null :
-  <div style={{marginTop: 26, fontFamily: 'Grot', fontSize: 38, fontWeight: 460, lineHeight: 1.2, letterSpacing: '-.006em',
+  <div style={{marginTop: 26, fontFamily: 'AhGrot', fontSize: 38, fontWeight: 460, lineHeight: 1.2, letterSpacing: '-.006em',
     maxWidth: 830}}>{words.map((w: any, j: number) => <Word key={j} w={w} t={t} size={38} />)}</div>;
 
 const Caption: React.FC<{it: any; i: number; total: number; t: number}> = ({it, i, total, t}) => <>
-  <div style={{fontFamily: 'Mono', fontSize: 21, letterSpacing: '.14em', color: MUTE, marginBottom: 24,
+  <div style={{fontFamily: 'AhMono', fontSize: 21, letterSpacing: '.14em', color: MUTE, marginBottom: 24,
     display: 'flex', gap: 18, alignItems: 'center'}}>
     <span style={{color: INK}}>{String(i + 1).padStart(2, '0')}</span>
     <span style={{width: 46, height: 1, background: MUTE}} />
     <span>{String(total).padStart(2, '0')}</span>
   </div>
-  <div style={{fontFamily: 'Serif', fontSize: it.title.length > 42 ? 64 : 76, lineHeight: .98,
+  <div style={{fontFamily: 'AhSerif', fontSize: it.title.length > 42 ? 64 : 76, lineHeight: .98,
     letterSpacing: '-.01em', textWrap: 'balance' as any}}><Rich text={it.title} /></div>
-  <div style={{marginTop: 22, fontFamily: 'Grot', fontSize: 30, fontWeight: 450, color: MUTE}}>
+  <div style={{marginTop: 22, fontFamily: 'AhGrot', fontSize: 30, fontWeight: 450, color: MUTE}}>
     {it.author}{it.year ? <>&nbsp;&nbsp;·&nbsp;&nbsp;{it.year}</> : null}</div>
   <Line words={it.line} t={t} />
 </>;
@@ -38,7 +45,7 @@ export const Collection: React.FC<any> = (p) => {
   const loopK = p.loopStart ? easeSine((t - p.loopStart) / Math.max(0.1, p.duration / p.fps - p.loopStart)) : 0;
 
   return <AbsoluteFill style={{background: '#0d0c0b', color: INK, overflow: 'hidden'}}>
-    <Fonts />
+    <Fonts lang={p.lang} />
     {p.items.map((it: any, i: number) => {
       const lt = t - it.start;
       if (lt < 0 || lt > it.dur) return null;
@@ -84,19 +91,19 @@ export const Collection: React.FC<any> = (p) => {
     {/* титул */}
     {Math.max(titleK, loopK) > 0 && <AbsoluteFill style={{opacity: Math.max(titleK, loopK)}}>
       <div style={{position: 'absolute', inset: 0, background: 'rgba(8,7,6,.55)'}} />
-      <div style={{position: 'absolute', left: M, top: 620, width: 900, fontFamily: 'Serif', fontSize: 150, lineHeight: .9,
+      <div style={{position: 'absolute', left: M, top: 620, width: 900, fontFamily: 'AhSerif', fontSize: titleSize(p.title, p.lang), lineHeight: .9,
         letterSpacing: '-.02em', textWrap: 'balance' as any,
         /* титул виден с первого кадра: первый кадр — уже ролик */}}>
         <Rich text={p.title} /></div>
       {p.intro && p.intro.length && titleK > 0 ? <div style={{position: 'absolute', left: M, top: 1040, width: 820,
-        fontFamily: 'Grot', fontSize: 44, fontWeight: 460, lineHeight: 1.2}}>
+        fontFamily: 'AhGrot', fontSize: 44, fontWeight: 460, lineHeight: 1.2}}>
         {p.intro.map((w: any, j: number) => <Word key={j} w={w} t={t} size={44} />)}</div>
-        : p.subtitle && titleK > 0 ? <div style={{position: 'absolute', left: M, top: 1040, width: 700, fontFamily: 'Grot', fontSize: 38,
+        : p.subtitle && titleK > 0 ? <div style={{position: 'absolute', left: M, top: 1040, width: 700, fontFamily: 'AhGrot', fontSize: 38,
         fontWeight: 450, lineHeight: 1.25, color: MUTE, textWrap: 'balance' as any,
         opacity: interpolate(t, [0.6, 1.3], [0, 1], out3)}}>{p.subtitle}</div> : null}
     </AbsoluteFill>}
 
-    <Bar text={t < p.titleEnd || loopK > 0 ? `Collection · ${total} works` : p.series} />
+    <Bar text={t < p.titleEnd || loopK > 0 ? (p.lang === 'ru' ? `Подборка · ${total} ${total % 10 >= 2 && total % 10 <= 4 && (total < 12 || total > 14) ? 'работы' : 'работ'}` : `Collection · ${total} works`) : p.series} />
     <Grain frame={frame} />
     {p.voice && <Audio src={p.voice} />}
     <Sfx list={p.sfx} fps={p.fps} />

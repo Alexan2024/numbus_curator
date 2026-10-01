@@ -7,32 +7,46 @@
                «Картина и место», «Кадр ← картина», «Что под слоем», «Какая из двух».
   collection — подборка работ разных авторов (Remotion: Collection).
 
-Рубрика — строка сверху кадра. Чередование форматов в автоплане — REEL_ROTATION (см. reels.next_kind)."""
+Рубрика — строка сверху кадра. Чередование форматов в автоплане — REEL_ROTATION (см. reels.next_kind).
+
+Язык (5.6): рилс бывает на английском (en) или на русском (ru). Промпты написаны по-английски; для русского
+к ним добавляется RU_RULES (как писать по-русски) и RU_NAMES (русские названия для экрана: название, автор,
+музей). Рубрика и подписи A / B — rubric_ru и roles_ru."""
 import os
 
 KINDS: dict[str, dict] = {
     "details": {"ru": "детали картины", "acc": "детали картины", "icon": "🔍", "engine": "story",
-                "rubric": os.getenv("REEL_RUBRIC", "Paintings, closely"), "obj": "картина", "subject": "painting"},
+                "rubric": os.getenv("REEL_RUBRIC", "Paintings, closely"), "rubric_ru": "Картины вблизи",
+                "obj": "картина", "subject": "painting"},
     "collection": {"ru": "подборка", "acc": "подборку", "icon": "🖼", "engine": "collection", "rubric": "",
                    "obj": "тема", "subject": "collection"},
     "photo": {"ru": "одна фотография", "acc": "«Одну фотографию»", "icon": "📷", "engine": "story",
-              "rubric": "Photographs, closely", "obj": "фотография", "subject": "photograph"},
+              "rubric": "Photographs, closely", "rubric_ru": "Фотографии вблизи", "obj": "фотография",
+              "subject": "photograph"},
     "scale": {"ru": "масштаб", "acc": "«Масштаб»", "icon": "🧍", "engine": "story",
-              "rubric": "Architecture, to scale", "obj": "здание", "subject": "building"},
+              "rubric": "Architecture, to scale", "rubric_ru": "Архитектура в масштабе", "obj": "здание",
+              "subject": "building"},
     "read": {"ru": "разбор здания", "acc": "разбор здания", "icon": "📐", "engine": "story",
-             "rubric": "Buildings, read closely", "obj": "здание", "subject": "building"},
+             "rubric": "Buildings, read closely", "rubric_ru": "Здание по линиям", "obj": "здание",
+             "subject": "building"},
     "plan": {"ru": "чертёж → здание", "acc": "«Чертёж → здание»", "icon": "✏️", "engine": "pair", "layout": "dissolve",
-             "rubric": "Drawn, then built", "obj": "пара", "roles": ("Drawn", "Built")},
+             "rubric": "Drawn, then built", "rubric_ru": "Нарисовано, потом построено", "obj": "пара",
+             "roles": ("Drawn", "Built"), "roles_ru": ("Чертёж", "Здание")},
     "thennow": {"ru": "тогда / сейчас", "acc": "«Тогда / сейчас»", "icon": "🕰", "engine": "pair", "layout": "wipe",
-                "rubric": "Then and now", "obj": "место", "roles": ("Then", "Now")},
+                "rubric": "Then and now", "rubric_ru": "Тогда и сейчас", "obj": "место",
+                "roles": ("Then", "Now"), "roles_ru": ("Тогда", "Сейчас")},
     "place": {"ru": "картина и место", "acc": "«Картину и место»", "icon": "📍", "engine": "pair", "layout": "wipe",
-              "rubric": "Painted, and real", "obj": "картина", "roles": ("Painted", "Real")},
+              "rubric": "Painted, and real", "rubric_ru": "На картине и наяву", "obj": "картина",
+              "roles": ("Painted", "Real"), "roles_ru": ("Картина", "Наяву")},
     "film": {"ru": "кадр ← картина", "acc": "«Кадр ← картина»", "icon": "🎞", "engine": "pair", "layout": "split",
-             "rubric": "Painting into film", "obj": "пара", "roles": ("Painting", "Film")},
+             "rubric": "Painting into film", "rubric_ru": "Из картины в кино", "obj": "пара",
+             "roles": ("Painting", "Film"), "roles_ru": ("Картина", "Фильм")},
     "layer": {"ru": "что под слоем", "acc": "«Что под слоем»", "icon": "🩻", "engine": "pair", "layout": "wipe",
-              "rubric": "Under the surface", "obj": "картина", "roles": ("Visible", "Beneath")},
+              "rubric": "Under the surface", "rubric_ru": "Под красочным слоем", "obj": "картина",
+              "roles": ("Visible", "Beneath"), "roles_ru": ("Видно", "Под слоем")},
     "which": {"ru": "какая из двух", "acc": "«Какую из двух»", "icon": "⚖️", "engine": "pair", "layout": "split",
-              "rubric": "Which one?", "obj": "пара", "roles": ("A", "B")},
+              "rubric": "Which one?", "rubric_ru": "Какая из двух?", "obj": "пара",
+              "roles": ("A", "B"), "roles_ru": ("А", "Б")},
 }
 ORDER = ["details", "photo", "scale", "read", "collection", "plan", "thennow", "place", "film", "layer", "which"]
 # автоплан: «детали» чаще остальных, пока статистика не подскажет другое
@@ -51,6 +65,77 @@ def acc(kind: str) -> str:
 
 def engine(kind: str) -> str:
     return KINDS.get(kind, {}).get("engine", "story")
+
+
+# ======================= язык =======================
+
+LANGS = {"en": "EN", "ru": "RU"}
+LANG_RU = {"en": "на английском", "ru": "на русском"}
+
+
+def lang_of(d: dict | None) -> str:
+    """Язык рилса: d["lang"]; старые рилсы без него — английские."""
+    lang = (d or {}).get("lang")
+    return lang if lang in LANGS else "en"
+
+
+def rubric(kind: str, lang: str = "en") -> str:
+    k = KINDS.get(kind, {})
+    return (k.get("rubric_ru") if lang == "ru" else None) or k.get("rubric", "")
+
+
+def roles(kind: str, lang: str = "en") -> tuple:
+    k = KINDS.get(kind, {})
+    return (k.get("roles_ru") if lang == "ru" else None) or k.get("roles", ("A", "B"))
+
+
+# подписи строк этикетки в конце story-рилса
+META_NAMES = {"details": ("Medium", "Size", "Collection"), "photo": ("Process", "Size", "Collection"),
+              "scale": ("Material", "Scale", "Place"), "read": ("Material", "Size", "Place")}
+META_NAMES_RU = {"details": ("Техника", "Размер", "Собрание"), "photo": ("Техника", "Размер", "Собрание"),
+                 "scale": ("Материал", "Масштаб", "Место"), "read": ("Материал", "Размеры", "Место")}
+
+
+def meta_names(kind: str, lang: str = "en") -> tuple | None:
+    return (META_NAMES_RU if lang == "ru" else META_NAMES).get(kind)
+
+
+RU_RULES = """LANGUAGE — RUSSIAN. The examples above are in English only to show the structure: do not translate them. Write every line that is spoken or shown on screen — hooks, context, reveals, climax, final, labels, figure_label, intro, the lines of the works, the on-screen title — and the caption in Russian, written in Russian from the start, not a translation from English. Keep in English: delivery, context_delivery, final_delivery, intro_delivery, voice_direction, target, type, and anything used to search for images. Where these Russian rules differ from the English ones above, follow the Russian rules.
+
+The voice: an older friend who knows art well and shows you something he loves, as if letting you in on a secret. Warm, curious, a little ironic. Never a lecturer, never an announcer. Example of the tone (structure only, do not reuse): «Хотите, покажу, на что тут почти никто не смотрит? На этом балу не смеётся только шут. Весь двор в соседнем зале, музыка, танцы. А он сидит один, почти в темноте. Видите письмо на столе? В нём новость: Смоленск взят Москвой. Война проиграна. А за дверью всё ещё танцуют.»
+
+How Russian should sound here:
+- Invite and steer the eye, addressing the viewer with «вы»: «Хотите, покажу…?», «Видите…?», «Теперь взгляните…», «Представляете:». One or two such questions or invitations per story, not in every line. A hook may be an invitation like this.
+- Short sentences, uneven living rhythm, fragments are fine («Музыка, танцы.»). Present tense for what we see.
+- Each reveal is a small discovery: point to the detail, name it, then say what it means. Lines are joined by cause and contrast: «а», «но», «поэтому», «потому что», «только». Never «а также», «кроме того», «теперь посмотрите на» as filler.
+- One ellipsis is allowed for suspense right before a key word («Самый грустный человек на этом балу... шут.»). No exclamation marks.
+- No officialese: no «является», «данный», «представляет собой», «осуществлять», «в рамках», no chains of genitives, no passive voice, no verbal nouns where a verb works.
+- No construction «не X, а Y» and no «это не просто X». No aphoristic closing line, no moral, no slogan: the final line is a fact about the work or the artist.
+- Never: шедевр, невероятный, потрясающий, культовый, легендарный, завораживающий, удивительный, гениальный, магия, «досмотрите до конца», «подписывайтесь», «вы не поверите». No emoji, no parentheses, no abbreviations (г., в., т. е., ок.), at most one dash in the whole story.
+- The narrator reads exactly what is written. Years in digits (1563); ages, counts and sizes in words the way people say them («двадцать четыре», «восемьдесят четыре колонны»). Write ё where it belongs (всё, ещё, её).
+- Names in the standard Russian form (Ян Матейко, Доротея Ланг, Андреа Палладио, Фриц Ланг, музей Прадо); titles of works as in Russian Wikipedia or Russian museum practice, otherwise a plain Russian translation. Film titles — as released in Russian.
+- 55–70 words in total; keep each part shorter than its limit in words.
+- *Emphasis* with asterisks and the ^ mark work exactly as described above: the asterisk word is the one the narrator leans on; ^ goes on a Russian word.
+- Delivery hints (in English) become the narrator's intonation. Build them from these words: "curious" for invitations and discoveries, "wry" for the ironic beat, "whisper" for the single most hidden detail (at most once per story), "soft" for the turn, "thoughtful" for the final line. Keep each hint short.
+- hashtags — 5–8 lowercase words without #, mostly Russian, multi-word tags written together (историяискусства); one or two English ones are fine."""
+
+RU_NAMES = """The reel is in Russian, so the screen shows Russian names. Keep "title", "author", "museum", "medium" and "size" in English (they are used to find and check the image) and add "ru": {"title": "...", "author": "...", "museum": "...", "medium": "...", "size": "..."} — the established Russian title of the work (Russian Wikipedia or Russian museum practice, otherwise a plain translation), the author's name in the standard Russian form, the museum or place in Russian ("Национальный музей, Варшава"), technique and size in Russian ("Холст, масло", "88 × 120 см"); leave a field empty if unknown."""
+
+RU_NAMES_PAIR = """The reel is in Russian. Keep every field as described, in English, and add to the top level "title_ru" — the short reel name in Russian — and inside "a" and "b" a "ru": {"title": "...", "author": "...", "museum": "..."} with the established Russian title of the work, the author's name in the standard Russian form and the museum or place in Russian."""
+
+RU_NAMES_WORKS = """The reel is in Russian. The on-screen "title" of the collection, "theme_ru", "intro", every "line" and the caption are in Russian. Each work keeps "title", "author" and "commons" in English or the original language (they are used to find the image) and adds "title_ru" — the established Russian title (Russian Wikipedia or Russian museum practice, otherwise a plain translation) — and "author_ru" — the author's name in the standard Russian form."""
+
+
+def localize(system: str, lang: str, names: str = "") -> str:
+    """Промпт для языка рилса: для русского — правила русского текста и русские названия для экрана."""
+    if lang != "ru":
+        return system
+    return system + "\n\n" + RU_RULES + ("\n\n" + names if names else "")
+
+
+def localize_pick(system: str, lang: str, names: str = RU_NAMES) -> str:
+    """Промпт выбора объекта: тексты не пишутся, нужны только русские названия."""
+    return system + ("\n\n" + names if lang == "ru" else "")
 
 
 # ======================= общие правила текста =======================

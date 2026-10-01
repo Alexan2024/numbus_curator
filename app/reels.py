@@ -14,8 +14,14 @@
 Картинки — из Wikimedia Commons, The Met и Cleveland Museum of Art (открытый доступ) в высоком разрешении,
 кадры из кино — TMDB. Какая из найденных — та самая работа, Claude проверяет глазами по превью.
 
-Расписание: REELS_DAYS (пн, ср, пт) в REELS_TIME (18:30). Накануне в REELS_BUILD_TIME (13:00) бот собирает
-рилс на завтра и присылает карточку: видео, работы, музыка. ✅ Беру / 🔁 Переделать / ❌ Не надо.
+Язык (5.6): каждый рилс — на английском или на русском, выбор кнопкой RU / EN при создании. Русский рилс:
+рассказ, подписи на экране, названия работ, подпись в Instagram и хэштеги — по-русски, читает русский голос
+(🎙 Голоса → RU), антиква с кириллицей. «🌐 На другом языке» в «Переделать» — тот же объект, новый рассказ.
+
+Расписание: REELS_DAYS (пн, ср, пт) в REELS_TIME (18:30). Накануне в REELS_ASK_TIME (10:00) бот спрашивает,
+какой формат и язык собрать на завтра; выбрал — рилс собирается сразу. Не ответил до REELS_BUILD_TIME (13:00) —
+бот собирает сам: формат по кругу, язык — как в прошлый раз. Потом присылает карточку: видео, работы, музыка.
+✅ Беру / 🔁 Переделать / ❌ Не надо.
 В день выхода в REELS_TIME приходит «Пора выкладывать»: видео файлом без сжатия, подпись одним блоком
 (нажать — скопируется), треки. Выложил — «✅ Выложил». Рилс по запросу — экран «🎬 Рилсы» на пульте.
 
@@ -59,6 +65,7 @@ ENABLED = os.getenv("REELS", "1").strip().lower() not in ("0", "off", "false", "
 DOW = [d.strip().lower() for d in os.getenv("REELS_DAYS", "mon,wed,fri").split(",") if d.strip()]
 TIME = _hm(os.getenv("REELS_TIME", "18:30"))
 BUILD_TIME = _hm(os.getenv("REELS_BUILD_TIME", "13:00"))
+ASK_TIME = _hm(os.getenv("REELS_ASK_TIME", "10:00"))     # вопрос «какой формат завтра»; должен быть раньше сборки
 TOPICS = [t.strip() for t in os.getenv("REEL_TOPICS", "art,architecture,photography,art,architecture,archive").split(",")
           if t.strip()]
 MAX_ITEMS = int(os.getenv("REEL_MAX_ITEMS", "8"))
@@ -762,7 +769,52 @@ async def _next_topic() -> str:
     return TOPICS[i % len(TOPICS)] if TOPICS else "art"
 
 
-def _credits(items: list[dict]) -> str:
+def _disp(it: dict | None, lang: str) -> dict:
+    """Работа так, как её показать на экране и в подписи: в русском рилсе — русские название, автор, музей,
+    техника и размер, если Claude их дал (поле ru; у работ подборки — title_ru и author_ru)."""
+    it = dict(it or {})
+    if lang != "ru":
+        return it
+    ru = it.get("ru") if isinstance(it.get("ru"), dict) else {}
+    ru = {**ru, **{k: it[f"{k}_ru"] for k in ("title", "author") if it.get(f"{k}_ru")}}
+    for k in ("title", "author", "museum", "medium", "size"):
+        if str(ru.get(k) or "").strip():
+            it[k] = str(ru[k]).strip()
+    return it
+
+
+NAMES_SYSTEM = """You give Russian display names for an Instagram reel in Russian. For each numbered line give: title — the established Russian title of the work (Russian Wikipedia or Russian museum practice; otherwise a plain Russian translation), author — the name in the standard Russian form, museum — the museum or place in Russian ("Национальный музей, Варшава"), medium and size in Russian ("Холст, масло", "88 × 120 см"). Leave a field empty if the line does not have it. Line 0, if present, is the short name of the reel itself: give only its title.
+
+Return ONLY JSON: {"items": [{"i": 1, "title": "...", "author": "...", "museum": "...", "medium": "...", "size": "..."}]}"""
+
+
+async def _ensure_ru(its: list[dict], background: bool, reel_name: dict | None = None) -> None:
+    """Русские названия для экрана, если их нет (рилс переделывают на русский — объект выбирался для английского).
+    reel_name — пара: её короткое имя (title → title_ru). Не вышло — останутся английские."""
+    need = [it for it in its if not (it.get("ru") or {}).get("title")]
+    ask_name = reel_name is not None and not reel_name.get("title_ru") and reel_name.get("title")
+    if not need and not ask_name:
+        return
+    lines = ([f"0. {reel_name['title']}"] if ask_name else []) + [
+        f"{n}. {it.get('title')} — {it.get('author') or ''}; museum: {it.get('museum') or ''}; "
+        f"medium: {it.get('medium') or ''}; size: {it.get('size') or ''}" for n, it in enumerate(need, 1)]
+    try:
+        res = await _ask("\n".join(lines), system=NAMES_SYSTEM, max_tokens=1200, background=background)
+    except Exception:
+        log.warning("Русские названия не получены — останутся английские", exc_info=True)
+        return
+    for x in res.get("items") or []:
+        try:
+            i = int(x.get("i"))
+        except (TypeError, ValueError):
+            continue
+        if i == 0 and ask_name and x.get("title"):
+            reel_name["title_ru"] = str(x["title"]).strip()
+        elif 1 <= i <= len(need):
+            need[i - 1]["ru"] = {k: str(x.get(k) or "").strip() for k in ("title", "author", "museum", "medium", "size")}
+
+
+def _credits(items: list[dict], lang: str = "en") -> str:
     """Авторы фото из Commons, если лицензия требует указать автора (не общественное достояние)."""
     need = []
     for it in items:
@@ -774,12 +826,14 @@ def _credits(items: list[dict]) -> str:
         lic = it.get("license") or ""
         src.append("The Met" if "The Met" in lic else "Cleveland Museum of Art" if "Cleveland" in lic
                    else "film still" if "film" in lic else "Wikimedia Commons")
-    base = "Images: " + ", ".join(dict.fromkeys(x for x in src if x != "film still")) if src else "Images: Wikimedia Commons"
-    return base + (". Photos: " + "; ".join(dict.fromkeys(need)) if need else "")
+    head, photos = ("Изображения: ", ". Фото: ") if lang == "ru" else ("Images: ", ". Photos: ")
+    base = head + (", ".join(dict.fromkeys(x for x in src if x != "film still")) if src else "Wikimedia Commons")
+    return base + (photos + "; ".join(dict.fromkeys(need)) if need else "")
 
 
 def _tags(tags: list, extra: str) -> str:
-    clean = [re.sub(r"[^a-z0-9_]", "", str(t).lower()) for t in tags or []]
+    # \w — и латиница, и кириллица: русские хэштеги не теряются
+    clean = [re.sub(r"[^\w]", "", str(t).lower()) for t in tags or []]
     out = ["ahmag", extra] + [t for t in clean if t and t not in ("ahmag", extra)]
     return " ".join(f"#{t}" for t in list(dict.fromkeys(out))[:10])
 
@@ -787,15 +841,17 @@ def _tags(tags: list, extra: str) -> str:
 def build_caption(r_kind: str, d: dict) -> str:
     if d.get("caption_override"):
         return d["caption_override"]
+    lang = rk.lang_of(d)
     if r_kind == "collection":
         lines = [d.get("title", ""), "", d.get("caption", "").strip(), ""]
         for n, it in enumerate(d.get("items") or [], 1):
-            lines.append(f"{n}. {it.get('title')} — {it.get('author')}" + (f", {it['year']}" if it.get("year") else ""))
-        lines += ["", _credits(d.get("items") or []), "", _tags(d.get("hashtags"), "ahmagreels")]
+            w = _disp(it, lang)
+            lines.append(f"{n}. {w.get('title')} — {w.get('author')}" + (f", {w['year']}" if w.get("year") else ""))
+        lines += ["", _credits(d.get("items") or [], lang), "", _tags(d.get("hashtags"), "ahmagreels")]
     else:
         hook = hook_text(d)
         its = [d["pair"]["a"], d["pair"]["b"]] if d.get("pair") else [d.get("painting") or {}]
-        lines = ([hook, ""] if hook else []) + [d.get("caption", "").strip(), "", _credits(its), "",
+        lines = ([hook, ""] if hook else []) + [d.get("caption", "").strip(), "", _credits(its, lang), "",
                  _tags(d.get("hashtags"), "ahmagreels")]
     return "\n".join(lines).strip()[:2150]
 
@@ -808,13 +864,15 @@ _gen_lock = asyncio.Lock()
 async def _collection(rid: int, d: dict, background: bool, client: httpx.AsyncClient) -> dict:
     from app import curator
     folder = DIR / str(rid)
+    lang = rk.lang_of(d)
     if not d.get("items"):
         topic = d.get("topic") or await _next_topic()
         req = d.get("request")
         prompt = ((f"Theme requested by the author: {req}\n" if req else
                    f"Area for this reel: {topic} — {TOPIC_HINT.get(topic, topic)}.\n")
                   + "Avoid these earlier reel titles:\n" + ("\n".join(await _avoid("collection")) or "—"))
-        plan = await _ask(prompt, system=COLLECTION_SYSTEM, max_tokens=4000, background=background)
+        plan = await _ask(prompt, system=rk.localize(COLLECTION_SYSTEM, lang, rk.RU_NAMES_WORKS), max_tokens=4000,
+                          background=background)
         works = [w for w in plan.get("works") or [] if w.get("title")]
         if not works:
             raise ReelError("Claude не предложил работ")
@@ -827,7 +885,8 @@ async def _collection(rid: int, d: dict, background: bool, client: httpx.AsyncCl
                 + "\nAlready in the reel: " + "; ".join(f"{w['title']} — {w['author']}" for w in good)
                 + "\nNot found on Commons: " + "; ".join(w["title"] for w in works
                                                            if w["title"] not in {g["title"] for g in good})
-                + f"\nGive {MAX_ITEMS} more works.", system=MORE_SYSTEM, max_tokens=2500, background=background)
+                + f"\nGive {MAX_ITEMS} more works.", system=rk.localize(MORE_SYSTEM, lang, rk.RU_NAMES_WORKS),
+                max_tokens=2500, background=background)
             good += await verify(client, (more.get("works") or [])[:MAX_ITEMS], background, max_aspect=tall)
         if vertical and len(good) < MIN_ITEMS:
             # вертикальных не хватило — подборка станет «целиком», добираем любые
@@ -846,7 +905,8 @@ async def _collection(rid: int, d: dict, background: bool, client: httpx.AsyncCl
         if not path.exists():
             await fetch_image(client, it, path)
         it["path"] = str(path)
-    render_items = [{"path": it["path"], "label": it["title"], "sub": f"By {it['author']}",
+    render_items = [{"path": it["path"], "label": _disp(it, lang)["title"],
+                     "sub": _disp(it, lang)["author"] if lang == "ru" else f"By {it['author']}",
                      "focus": it.get("focus") or [0.5, 0.5]} for it in d["items"]]
     video = folder / f"reel_{int(datetime.now().timestamp())}.mp4"
     d.pop("render_note", None)
@@ -868,21 +928,18 @@ async def _collection(rid: int, d: dict, background: bool, client: httpx.AsyncCl
     return d
 
 
-META_NAMES = {"details": ("Medium", "Size", "Collection"), "photo": ("Process", "Size", "Collection"),
-              "scale": ("Material", "Scale", "Place"), "read": ("Material", "Size", "Place")}
-
-
 async def _details(rid: int, d: dict, background: bool, client: httpx.AsyncClient) -> dict:
     """Одна картинка, камера по деталям: детали картины, одна фотография, масштаб, разбор здания."""
     from app import curator
     kind = d.get("kind") or "details"
     folder = DIR / str(rid)
+    lang = rk.lang_of(d)
     if not d.get("painting"):
         req = d.get("request")
         prompt = ((f"The author asks for: {req}\n" if req else "")
                   + "Avoid (already done):\n" + (("\n".join(await _avoid(kind))) or "—"))
         tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
-        system = PAINTING_SYSTEM if kind == "details" else rk.PICK[kind]
+        system = rk.localize_pick(PAINTING_SYSTEM if kind == "details" else rk.PICK[kind], lang)
         p = await _ask(prompt, system=system, max_tokens=4000, tools=tools, background=background)
         if not p.get("title"):
             raise ReelError(f"Claude не выбрал: {rk.KINDS[kind]['obj']}")
@@ -908,7 +965,7 @@ async def _details(rid: int, d: dict, background: bool, client: httpx.AsyncClien
                 + "\n".join(f"- {f}" for f in d.get("facts") or [])
                 + ("\n\nThe previous version used these details and lines, choose others where possible:\n"
                    + "\n".join(avoid) if avoid else ""))
-        system = STORY_SYSTEM if kind == "details" else rk.story_system(kind)
+        system = rk.localize(STORY_SYSTEM if kind == "details" else rk.story_system(kind), lang)
         st = await _ask([block, {"type": "text", "text": text}], system=system, max_tokens=5000,
                         background=background)
         hooks = [h for h in st.get("hooks") or [] if h.get("text")]
@@ -932,15 +989,18 @@ async def _details(rid: int, d: dict, background: bool, client: httpx.AsyncClien
         d.update(caption=st.get("caption") or "", hashtags=st.get("hashtags") or [])
         n = await refine_boxes(path, d["story"], background)
         log.info("Рилс: уточнил рамок %s", n)
-    end = [f"{pt['title']}" + (f", {pt['year']}" if pt.get("year") else ""), pt.get("author") or "",
-           pt.get("museum") or ""]
+    if lang == "ru":
+        await _ensure_ru([pt], background)
+    show = _disp(pt, lang)
+    end = [f"{show['title']}" + (f", {show['year']}" if show.get("year") else ""), show.get("author") or "",
+           show.get("museum") or ""]
     bs = beats(d)
     voice = await _voice(folder, d, bs)
     video = folder / f"reel_{int(datetime.now().timestamp())}.mp4"
     d.pop("render_note", None)
     if reelplan.available():
         try:
-            info = {**pt, "rubric": rk.KINDS[kind]["rubric"], "meta_names": META_NAMES.get(kind)}
+            info = {**show, "rubric": rk.rubric(kind, lang), "meta_names": rk.meta_names(kind, lang), "lang": lang}
             props = await asyncio.to_thread(reelplan.story_props, folder, path, bs, voice, info, await sfx_on())
             d["duration"] = await asyncio.to_thread(reelplan.render, "Story", props, folder, video)
             d["video"], d["cover_t"] = str(video), props.get("coverT")
@@ -961,18 +1021,20 @@ async def _pair(rid: int, d: dict, background: bool, client: httpx.AsyncClient) 
     kind = d.get("kind")
     spec = rk.KINDS[kind]
     folder = DIR / str(rid)
+    lang = rk.lang_of(d)
     if not d.get("pair"):
         req = d.get("request")
         prompt = ((f"The author asks for: {req}\n" if req else "")
                   + "Avoid (already done):\n" + (("\n".join(await _avoid(kind))) or "—"))
         tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}]
-        p = await _ask(prompt, system=rk.pair_pick_system(kind), max_tokens=4000, tools=tools, background=background)
+        p = await _ask(prompt, system=rk.localize_pick(rk.pair_pick_system(kind), lang, rk.RU_NAMES_PAIR), max_tokens=4000,
+                       tools=tools, background=background)
         a, b = p.get("a") or {}, p.get("b") or {}
         if not a.get("title") or not b.get("title"):
             raise ReelError("Claude не подобрал пару")
         got = []
         for side, role in ((a, spec["roles"][0]), (b, spec["roles"][1])):
-            w = {k: side.get(k) for k in ("title", "author", "year", "museum", "commons", "role")}
+            w = {k: side.get(k) for k in ("title", "author", "year", "museum", "commons", "role", "ru")}
             w["need"] = rk.PAIR_NEED.get(side.get("role") or "", "") or rk.PAIR_NEED.get(role, "")
             if kind == "film" and side is b:
                 w["cands"] = await tmdb_candidates(client, b.get("film") or {"title": b.get("title"), "year": b.get("year")})
@@ -983,7 +1045,8 @@ async def _pair(rid: int, d: dict, background: bool, client: httpx.AsyncClient) 
             if not good:
                 raise ReelError(f"не нашлось хорошей картинки «{w['title']}» — попробуй другую пару")
             got.append(good[0])
-        d.update(pair={"a": got[0], "b": got[1], "title": p.get("title") or a["title"], "answer": p.get("answer")},
+        d.update(pair={"a": got[0], "b": got[1], "title": p.get("title") or a["title"], "answer": p.get("answer"),
+                       "title_ru": p.get("title_ru") or ""},
                  title=p.get("title") or a["title"], music=(p.get("music") or [])[:3], facts=p.get("facts") or [])
         d.pop("story", None)
     pr = d["pair"]
@@ -1006,7 +1069,8 @@ async def _pair(rid: int, d: dict, background: bool, client: httpx.AsyncClient) 
         text = ("Facts:\n" + "\n".join(f"- {f}" for f in d.get("facts") or [])
                 + (f"\nThe answer to the question: image {str(pr.get('answer')).upper()}" if kind == "which" and pr.get("answer") else "")
                 + ("\n\nThe previous version used these lines, write a different story:\n" + "\n".join(avoid) if avoid else ""))
-        st = await _ask(blocks + [{"type": "text", "text": text}], system=rk.pair_story_system(kind), max_tokens=5000,
+        st = await _ask(blocks + [{"type": "text", "text": text}], system=rk.localize(rk.pair_story_system(kind), lang),
+                        max_tokens=5000,
                         background=background)
         hooks = [h for h in st.get("hooks") or [] if h.get("text")]
         reveals = [r for r in st.get("reveals") or [] if r.get("text")][:4]
@@ -1052,17 +1116,21 @@ async def _pair(rid: int, d: dict, background: bool, client: httpx.AsyncClient) 
     ra, rb = sizes[0][0] / sizes[0][1], sizes[1][0] / sizes[1][1]
     if layout in ("wipe", "dissolve") and max(ra, rb) / min(ra, rb) > 1.6:
         layout = "split"            # слишком разные пропорции: общее окно срежет полкартинки — показываем каждую целиком
-    roles = spec["roles"]
+    roles = rk.roles(kind, lang)
+    if lang == "ru":
+        await _ensure_ru([pr["a"], pr["b"]], background, reel_name=pr)
+    sa, sb = _disp(pr["a"], lang), _disp(pr["b"], lang)
+    name = (pr.get("title_ru") if lang == "ru" else None) or pr.get("title") or d.get("title") or ""
 
     def who(it):
         return ", ".join(x for x in (it.get("author"), str(it.get("year") or "")) if x and x != "None")
-    tags = [f"{roles[0]}" + (f" · {pr['a']['year']}" if pr["a"].get("year") and kind != "which" else ""),
-            f"{roles[1]}" + (f" · {pr['b']['year']}" if pr["b"].get("year") and kind != "which" else "")]
-    meta = [[roles[0], f"{pr['a'].get('title')}" + (f", {who(pr['a'])}" if who(pr['a']) else "")],
-            [roles[1], f"{pr['b'].get('title')}" + (f", {who(pr['b'])}" if who(pr['b']) else "")]]
-    info = {"title": pr.get("title") or d.get("title") or "", "rubric": spec["rubric"], "roles": roles, "tags": tags,
+    tags = [f"{roles[0]}" + (f" · {sa['year']}" if sa.get("year") and kind != "which" else ""),
+            f"{roles[1]}" + (f" · {sb['year']}" if sb.get("year") and kind != "which" else "")]
+    meta = [[roles[0], f"{sa.get('title')}" + (f", {who(sa)}" if who(sa) else "")],
+            [roles[1], f"{sb.get('title')}" + (f", {who(sb)}" if who(sb) else "")]]
+    info = {"title": name, "rubric": rk.rubric(kind, lang), "roles": roles, "tags": tags,
             "meta": meta, "focus": [pr["a"].get("focus") or [0.5, 0.5], pr["b"].get("focus") or [0.5, 0.5]],
-            "series": pr.get("title") or ""}
+            "series": name, "lang": lang}
     if kind == "plan":
         info.update(ink=True, paper=reelplan.paper_color(paths[0]))
     props = await asyncio.to_thread(reelplan.pair_props, folder, paths, bs, voice, info, layout, await sfx_on())
@@ -1075,9 +1143,11 @@ async def _voice(folder: Path, d: dict, bs: list[dict]) -> list | dict | None:
     """Озвучить вступление и фразы деталей. Уже озвученное (тот же текст, тот же голос) не синтезируется заново.
     Не вышло — рилс собирается без звука, а в d["voice_note"] — почему."""
     d.pop("voice_note", None)
-    if await tts.provider() == "off":
+    lang = rk.lang_of(d)
+    if await tts.provider(lang) == "off":
         return None
-    vkey = await tts.current_key()
+    vkey = await tts.current_key(lang)
+    spare = tts.FALLBACK[lang]
     if tts.is_one_take(vkey):
         parts = [(b["kind"], b["text"], b.get("how") or "") for b in bs]
         extra = (d.get("story") or {}).get("voice_direction") or ""
@@ -1092,7 +1162,7 @@ async def _voice(folder: Path, d: dict, bs: list[dict]) -> list | dict | None:
                 d["voice_label"] = _voice_label(v, hit)
                 return hit
             try:
-                res = await tts.speak_story(parts, folder / "voice" / f"take_{key}", extra, v)
+                res = await tts.speak_story(parts, folder / "voice" / f"take_{key}", extra, v, lang)
                 if res.get("approx"):
                     d["voice_note"] = "время слов не сошлось с текстом — слова идут по голосу приблизительно"
                 if fails:
@@ -1104,7 +1174,7 @@ async def _voice(folder: Path, d: dict, bs: list[dict]) -> list | dict | None:
                 log.warning("Рилс: дубль %s не получился", v, exc_info=True)
                 fails.append(str(exc)[:120] or type(exc).__name__)
         d["voice_note"] = f"{fails[0]} — прочитал запасной голос"
-        vkey = "kokoro:af_heart"
+        vkey = spare
     cache = d.get("voice") or {}
     texts = [(b["text"], b.get("how") or "") for b in bs]
     out = []
@@ -1115,8 +1185,8 @@ async def _voice(folder: Path, d: dict, bs: list[dict]) -> list | dict | None:
             if hit and Path(hit["audio"]).exists():
                 out.append(hit)
                 continue
-            res = (await tts.speak(text, folder / "voice" / key, how or None) if not vkey.startswith("kokoro:af_heart")
-                   or not d.get("voice_note") else await tts._speak_with(vkey, text, folder / "voice" / key))
+            res = (await tts.speak(text, folder / "voice" / key, how or None, lang) if vkey != spare
+                   or not d.get("voice_note") else await tts._speak_with(vkey, text, folder / "voice" / key, lang=lang))
             if res and res.get("fallback"):
                 d["voice_note"] = res["fallback"]
             if res and not res.get("fallback"):     # запасной голос не запоминаем — в следующий раз попробуем выбранный
@@ -1175,10 +1245,19 @@ def start(bot: Bot, rid: int, background: bool = False) -> None:
 
 
 async def new(bot: Bot, kind: str, request: str | None = None, day: str | None = None,
-              background: bool = False) -> int:
-    rid = await _add(kind, day or await free_day(), {"request": request} if request else {})
+              background: bool = False, lang: str = "en") -> int:
+    lang = lang if lang in rk.LANGS else "en"
+    day = day or await free_day()
+    rid = await _add(kind, day, {"lang": lang, **({"request": request} if request else {})})
+    await db.set_setting("reel_last_lang", lang)
+    await _drop_ask(bot, day)                   # на этот день рилс уже есть — вопрос о формате не нужен
     start(bot, rid, background)
     return rid
+
+
+def lang_rows(prefix: str) -> list:
+    """Кнопки языка: callback = prefix + en | ru."""
+    return [[btn("RU · по-русски", f"{prefix}ru"), btn("EN · in English", f"{prefix}en")]]
 
 
 # ======================= карточка =======================
@@ -1196,7 +1275,10 @@ def _card_text(r, d: dict, note: str | None = None) -> str:
     when = f"{human(r['day'])} в {TIME[0]:02d}:{TIME[1]:02d}"
     st = {"ready": "ждёт решения", "approved": "одобрен", "sent": "ждёт публикации", "posted": "выложен"}.get(
         r["status"], r["status"])
-    lines = [f"🎬 <b>Рилс · {KIND_RU.get(r['kind'], r['kind'])}</b> · {when} · {st}"]
+    lang = rk.lang_of(d)
+    lines = [f"🎬 <b>Рилс · {KIND_RU.get(r['kind'], r['kind'])} · {rk.LANGS[lang]}</b> · {when} · {st}"]
+    if d.get("auto_pick") and r["status"] == "ready":
+        lines.append("<i>Формат не выбрал — собрал сам: формат по кругу, язык как в прошлый раз.</i>")
     if note:
         lines.append(f"<b>{html.escape(note)}</b>")
     if r["kind"] == "collection":
@@ -1205,14 +1287,16 @@ def _card_text(r, d: dict, note: str | None = None) -> str:
         if d.get("intro") and d.get("voice"):
             lines.append(f"🪝 <b>{html.escape(d['intro'].replace('*', ''))}</b>")
         for n, it in enumerate(d.get("items") or [], 1):
-            lines.append(f"{n}. {html.escape(it['title'])} — {html.escape(it['author'])}"
-                         + (f", {html.escape(str(it['year']))}" if it.get("year") else ""))
+            w = _disp(it, lang)
+            lines.append(f"{n}. {html.escape(w['title'])} — {html.escape(w['author'])}"
+                         + (f", {html.escape(str(w['year']))}" if w.get("year") else ""))
     else:
         def line(it):
+            it = _disp(it, lang)
             return (f"<b>{html.escape(it.get('title') or '')}</b> — {html.escape(it.get('author') or '')}"
                     + (f", {html.escape(str(it['year']))}" if it.get("year") else ""))
         if d.get("pair"):
-            roles = rk.KINDS.get(r["kind"], {}).get("roles", ("A", "B"))
+            roles = rk.roles(r["kind"], lang)
             lines.append(f"\n{roles[0]}: {line(d['pair']['a'])}\n{roles[1]}: {line(d['pair']['b'])}")
         else:
             lines.append("\n" + line(d.get("painting") or {}))
@@ -1236,7 +1320,7 @@ def _card_text(r, d: dict, note: str | None = None) -> str:
         lines.append(f"\n⚠️ {html.escape(d['render_note'])}")
     if r["kind"] != "collection" or d.get("voice"):
         lines.append("\n" + (f"⚠️ {html.escape(d['voice_note'])}" if d.get("voice_note") else f"🎙 {html.escape(d.get('voice_label') or '')}"))
-    lines.append(f"\n⏱ {d.get('duration', 0):.0f} с · подпись на английском придёт в день выхода")
+    lines.append(f"\n⏱ {d.get('duration', 0):.0f} с · подпись {rk.LANG_RU[lang]} придёт в день выхода")
     text = "\n".join(lines)
     return text if len(text) <= 1024 else text[:1020] + "…"
 
@@ -1254,8 +1338,10 @@ def _card_kb(r, sub: str | None = None) -> InlineKeyboardMarkup:
                           + [[btn("← Назад", f"rl:redo:{rid}")]])
     if sub == "redo":
         rows = []
+        other_lang = btn("🌐 Переделать в EN" if rk.lang_of(d) == "ru" else "🌐 Переделать в RU", f"rl:lang:{rid}")
         if r["kind"] == "collection":
             rows.append([btn("🔀 Другая тема", f"rl:theme:{rid}"), btn("🔄 Другой формат", f"rl:kinds:{rid}")])
+            rows.append([other_lang])
             nums = [btn(f"🖼 {n}", f"rl:rep:{rid}:{n}") for n in range(1, len(d.get("items") or []) + 1)]
             if nums:
                 rows.append([btn("Заменить работу:", "rl:noop")])
@@ -1267,7 +1353,7 @@ def _card_kb(r, sub: str | None = None) -> InlineKeyboardMarkup:
             other = {"картина": "Другая картина", "фотография": "Другая фотография", "здание": "Другое здание",
                      "пара": "Другая пара", "место": "Другое место"}.get(obj, "Другой объект")
             rows.append([btn(f"🔀 {other}", f"rl:theme:{rid}"), btn("🎯 Другой сюжет", f"rl:det:{rid}")])
-            rows.append([btn("🔄 Другой формат", f"rl:kinds:{rid}")])
+            rows.append([btn("🔄 Другой формат", f"rl:kinds:{rid}"), other_lang])
         rows.append([btn("✏️ Подпись", f"rl:cap:{rid}"), btn("← Назад", f"rl:back:{rid}")])
         return screen._kb(rows)
     if r["status"] == "ready":
@@ -1349,7 +1435,8 @@ async def send_package(bot: Bot, rid: int) -> None:
 # ======================= расписание =======================
 
 async def plan_next(bot: Bot) -> None:
-    """Накануне дня рилса — собрать его. Если сегодня день рилса, а его нет и время не прошло, — и на сегодня."""
+    """Накануне дня рилса — собрать его, если автор не выбрал формат сам (вопрос в REELS_ASK_TIME): формат по
+    кругу, язык — как в прошлый раз. Если сегодня день рилса, а его нет и время не прошло, — и на сегодня."""
     if not ENABLED:
         return
     taken = await _taken_days()
@@ -1357,11 +1444,70 @@ async def plan_next(bot: Bot) -> None:
     targets = [today + timedelta(days=1)]
     if _now() < _post_dt(today.isoformat()) - timedelta(hours=1):
         targets.insert(0, today)
+    asked = await db.get_setting("reel_ask") or {}
     for d in targets:
         if is_reel_day(d) and d.isoformat() not in taken:
             kind = await next_kind()
-            rid = await _add(kind, d.isoformat(), {})
+            lang = await last_lang()
+            data = {"lang": lang, **({"auto_pick": True} if asked.get("day") == d.isoformat() else {})}
+            await _drop_ask(bot, d.isoformat())
+            rid = await _add(kind, d.isoformat(), data)
             await generate(bot, rid, background=True)
+
+
+async def last_lang() -> str:
+    lang = await db.get_setting("reel_last_lang", "en")
+    return lang if lang in rk.LANGS else "en"
+
+
+# ---------- вопрос «какой формат завтра» ----------
+
+def _ask_text(day: str, kind: str | None = None) -> str:
+    when = human(day)
+    if kind:
+        what = "на выбор бота (по кругу)" if kind == "auto" else f"{rk.KINDS[kind]['icon']} {KIND_RU[kind]}"
+        return f"🎬 Рилс на {when}: {what}.\nНа каком языке?"
+    return (f"🎬 {when.capitalize()} день рилса. Какой формат собрать?\n"
+            f"<i>Не выберешь до {BUILD_TIME[0]:02d}:{BUILD_TIME[1]:02d} — соберу сам: формат по кругу, "
+            "язык как в прошлый раз.</i>")
+
+
+def _ask_kb(day: str) -> InlineKeyboardMarkup:
+    return screen._kb(kinds_rows(f"rl:ak:{day}:") + [[btn("🎲 На выбор бота", f"rl:ak:{day}:auto")]])
+
+
+async def send_ask(bot: Bot, day: str) -> None:
+    """Спросить, какой формат и язык собрать на день day. Старый вопрос убирается."""
+    old = await db.get_setting("reel_ask") or {}
+    await ui.drop(bot, old.get("msg"))
+    m = await bot.send_message(config.ADMIN_ID, _ask_text(day), reply_markup=_ask_kb(day))
+    await db.set_setting("reel_ask", {"day": day, "msg": m.message_id})
+
+
+async def _drop_ask(bot: Bot, day: str | None = None) -> None:
+    """Убрать вопрос о формате (на день day или любой)."""
+    old = await db.get_setting("reel_ask") or {}
+    if old and (day is None or old.get("day") == day):
+        await ui.drop(bot, old.get("msg"))
+        await db.set_setting("reel_ask", {})
+
+
+async def pending_ask() -> str | None:
+    """День, на который бот спросил формат и ещё ждёт ответа."""
+    old = await db.get_setting("reel_ask") or {}
+    day = old.get("day")
+    if not day or day < _now().date().isoformat() or day in await _taken_days():
+        return None
+    return day
+
+
+async def ask_next(bot: Bot) -> None:
+    """Накануне дня рилса, до сборки, — спросить формат и язык. Если рилс на завтра уже есть — не спрашивать."""
+    if not ENABLED:
+        return
+    day = _now().date() + timedelta(days=1)
+    if is_reel_day(day) and day.isoformat() not in await _taken_days():
+        await send_ask(bot, day.isoformat())
 
 
 async def next_kind() -> str:
@@ -1424,6 +1570,11 @@ async def cleanup() -> None:
 def schedule(sched, bot: Bot, guarded) -> None:
     if not ENABLED:
         return
+    if ASK_TIME < BUILD_TIME:
+        sched.add_job(guarded(bot, "рилс: какой формат", ask_next, bot), "cron", hour=ASK_TIME[0], minute=ASK_TIME[1],
+                      id="reels_ask", max_instances=1)
+    else:
+        log.warning("REELS_ASK_TIME не раньше REELS_BUILD_TIME — бот не будет спрашивать формат, соберёт сам")
     sched.add_job(guarded(bot, "рилс: сборка", plan_next, bot), "cron", hour=BUILD_TIME[0], minute=BUILD_TIME[1],
                   id="reels_build", max_instances=1)
     sched.add_job(guarded(bot, "рилс: выкладывать", due, bot), "cron", hour=TIME[0], minute=TIME[1], id="reels_due")
@@ -1638,8 +1789,15 @@ async def _v_stats(arg: dict):
 
 
 async def _v_new(arg: dict):
-    lines = ["<b>➕ Собрать рилс</b>", "Выбери формат — рилс соберётся на ближайший свободный день, карточка придёт "
-             "сообщением.", "",
+    kind = arg.get("kind")
+    if kind in rk.KINDS:
+        # второй шаг: язык
+        lines = ["<b>➕ Собрать рилс</b>", f"Формат: {rk.KINDS[kind]['icon']} {KIND_RU[kind]}.", "", "На каком языке?",
+                 "<i>RU — рассказ, надписи, названия работ, подпись и хэштеги по-русски, читает русский голос.</i>"]
+        kb = lang_rows(f"rl:nl:{kind}:") + [[btn("← Формат", "rl:newmenu"), btn("← Рилсы", "rl:home")]]
+        return screen.banner(), "\n".join(lines)[:1020], screen._kb(kb), arg
+    lines = ["<b>➕ Собрать рилс</b>", "Выбери формат, потом язык — рилс соберётся на ближайший свободный день, "
+             "карточка придёт сообщением.", "",
              "🔍 детали картины · 📷 одна фотография — камера по деталям под рассказ",
              "🧍 масштаб — от человека к огромному зданию",
              "📐 разбор здания — ось, сетка, пропорции поверх фасада",
@@ -1654,8 +1812,8 @@ async def _v_new(arg: dict):
 async def _v_reels(arg: dict):
     days = ", ".join(DOW_RU[DOW_NUM[x]] for x in DOW if x in DOW_NUM)
     lines = [f"<b>🎬 Рилсы</b> — только Instagram · {days} в {TIME[0]:02d}:{TIME[1]:02d}",
-             f"<i>Накануне в {BUILD_TIME[0]:02d}:{BUILD_TIME[1]:02d} бот собирает рилс и присылает карточку. "
-             "Музыку кладёшь ты при публикации.</i>"]
+             f"<i>Накануне в {ASK_TIME[0]:02d}:{ASK_TIME[1]:02d} спрошу формат и язык; не ответишь — в "
+             f"{BUILD_TIME[0]:02d}:{BUILD_TIME[1]:02d} соберу сам. Музыку кладёшь ты при публикации.</i>"]
     if not ENABLED:
         lines.append("⚠️ Выключены переменной REELS=0")
     if not reelplan.available():
@@ -1669,7 +1827,8 @@ async def _v_reels(arg: dict):
     rows = []
     for r in rows_r[:10]:
         st = _data(r).get("stats") if r["status"] == "posted" else None
-        lines.append(f"{ICON.get(r['status'], '•')} {human(r['day'])} · {KIND_RU.get(r['kind'], r['kind'])} · "
+        ru_mark = " · RU" if rk.lang_of(_data(r)) == "ru" else ""
+        lines.append(f"{ICON.get(r['status'], '•')} {human(r['day'])} · {KIND_RU.get(r['kind'], r['kind'])}{ru_mark} · "
                      f"{html.escape((r['title'] or '…')[:40])}"
                      + (f" — <i>{html.escape((r['note'] or '')[:60])}</i>" if r["status"] == "failed" else "")
                      + (f" — {_fmt(_score(st, float(_data(r).get('duration') or 30)))}" if st else ""))
@@ -1679,23 +1838,33 @@ async def _v_reels(arg: dict):
             rows.append([btn(f"🔁 Ещё раз · {human(r['day'])}", f"rl:retry:{r['id']}")])
     if not rows_r:
         lines.append("Пока рилсов не было.")
+    ask = await pending_ask()
+    if ask:
+        lines.append(f"❓ {human(ask)} · жду, какой формат собрать (до {BUILD_TIME[0]:02d}:{BUILD_TIME[1]:02d})")
+        rows.insert(0, [btn(f"🎯 Выбрать формат на {human(ask)}", "rl:askday")])
     lines.append("\n<i>📥 ждёт решения · 🟡 одобрен · 📤 ждёт публикации · ✅ выложен · ⏳ собирается</i>")
     rows.append([btn("➕ Собрать рилс", "rl:newmenu"), btn("✍️ Своя тема", "rl:ask")])
     rows.append([btn("📊 Что заходит", "rl:stats")])
-    rows.append([btn(f"🎙 {await tts.label()}", "rl:voices"),
+    en, ru = await tts.voice("en"), await tts.voice("ru")
+    vname = lambda v: tts.VOICES.get(v, (v.split(":")[-1],))[0]
+    rows.append([btn(f"🎙 EN {vname(en)} · RU {vname(ru)}" if tts.ENABLED else "🎙 без озвучки", "rl:voices"),
                  btn("🔈 Звуки: вкл" if await sfx_on() else "🔇 Звуки: выкл", "rl:sfx")])
     rows.append([btn("← Пульт", "h:home")])
     return screen.banner(), "\n".join(lines)[:1020], screen._kb(rows), arg
 
 
-VOICE_KEYS = tts.available()
+VOICE_KEYS = {lang: tts.available(lang) for lang in tts.LANGS}
 
 
 async def _v_voices(arg: dict):
-    """Выбор голоса для «деталей»: нажал — голос выбран, и приходит образец."""
-    cur = await tts.voice()
-    lines = ["<b>🎙 Голос рилсов</b>",
-             "Нажми на голос — он станет основным, и я пришлю образец послушать."]
+    """Выбор голоса: отдельно для английских и для русских рилсов. Нажал — голос выбран, и приходит образец."""
+    lang = arg.get("lang") if arg.get("lang") in tts.LANGS else "en"
+    cur = await tts.voice(lang)
+    lines = [f"<b>🎙 Голос рилсов · {rk.LANGS[lang]}</b>",
+             "Нажми на голос — он станет основным для рилсов "
+             + ("на русском" if lang == "ru" else "на английском") + ", и я пришлю образец послушать."]
+    if lang == "ru":
+        lines.append("<i>По-русски читают ElevenLabs, OpenAI и Edge. Kokoro русского не знает.</i>")
     if not tts.el_ready():
         lines.append("<i>Голоса ElevenLabs появятся, когда в Railway будет ELEVENLABS_API_KEY или FAL_KEY.</i>")
     elif not tts.EL_KEY:
@@ -1705,11 +1874,13 @@ async def _v_voices(arg: dict):
     if arg.get("note"):
         lines.append(f"<b>{html.escape(arg['note'])}</b>")
     lines.append("")
-    for k in VOICE_KEYS:
+    keys = VOICE_KEYS[lang]
+    for k in keys:
         name, desc = tts.VOICES[k]
         lines.append(f"{'●' if k == cur else '○'} <b>{name}</b> — {desc}")
-    rows = []
-    b = [btn(("● " if k == cur else "") + tts.VOICES[k][0], f"rl:vs:0:{i}") for i, k in enumerate(VOICE_KEYS)]
+    rows = [[btn(("● " if lg == lang else "") + f"Голоса {rk.LANGS[lg]}", f"rl:voices:{lg}") for lg in tts.LANGS]]
+    li = tts.LANGS.index(lang)
+    b = [btn(("● " if k == cur else "") + tts.VOICES[k][0], f"rl:vs:{li}:{i}") for i, k in enumerate(keys)]
     rows += [b[i:i + 3] for i in range(0, len(b), 3)]
     rows.append([btn("← Рилсы", "rl:home")])
     return screen.banner(), "\n".join(lines)[:1020], screen._kb(rows), arg
@@ -1732,14 +1903,63 @@ async def on_cb(cb: CallbackQuery, bot: Bot, state: FSMContext):
         await screen.adopt(cb.message)
         return await screen.show(bot, "reels")
     if a == "new":
+        # формат выбран — теперь язык
         kind = p[2]
         if kind not in rk.KINDS:
             return await cb.answer()
-        rid = await new(bot, kind)
-        r = await get(rid)
-        await cb.answer(f"Собираю {KIND_ACC[kind]} на {human(r['day'])} — пара минут")
+        await cb.answer()
         await screen.adopt(cb.message)
-        return await screen.show(bot, "reels", note=f"⏳ Собираю {KIND_ACC[kind]}, карточка придёт сообщением")
+        return await screen.show(bot, "reelnew", kind=kind)
+    if a == "nl":
+        kind, lang = p[2], p[3] if len(p) > 3 else "en"
+        if kind not in rk.KINDS or lang not in rk.LANGS:
+            return await cb.answer()
+        rid = await new(bot, kind, lang=lang)
+        r = await get(rid)
+        await cb.answer(f"Собираю {KIND_ACC[kind]} {rk.LANG_RU[lang]} на {human(r['day'])} — пара минут")
+        await screen.adopt(cb.message)
+        return await screen.show(bot, "reels", note=f"⏳ Собираю {KIND_ACC[kind]} {rk.LANG_RU[lang]}, "
+                                                    "карточка придёт сообщением")
+    if a == "ak":
+        # вопрос «какой формат завтра»: выбран формат (или «на выбор бота») — спросить язык
+        day, kind = p[2], p[3] if len(p) > 3 else ""
+        if kind != "auto" and kind not in rk.KINDS:
+            return await cb.answer()
+        await cb.answer()
+        try:
+            return await cb.message.edit_text(_ask_text(day, kind), reply_markup=screen._kb(
+                lang_rows(f"rl:al:{day}:{kind}:") + [[btn("← Формат", f"rl:ab:{day}")]]))
+        except Exception:
+            return
+    if a == "ab":
+        await cb.answer()
+        try:
+            return await cb.message.edit_text(_ask_text(p[2]), reply_markup=_ask_kb(p[2]))
+        except Exception:
+            return
+    if a == "al":
+        day, kind, lang = p[2], p[3], p[4] if len(p) > 4 else "en"
+        if lang not in rk.LANGS or (kind != "auto" and kind not in rk.KINDS):
+            return await cb.answer()
+        await ui.drop(bot, cb.message.message_id)
+        if day < _now().date().isoformat() or day in await _taken_days():
+            await _drop_ask(bot, day)
+            return await cb.answer("На этот день рилс уже есть — он в «🎬 Рилсы»", show_alert=True)
+        if _now() >= _post_dt(day) - timedelta(minutes=10):
+            await _drop_ask(bot, day)
+            return await cb.answer("Время этого рилса уже прошло", show_alert=True)
+        kind = await next_kind() if kind == "auto" else kind
+        await new(bot, kind, day=day, lang=lang)
+        await cb.answer(f"Собираю {KIND_ACC[kind]} {rk.LANG_RU[lang]} на {human(day)} — пара минут")
+        return screen.refresh_soon(bot)
+    if a == "askday":
+        day = await pending_ask()
+        if not day:
+            await cb.answer("Уже не нужно — рилс на этот день есть")
+            await screen.adopt(cb.message)
+            return await screen.show(bot, "reels")
+        await cb.answer()
+        return await send_ask(bot, day)
     if a == "newmenu":
         await cb.answer()
         await screen.adopt(cb.message)
@@ -1768,18 +1988,21 @@ async def on_cb(cb: CallbackQuery, bot: Bot, state: FSMContext):
     if a == "voices":
         await cb.answer()
         await screen.adopt(cb.message)
-        return await screen.show(bot, "reelvoice")
+        return await screen.show(bot, "reelvoice", lang=p[2] if len(p) > 2 and p[2] in tts.LANGS else "en")
     if a == "vs":
-        k = VOICE_KEYS[int(p[3])] if 0 <= int(p[3]) < len(VOICE_KEYS) else None
+        li = int(p[2]) if p[2].isdigit() and int(p[2]) < len(tts.LANGS) else 0
+        lang = tts.LANGS[li]
+        keys = VOICE_KEYS[lang]
+        k = keys[int(p[3])] if 0 <= int(p[3]) < len(keys) else None
         if not k:
             return await cb.answer()
-        await db.set_setting("reel_voice", k)
+        await db.set_setting("reel_voice_ru" if lang == "ru" else "reel_voice", k)
         name = tts.VOICES[k][0]
-        await cb.answer(f"Голос: {name}. Готовлю образец — до минуты в первый раз")
+        await cb.answer(f"Голос {rk.LANGS[lang]}: {name}. Готовлю образец — до минуты в первый раз")
         await screen.adopt(cb.message)
-        await screen.show(bot, "reelvoice", note=f"Выбран {name}")
+        await screen.show(bot, "reelvoice", lang=lang, note=f"Выбран {name}")
         try:
-            path = await tts.sample(k)
+            path = await tts.sample(k, lang)
             m = await bot.send_audio(config.ADMIN_ID, FSInputFile(path, filename=f"{name}.mp3"),
                                      title=f"AHMAG · {name}", performer="образец голоса",
                                      caption=f"🎙 {name} — {tts.VOICES[k][1]}")
@@ -1798,16 +2021,42 @@ async def on_cb(cb: CallbackQuery, bot: Bot, state: FSMContext):
         await state.update_data(prompt=m.message_id)
         return await screen.add_temp([m.message_id])
     if a == "mk":
+        # своя тема: формат выбран — спросить язык
+        data = await state.get_data()
+        req = data.get("reel_request")
+        if not req or p[2] not in rk.KINDS:
+            await ui.drop(bot, cb.message.message_id)
+            return await cb.answer("Запрос потерялся — напиши заново", show_alert=True)
+        await cb.answer()
+        try:
+            return await cb.message.edit_text(
+                f"«{html.escape(req)}» · {rk.KINDS[p[2]]['icon']} {KIND_RU[p[2]]}. На каком языке?",
+                reply_markup=screen._kb(lang_rows(f"rl:ml:{p[2]}:") + [[btn("← Формат", "rl:mkb")]]))
+        except Exception:
+            return
+    if a == "mkb":
+        data = await state.get_data()
+        req = data.get("reel_request")
+        await cb.answer()
+        if not req:
+            return await ui.drop(bot, cb.message.message_id)
+        try:
+            return await cb.message.edit_text(f"«{html.escape(req)}» — в каком формате?",
+                                              reply_markup=screen._kb(kinds_rows("rl:mk:")))
+        except Exception:
+            return
+    if a == "ml":
         data = await state.get_data()
         req = data.get("reel_request")
         await state.clear()
         await ui.drop(bot, cb.message.message_id)
-        if not req:
+        kind, lang = p[2], p[3] if len(p) > 3 else "en"
+        if not req or kind not in rk.KINDS or lang not in rk.LANGS:
             return await cb.answer("Запрос потерялся — напиши заново", show_alert=True)
-        rid = await new(bot, p[2], req)
+        rid = await new(bot, kind, req, lang=lang)
         r = await get(rid)
-        await cb.answer(f"Собираю на {human(r['day'])} — пара минут")
-        return await screen.move_down(bot, "reels", note=f"⏳ {KIND_RU[p[2]]}: «{req[:50]}»")
+        await cb.answer(f"Собираю {rk.LANG_RU[lang]} на {human(r['day'])} — пара минут")
+        return await screen.move_down(bot, "reels", note=f"⏳ {KIND_RU[kind]} · {rk.LANGS[lang]}: «{req[:50]}»")
 
     rid = int(p[2])
     r = await get(rid)
@@ -1826,7 +2075,7 @@ async def on_cb(cb: CallbackQuery, bot: Bot, state: FSMContext):
             return
         d = _data(r)
         if "хороших картинок" in (r["note"] or "") or "не нашлось" in (r["note"] or ""):
-            d = {k: v for k, v in d.items() if k == "request"}     # тема не удалась — берём новую
+            d = {k: v for k, v in d.items() if k in ("request", "lang")}     # тема не удалась — берём новую
         await _set(rid, data=d)
         start(bot, rid)
         if cb.message.photo:
@@ -1887,16 +2136,28 @@ async def on_cb(cb: CallbackQuery, bot: Bot, state: FSMContext):
     if r["status"] in ("building",):
         return await cb.answer("Уже собирается")
     d = _data(r)
+    lang = rk.lang_of(d)
     if a == "theme":
-        d = {}
+        d = {"lang": lang}
         note = "Беру другую тему" if r["kind"] == "collection" else "Беру другую картину"
     elif a == "kind":
         kind = p[3] if len(p) > 3 and p[3] in rk.KINDS else ("details" if r["kind"] == "collection" else "collection")
         async with db.connect() as c:
             await c.execute("UPDATE reels SET kind=? WHERE id=?", (kind, rid))
             await c.commit()
-        d = {}
+        d = {"lang": lang}
         note = f"Делаю {KIND_ACC[kind]}"
+    elif a == "lang":
+        # тот же объект, рассказ заново на другом языке; подборку — заново целиком (строки работ привязаны к языку)
+        lang = "en" if lang == "ru" else "ru"
+        if r["kind"] == "collection":
+            d = {k: v for k, v in d.items() if k == "request"}
+        else:
+            for k in ("story", "frames", "caption", "hashtags", "avoid_frames", "caption_override", "auto_pick"):
+                d.pop(k, None)
+        d["lang"] = lang
+        await db.set_setting("reel_last_lang", lang)
+        note = f"Переделываю {rk.LANG_RU[lang]}"
     elif a == "det":
         if r["kind"] == "collection":
             return await cb.answer()
@@ -1941,7 +2202,8 @@ async def _replacement(d: dict, background: bool) -> dict | None:
         return spare[0]
     have = "; ".join(f"{w['title']} — {w['author']}" for w in d.get("items") or [])
     more = await _ask(f"Theme: {d.get('title')}\nAlready in the reel: {have}\nGive 4 more works.",
-                      system=MORE_SYSTEM, max_tokens=2500, background=background)
+                      system=rk.localize(MORE_SYSTEM, rk.lang_of(d), rk.RU_NAMES_WORKS), max_tokens=2500,
+                      background=background)
     tall = None
     paths = [Path(w["path"]) for w in d.get("items") or [] if w.get("path") and Path(w["path"]).exists()]
     if paths and reelplan.collection_mode([reelplan._size(x) for x in paths]) == "bleed":

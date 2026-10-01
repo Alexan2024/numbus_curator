@@ -32,7 +32,7 @@ export const Story: React.FC<any> = (p) => {
   const text = t < p.endStart;
 
   return <AbsoluteFill style={{background: '#0d0c0b', color: INK, overflow: 'hidden'}}>
-    <Fonts />
+    <Fonts lang={p.lang} />
     {st.prev && st.mix < 1 && <Stage src={p.image} pw={p.pw} ph={p.ph} cam={fix(st.prev, t)} />}
     <div style={{position: 'absolute', inset: 0, opacity: st.mix}}>
       <Stage src={p.image} pw={p.pw} ph={p.ph} cam={cam} shadow={endK} blur={mb} />

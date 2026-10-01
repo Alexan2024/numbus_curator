@@ -1,15 +1,42 @@
-import React from 'react';
-import {Audio, Easing, Img, Sequence, interpolate, staticFile} from 'remotion';
+import React, {useEffect, useState} from 'react';
+import {Audio, Easing, Img, Sequence, continueRender, delayRender, interpolate, staticFile} from 'remotion';
 
 export const W = 1080, H = 1920, A = H / W, M = 72;
 export const INK = '#F2EEE6', MUTE = 'rgba(242,238,230,.62)';
 
-export const Fonts: React.FC = () => <style>{`
-@font-face{font-family:Serif;src:url(${staticFile('InstrumentSerif-Regular.ttf')})}
-@font-face{font-family:Serif;font-style:italic;src:url(${staticFile('InstrumentSerif-Italic.ttf')})}
-@font-face{font-family:Grot;src:url(${staticFile('InterTight.ttf')});font-weight:100 900}
-@font-face{font-family:Mono;src:url(${staticFile('IBMPlexMono-Regular.ttf')})}
-@font-face{font-family:Mono;font-weight:500;src:url(${staticFile('IBMPlexMono-Medium.ttf')})}`}</style>;
+// Шрифты загружаются через FontFace, и кадр не снимается, пока они не загрузились (delayRender). Имена
+// семейств с приставкой Ah: «Serif» без кавычек браузер читал как общее семейство serif и брал системную
+// антикву вместо Instrument Serif.
+// Антиква: Instrument Serif; у неё нет кириллицы, поэтому в русских рилсах (lang = ru) вся антиква —
+// Noto Serif Display в узкой ширине: тот же характер, цифры и латиница в одном шрифте с буквами.
+const FONT_FILES = (lang?: string): [string, string, FontFaceDescriptors][] => [
+  ['AhSerif', lang === 'ru' ? 'NotoSerifDisplay-Cond-Regular.ttf' : 'InstrumentSerif-Regular.ttf', {}],
+  ['AhSerif', lang === 'ru' ? 'NotoSerifDisplay-Cond-Italic.ttf' : 'InstrumentSerif-Italic.ttf', {style: 'italic'}],
+  ['AhGrot', 'InterTight.ttf', {weight: '100 900'}],
+  ['AhMono', 'IBMPlexMono-Regular.ttf', {}],
+  ['AhMono', 'IBMPlexMono-Medium.ttf', {weight: '500'}],
+];
+const fontsLoading: Record<string, Promise<void>> = {};
+const loadFonts = (lang?: string) => {
+  const key = lang === 'ru' ? 'ru' : 'en';
+  if (!fontsLoading[key]) {
+    fontsLoading[key] = Promise.all(FONT_FILES(lang).map(([family, file, desc]) =>
+      new FontFace(family, `url(${staticFile(file)})`, desc).load().then((f) => { document.fonts.add(f); })))
+      .then(() => undefined);
+  }
+  return fontsLoading[key];
+};
+
+export const Fonts: React.FC<{lang?: string}> = ({lang}) => {
+  const [handle] = useState(() => delayRender('шрифты'));
+  useEffect(() => {
+    loadFonts(lang).then(() => continueRender(handle)).catch((e) => {
+      console.error('Шрифт не загрузился', e);
+      continueRender(handle);
+    });
+  }, [handle, lang]);
+  return null;
+};
 
 export const clamp = {extrapolateLeft: 'clamp' as const, extrapolateRight: 'clamp' as const};
 export const out3 = {...clamp, easing: Easing.out(Easing.cubic)};
@@ -71,7 +98,7 @@ export const Sfx: React.FC<{list?: any[]; fps: number}> = ({list, fps}) => <>{(l
 
 export const Bar: React.FC<{text: string; opacity?: number}> = ({text, opacity = 1}) =>
   <div style={{position: 'absolute', left: M, right: M, top: 150, display: 'flex', alignItems: 'center', gap: 22,
-    fontFamily: 'Mono', fontSize: 21, letterSpacing: '.14em', textTransform: 'uppercase', color: MUTE, opacity}}>
+    fontFamily: 'AhMono', fontSize: 21, letterSpacing: '.14em', textTransform: 'uppercase', color: MUTE, opacity}}>
     <Img src={staticFile('logo.png')} style={{height: 30, opacity: .9}} />
     <span style={{width: 46, height: 1, background: MUTE}} />
     <span>{text}</span>
@@ -87,5 +114,5 @@ export const Grain: React.FC<{frame: number}> = ({frame}) => {
 // *слово* → курсив антиквы
 export const Rich: React.FC<{text: string}> = ({text}) => <>{
   text.split(/(\*[^*]+\*)/).map((part, i) => part.startsWith('*') && part.endsWith('*')
-    ? <i key={i} style={{fontFamily: 'Serif', fontStyle: 'italic'}}>{part.slice(1, -1)}</i> : <span key={i}>{part}</span>)
+    ? <i key={i} style={{fontFamily: 'AhSerif', fontStyle: 'italic'}}>{part.slice(1, -1)}</i> : <span key={i}>{part}</span>)
 }</>;

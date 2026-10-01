@@ -129,9 +129,9 @@ def _full(pw, ph):
     return [pw / 2, cy, W / s]
 
 
-def _hook_win(text: str) -> tuple[int, int]:
-    """Хук набран крупно сверху: деталь — под ним."""
-    lines = max(1, -(-len(text) // 18))
+def _hook_win(text: str, lang: str = "en") -> tuple[int, int]:
+    """Хук набран крупно сверху: деталь — под ним. Русская антиква шире, и слова длиннее: в строку входит меньше."""
+    lines = max(1, -(-len(text) // (15 if lang == "ru" else 18)))
     return (min(HOOK_TOP + lines * 108 + 60, 940), 1440)
 
 
@@ -358,7 +358,7 @@ def story_props(folder: Path, image: Path, beats: list[dict], voice, pt: dict, s
             rects.append((full, _hold(pw, ph, full, None, 1.03)))
             continue
         hook = b["kind"] == "hook"
-        r0 = _fit(pw, ph, b["box"], _hook_win(b["text"]) if hook else WIN, HOOK_SLACK if hook else SLACK)
+        r0 = _fit(pw, ph, b["box"], _hook_win(b["text"], pt.get("lang") or "en") if hook else WIN, HOOK_SLACK if hook else SLACK)
         rects.append((r0, _hold(pw, ph, r0, b["box"])))
     anchors = [_anchor(b["raw"]) for b in beats]
     plan: list[tuple[float, float, int]] = []          # (уезжает, приезжает, 1 — растворение) для каждой части
@@ -490,7 +490,8 @@ def story_props(folder: Path, image: Path, beats: list[dict], voice, pt: dict, s
         voice_path = folder / "voice_mix.wav"
         _mix_voice(clips, dur, voice_path)
     year = str(pt.get("year") or "").strip()
-    names = pt.get("meta_names") or ("Medium", "Size", "Collection")
+    names = pt.get("meta_names") or (("Техника", "Размер", "Собрание") if pt.get("lang") == "ru"
+                                     else ("Medium", "Size", "Collection"))
     meta = [[k, v] for k, v in zip(names, (pt.get("medium"), pt.get("size"), pt.get("museum"))) if v]
     return {"fps": FPS, "duration": round(dur * FPS), "pw": pw, "ph": ph,
             "cam": [[round(x, 3) for x in k] for k in cam], "marks": marks,
@@ -498,7 +499,8 @@ def story_props(folder: Path, image: Path, beats: list[dict], voice, pt: dict, s
             "beats": out, "sfx": events, "slack": list(HOOK_SLACK), "endStart": round(end_start, 3), "labelTop": round(300 + ph * s_end + 60),
             "title": pt.get("title") or "", "sub": ", ".join(x for x in (pt.get("author"), year) if x),
             "rubric": pt.get("rubric") or RUBRIC, "series": " · ".join(x for x in (pt.get("title"), year) if x), "meta": meta,
-            "image": str(image), "voice": str(voice_path) if voice_path else None, "_dur": dur}
+            "image": str(image), "voice": str(voice_path) if voice_path else None, "_dur": dur,
+            "lang": pt.get("lang") or "en"}
 
 
 # ======================= время частей рассказа (пары, подборки) =======================
@@ -650,7 +652,7 @@ def pair_props(folder: Path, images: list[Path], beats: list[dict], voice, info:
                     op = 1.0 if not b.get("pick") or b["pick"] == me else 0.28
                     res.append([*FR, *_view_at(pw, ph, x, y, w, h), op, 0.0, lab])
                 elif show == me:
-                    win = _hook_win(b["text"]) if b["kind"] == "hook" else WIN
+                    win = _hook_win(b["text"], info.get("lang") or "en") if b["kind"] == "hook" else WIN
                     view = _fit(pw, ph, box, win, HOOK_SLACK if b["kind"] == "hook" else SLACK) if box else _full(pw, ph)
                     res.append([*FR, *view, 1.0, 0.0, 0.0])
                 else:
@@ -753,7 +755,7 @@ def pair_props(folder: Path, images: list[Path], beats: list[dict], voice, info:
             "labelTop": label_top, "title": info.get("title") or "", "meta": info.get("meta") or [],
             "rubric": info.get("rubric") or "", "series": info.get("series") or info.get("title") or "",
             "coverT": round(max(0.8, out[0]["end"] - 0.35), 2),
-            "voice": str(voice_path) if voice_path else None, "_dur": dur}
+            "voice": str(voice_path) if voice_path else None, "_dur": dur, "lang": info.get("lang") or "en"}
 
 
 def align(a: Path, b: Path, dest: Path) -> tuple[Path, Path] | None:
@@ -859,8 +861,10 @@ def collection_props(folder: Path, d: dict, sfx: bool = True, voice=None) -> dic
         else:
             dur = SEG * (RHYTHM[(n - 1) % len(RHYTHM)] if n else 1.0) + (TITLE_HOLD if n == 0 else 0) \
                 + (0.8 if n == n_all - 1 else 0)
+        ru = d.get("lang") == "ru"            # в русской подборке — русские названия и имена, если Claude их дал
         row = {"image": it["path"], "pw": pw, "ph": ph, "start": round(t, 3), "dur": round(dur, 3),
-               "title": it.get("title") or "", "author": it.get("author") or "", "year": str(it.get("year") or "")}
+               "title": (ru and it.get("title_ru")) or it.get("title") or "",
+               "author": (ru and it.get("author_ru")) or it.get("author") or "", "year": str(it.get("year") or "")}
         if tl:
             row["line"] = tl[n + 1]["words"]
         if mode == "frame":
@@ -886,7 +890,7 @@ def collection_props(folder: Path, d: dict, sfx: bool = True, voice=None) -> dic
             "subtitle": cap if len(cap) <= 90 else "", "series": (d.get("title") or "").replace("*", ""),
             "intro": tl[0]["words"] if tl else None, "loopStart": round(loop_start, 3) if loop_start else None,
             "voice": str(voice_path) if voice_path else None, "coverT": 1.2,
-            "sfx": events, "_dur": dur}
+            "sfx": events, "_dur": dur, "lang": d.get("lang") or "en"}
 
 
 # ======================= рендер =======================

@@ -56,7 +56,7 @@ const Tag: React.FC<{text: string; k: Key; l: any; right?: boolean}> = ({text, k
   const L = Math.max(x, ix), T = Math.max(y, iy), R = Math.min(x + w, ix + l.pw * s);
   void h;
   return <div style={{position: 'absolute', top: T + 22, ...(right ? {left: R - 22, transform: 'translateX(-100%)'} : {left: L + 22}),
-    opacity: lab * op, fontFamily: 'Mono', fontSize: 21, letterSpacing: '.14em', textTransform: 'uppercase', color: INK,
+    opacity: lab * op, fontFamily: 'AhMono', fontSize: 21, letterSpacing: '.14em', textTransform: 'uppercase', color: INK,
     background: 'rgba(8,7,6,.55)', padding: '8px 14px 7px'}}>{text}</div>;
 };
 
@@ -71,7 +71,7 @@ export const Pair: React.FC<any> = (p) => {
   const b = ks[1];
   const wipe = b[F.clip] > 0.002 && b[F.clip] < 0.998 && b[F.op] > 0.05;
   return <AbsoluteFill style={{background: '#0d0c0b', color: INK, overflow: 'hidden'}}>
-    <Fonts />
+    <Fonts lang={p.lang} />
     {p.layers.map((l: any, i: number) => <Layer key={i} l={l} k={ks[i]} t={t} id={`ink${i}`} />)}
     {wipe && <div style={{position: 'absolute', left: b[F.x] + b[F.clip] * b[F.w] - 1, top: b[F.y], width: 2, height: b[F.h],
       background: INK, opacity: .9 * b[F.op], boxShadow: '0 0 12px rgba(0,0,0,.45)'}} />}

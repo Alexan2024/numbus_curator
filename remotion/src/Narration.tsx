@@ -25,7 +25,7 @@ export const Word: React.FC<{w: Wd; t: number; serif?: boolean; mute?: boolean; 
   ({w, t, serif, mute, instant, size}) => {
   const k = instant ? (t >= w.t - 0.1 ? 1 : 0) : interpolate(t, [w.t - 0.04, w.t + 0.24], [0, 1], out3);
   return <span style={{display: 'inline-block', opacity: k, transform: `translateY(${(1 - k) * 14}px)`,
-    marginRight: '0.26em', color: w.em ? INK : mute ? MUTE : INK, fontFamily: w.em || serif ? 'Serif' : 'Grot',
+    marginRight: '0.26em', color: w.em ? INK : mute ? MUTE : INK, fontFamily: w.em || serif ? 'AhSerif' : 'AhGrot',
     fontStyle: w.em ? 'italic' : 'normal', fontWeight: w.em || serif ? 400 : 480,
     fontSize: w.em && !serif && size ? size * 1.2 : undefined}}>{w.w}</span>;
 };
@@ -43,7 +43,7 @@ export const BeatText: React.FC<{b: any; t: number}> = ({b, t}) => {
   const fade = interpolate(t, [b.end - 0.25, b.end], [1, 0], clamp);
   const gs = groups(b.words);
   if (b.kind === 'hook') {
-    return <div style={{position: 'absolute', left: M, width: 900, top: HOOK_TOP, fontFamily: 'Serif',
+    return <div style={{position: 'absolute', left: M, width: 900, top: HOOK_TOP, fontFamily: 'AhSerif',
       fontSize: 112, lineHeight: .96, letterSpacing: '-.012em', opacity: fade}}>
       {gs.map((g, gi) => <div key={gi}>{g.map((w, wi) => <Word key={wi} w={w} t={t} serif mute={gi > 0} instant />)}</div>)}
     </div>;
@@ -52,14 +52,14 @@ export const BeatText: React.FC<{b: any; t: number}> = ({b, t}) => {
   const gi = Math.max(0, gs.findIndex((g, j) => t < (gs[j + 1]?.[0].t ?? 1e9) - 0.02));
   const lab = b.label ? interpolate(t, [b.arrive - 0.1, b.arrive + 0.45], [0, 1], out3) : 0;
   return <div style={{position: 'absolute', left: M, width: climax ? 860 : 820, bottom: TEXT_BOTTOM, opacity: fade}}>
-    {b.label && <div style={{fontFamily: 'Mono', fontSize: 22, letterSpacing: '.14em', textTransform: 'uppercase',
+    {b.label && <div style={{fontFamily: 'AhMono', fontSize: 22, letterSpacing: '.14em', textTransform: 'uppercase',
       display: 'flex', gap: 16, alignItems: 'center', marginBottom: 26, opacity: lab,
       transform: `translateX(${(1 - lab) * -14}px)`}}>
       <span style={{color: MUTE}}>{String(b.n).padStart(2, '0')}</span>
       <span style={{width: 34 * lab, height: 1, background: MUTE}} />
       <span>{b.label}</span>
     </div>}
-    <div style={{fontFamily: climax ? 'Serif' : 'Grot', fontSize: climax ? 80 : 48, lineHeight: climax ? 1.02 : 1.16,
+    <div style={{fontFamily: climax ? 'AhSerif' : 'AhGrot', fontSize: climax ? 80 : 48, lineHeight: climax ? 1.02 : 1.16,
       letterSpacing: climax ? '-.01em' : '-.008em'}}>
       {climax ? gs.map((g, j) => <div key={j}>{g.map((w, wi) => <Word key={wi} w={w} t={t} serif />)}</div>)
         : (gs[gi] || []).map((w, wi) => <Word key={wi} w={w} t={t} size={48} />)}
@@ -77,10 +77,10 @@ export const Label: React.FC<{t: number; start: number; top: number; title: stri
   <div style={{position: 'absolute', left: M, top, width: 936}}>
     <div style={{height: 1, background: 'rgba(242,238,230,.35)', marginBottom: 34,
       width: `${interpolate(t, [start + 0.7, start + 1.5], [0, 100], out3)}%`}} />
-    {[<div key="a" style={{fontFamily: 'Serif', fontStyle: 'italic', fontSize: title.length > 30 ? 70 : 86, lineHeight: 1}}>{title}</div>,
-      sub ? <div key="b" style={{marginTop: 22, fontFamily: 'Grot', fontSize: 32, fontWeight: 450}}>{sub}</div> : null,
+    {[<div key="a" style={{fontFamily: 'AhSerif', fontStyle: 'italic', fontSize: title.length > 30 ? 70 : 86, lineHeight: 1}}>{title}</div>,
+      sub ? <div key="b" style={{marginTop: 22, fontFamily: 'AhGrot', fontSize: 32, fontWeight: 450}}>{sub}</div> : null,
       <div key="c" style={{marginTop: 34, display: 'grid', gridTemplateColumns: `${metaCol}px 1fr`, rowGap: 12,
-        fontFamily: 'Mono', fontSize: 21, letterSpacing: '.08em', textTransform: 'uppercase', color: MUTE}}>
+        fontFamily: 'AhMono', fontSize: 21, letterSpacing: '.08em', textTransform: 'uppercase', color: MUTE}}>
         {(meta || []).map((m: string[]) => [<span key={m[0]}>{m[0]}</span>,
           <span key={m[0] + 'v'} style={{color: INK}}>{m[1]}</span>])}
       </div>].filter(Boolean).map((el, j) => {
