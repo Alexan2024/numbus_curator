@@ -2,6 +2,8 @@ import React, {useEffect, useState} from 'react';
 import {Audio, Easing, Img, Sequence, continueRender, delayRender, interpolate, staticFile} from 'remotion';
 
 export const W = 1080, H = 1920, A = H / W, M = 72;
+// знак и название — ниже шапки Instagram (на 150 px её «Reels» и камера их закрывали)
+export const BAR_TOP = 280;   // = верхние 14% кадра, которые Meta советует не занимать
 export const INK = '#F2EEE6', MUTE = 'rgba(242,238,230,.62)';
 
 // Шрифты загружаются через FontFace, и кадр не снимается, пока они не загрузились (delayRender). Имена
@@ -97,7 +99,7 @@ export const Sfx: React.FC<{list?: any[]; fps: number}> = ({list, fps}) => <>{(l
   </Sequence>)}</>;
 
 export const Bar: React.FC<{text: string; opacity?: number}> = ({text, opacity = 1}) =>
-  <div style={{position: 'absolute', left: M, right: M, top: 150, display: 'flex', alignItems: 'center', gap: 22,
+  <div style={{position: 'absolute', left: M, right: M, top: BAR_TOP, display: 'flex', alignItems: 'center', gap: 22,
     fontFamily: 'AhMono', fontSize: 21, letterSpacing: '.14em', textTransform: 'uppercase', color: MUTE, opacity}}>
     <Img src={staticFile('logo.png')} style={{height: 30, opacity: .9}} />
     <span style={{width: 46, height: 1, background: MUTE}} />
