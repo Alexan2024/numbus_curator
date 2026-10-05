@@ -140,12 +140,47 @@ def _img(path, size: int | None = None) -> dict:
                                         "data": media.thumb_b64(Path(path), size or config.THUMB_SIZE)}}
 
 
+_TRAILING_COMMA = re.compile(r",(\s*[}\]])")
+
+
+def _close_of(text: str, i: int) -> int:
+    """Где закрывается скобка, открытая в позиции i (грубо, по счёту скобок); -1 — не закрывается."""
+    depth = 0
+    for k in range(i, len(text)):
+        depth += {"{": 1, "}": -1}.get(text[k], 0)
+        if depth == 0:
+            return k
+    return -1
+
+
 def _parse_json(text: str) -> dict:
-    text = re.sub(r"```(?:json)?", "", text).strip()
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end <= start:
+    """Ответ Claude → dict. Терпит то, на чём раньше падало: текст до и после JSON (в том числе с фигурными
+    скобками), переносы строк прямо внутри строк, висячие запятые. Берёт самый большой разбираемый объект —
+    но не обломок изнутри битого или обрезанного ответа: такой случай остаётся ошибкой (дальше — повтор/починка)."""
+    clean = re.sub(r"```(?:json)?", "", text).strip()
+    if clean.find("{") < 0 or clean.rfind("}") <= clean.find("{"):
         raise ValueError(f"Claude вернул не JSON: {text[:200]!r}")
-    return json.loads(text[start:end + 1])
+    dec = json.JSONDecoder(strict=False)
+    last: Exception | None = None
+    for cand in (clean, _TRAILING_COMMA.sub(r"\1", clean)):
+        best, b0, b1, failed = None, 0, 0, []
+        i = cand.find("{")
+        while i >= 0:
+            if best is not None and i < b1:      # внутри уже найденного объекта — дальше не ищем
+                i = cand.find("{", i + 1)
+                continue
+            try:
+                obj, j = dec.raw_decode(cand, i)
+                if isinstance(obj, dict) and j - i > b1 - b0:
+                    best, b0, b1 = obj, i, j
+            except ValueError as exc:
+                last = last or exc
+                failed.append(i)
+            i = cand.find("{", i + 1)
+        # битая скобка, внутри которой лежит найденный объект, — значит найден обломок, а не ответ
+        if best is not None and not any(f < b0 and not (0 <= _close_of(cand, f) < b0) for f in failed):
+            return best
+    raise ValueError(f"Claude вернул не JSON (битый): {last}")
 
 
 def _public(data: dict) -> dict:
@@ -153,7 +188,8 @@ def _public(data: dict) -> dict:
     return {k: v for k, v in data.items() if not k.startswith("_")}
 
 
-async def _create(params: dict, background: bool) -> str:
+async def _create(params: dict, background: bool) -> tuple[str, str | None]:
+    """→ (текст, stop_reason). stop_reason == "max_tokens" — ответ обрезан на полуслове."""
     if background and not await budget_ok():
         raise BudgetExceeded()
     messages = list(params["messages"])
@@ -172,16 +208,42 @@ async def _create(params: dict, background: bool) -> str:
     if not text.strip():
         log.warning("Пустой ответ Claude: model=%s stop_reason=%s max_tokens=%s",
                     params.get("model"), getattr(resp, "stop_reason", None), params.get("max_tokens"))
-    return text
+    return text, getattr(resp, "stop_reason", None)
+
+
+REPAIR_SYSTEM = ("You repair broken JSON. Return the same data as ONE valid JSON object: escape quotes inside "
+                 "strings, remove trailing commas, drop any text around the object, close brackets if the end is cut. "
+                 "Never change, translate, shorten or add values. Output only the JSON, no code fences.")
+
+
+async def _repair_json(text: str, background: bool) -> dict:
+    """Дешёвая починка битого JSON через Haiku — вместо повтора всего дорогого запроса с картинкой."""
+    params = {"model": config.TRIAGE_MODEL, "max_tokens": min(16000, len(text) + 500),
+              "system": _system(REPAIR_SYSTEM), "messages": [{"role": "user", "content": [{"type": "text", "text": text}]}]}
+    fixed, _ = await _create(params, background)
+    return _parse_json(fixed)
 
 
 async def _ask_json(params: dict, background: bool) -> dict:
-    """Запрос → JSON. Пустой ответ (весь запас токенов ушёл на размышления или поиск) — ещё раз
-    с запасом втрое больше: так было с «Claude вернул не JSON: ''» у рилсов и правил вкуса."""
-    text = await _create(params, background)
-    if not text.strip():
-        text = await _create({**params, "max_tokens": params["max_tokens"] * 3}, background)
-    return _parse_json(text)
+    """Запрос → JSON. Три известные поломки и что с ними делаем:
+    1) пустой ответ (весь запас ушёл на размышления/поиск) и 2) ответ обрезан по max_tokens — ещё раз с запасом
+    втрое больше; 3) JSON битый (кавычка внутри текста, мусор вокруг) — чиним через Haiku, а не повторяем всё."""
+    text, stop = await _create(params, background)
+    if not text.strip() or stop == "max_tokens":
+        log.warning("Ответ Claude %s (max_tokens=%s) — повторяю с запасом ×3",
+                    "обрезан" if text.strip() else "пустой", params["max_tokens"])
+        text, stop = await _create({**params, "max_tokens": params["max_tokens"] * 3}, background)
+    try:
+        return _parse_json(text)
+    except ValueError as exc:
+        if not text.strip():
+            raise
+        log.warning("Битый JSON от Claude (stop=%s, %s симв.): %s | начало: %r | конец: %r",
+                    stop, len(text), exc, text[:300], text[-300:])
+    try:
+        return await _repair_json(text, background)
+    except ValueError as exc:
+        raise ValueError(f"Claude вернул не JSON и починить не вышло: {exc}") from exc
 
 
 async def _call(content: list | str, *, system: str, model: str, max_tokens: int = 2000,
