@@ -6,7 +6,7 @@ import {INK, M, MUTE, clamp, out3} from './common';
    под голос внизу, над строкой — номер и имя детали, кульминация антиквой. */
 
 export type Wd = {w: string; em: boolean; t: number};
-export const HOOK_TOP = 290, TEXT_BOTTOM = 500;   // безопасные зоны Instagram: сверху шапка, снизу подпись и кнопки
+export const HOOK_TOP = 380, TEXT_BOTTOM = 500;   // безопасные зоны Instagram: сверху шапка, снизу подпись и кнопки
 
 // группа на экране — предложение; длинное делится на запятой после 7 слов или на 11-м слове
 export function groups(words: Wd[]) {
