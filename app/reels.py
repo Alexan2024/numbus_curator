@@ -669,18 +669,15 @@ def hook_text(d: dict) -> str:
 
 
 async def _ask(content, *, system: str, max_tokens: int, background: bool, tools: list | None = None) -> dict:
-    """Вызов Claude для рилса. Пустой ответ (весь запас токенов ушёл на размышления или поиск) — ещё раз
-    с запасом втрое больше: так было с «Claude вернул не JSON: ''»."""
+    """Вызов Claude для рилса. Повторы при пустом/обрезанном ответе и починка битого JSON — в curator._ask_json;
+    сюда доходит только то, что не спасли и они."""
     from app import curator
-    for n in range(2):
-        try:
-            return await curator._call(content, system=system, model=config.CLAUDE_MODEL,
-                                       max_tokens=max_tokens * (3 if n else 1), tools=tools, background=background)
-        except ValueError as exc:
-            if n or "не JSON" not in str(exc):
-                raise ReelError("Claude ответил не по формату — попробуй ещё раз") from exc
-            log.warning("Рилс: пустой или битый ответ Claude, повторяю с большим запасом: %s", exc)
-    return {}
+    try:
+        return await curator._call(content, system=system, model=config.CLAUDE_MODEL, max_tokens=max_tokens,
+                                   tools=tools, background=background)
+    except ValueError as exc:
+        log.warning("Рилс: ответ Claude так и не разобрался: %s", exc)
+        raise ReelError("Claude ответил не по формату — попробуй ещё раз") from exc
 
 
 def _grid_crop(im: Image.Image, box: list[float]) -> tuple[Image.Image, tuple[float, float, float, float]]:
