@@ -27,6 +27,7 @@ FPS = int(os.getenv("REEL_FPS", "30"))
 ASPECT = H / W
 FONTS = Path(__file__).resolve().parent.parent / "data" / "fonts"
 FADE = 0.35                     # появление и исчезновение текста, с
+BAR_TOP = 280                # подпись сверху — ниже шапки Instagram, как в Remotion
 LOGO_BOTTOM = int(os.getenv("REEL_LOGO_BOTTOM", "380"))   # знак выше подписи Instagram, иначе её плашка его закроет
 MAX_SIDE = 4200                 # больше не нужно даже для крупных деталей
 
@@ -324,9 +325,9 @@ def collection(title: str, items: list[dict], out: Path) -> float:
         if n == 0:
             head = text_block([(title.upper(), font(92), 0)], width=920)
             layers.append((head, ((W - head.width) // 2, int(H * 0.40) - head.height // 2), 0, TITLE_HOLD, False, True))
-            layers.append((lab, (lx, 150), TITLE_HOLD, dur, True, False))
+            layers.append((lab, (lx, BAR_TOP), TITLE_HOLD, dur, True, False))
         else:
-            layers.append((lab, (lx, 150), 0, dur, False, False))
+            layers.append((lab, (lx, BAR_TOP), 0, dur, False, False))
         shots.append({"stage": st, "keys": [(0, a), (dur, b)], "dur": dur, "eased": False, "layers": layers})
     # последний кадр чуть дольше, с плавным уходом в чёрный не заморачиваемся: Instagram зацикливает ролик
     return encode(shots, out)
