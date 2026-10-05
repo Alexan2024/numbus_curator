@@ -86,10 +86,11 @@ def _url(base: str, folder: Path, path: Path | str) -> str:
 # и не приближается сильнее ZOOM_MAX экранных пикселей на пиксель картины (иначе мыло).
 
 ZOOM_MAX = float(os.getenv("REEL_ZOOM_MAX", "1.25"))
-WIN = (290, 1170)            # окно для детали под рассказом: от верхней строки до подписи (безопасные зоны Instagram)
+WIN = (330, 1170)            # окно для детали под рассказом: от верхней строки до подписи (безопасные зоны Instagram)
 FULL_H = 1450                # общий план: картина не выше этого
 HOLD_ZOOM = 1.04             # медленный наезд, пока камера стоит на детали
-HOOK_TOP = 290               # хук сверху — ниже шапки Instagram
+END_TOP = 350                # титр «Деталей»: верх картины — под строкой со знаком (BAR_TOP 280 в common.tsx)
+HOOK_TOP = 380               # хук сверху — ниже шапки Instagram и строки со знаком (BAR_TOP в common.tsx)
 HOOK_PUSH = float(os.getenv("REEL_HOOK_PUSH", "1.12"))   # первый кадр чуть шире и сразу наезд: движение с кадра 0
 HOOK_PUSH_T = 0.9
 LOOP = os.getenv("REEL_LOOP", "1").strip().lower() not in ("0", "off", "false", "no")
@@ -463,12 +464,12 @@ def story_props(folder: Path, image: Path, beats: list[dict], voice, pt: dict, s
             o["label"] = b.get("label") or ""
             o["n"] = reveal_n
     end_start = max(ends[-1], voice_dur) + 0.3
-    # титр: картина вписывается в поле 936×760 слева сверху, камера сама приводит её туда
-    s_end = min(936 / pw, 760 / ph)
+    # титр: картина вписывается в поле 936×710 слева сверху (с END_TOP — ниже строки со знаком), камера сама приводит её туда
+    s_end = min(936 / pw, 710 / ph)
     cwe = W / s_end
     end_start = max(end_start, cam[-1][0] + 0.1)
     cam.append([end_start, *cam[-1][1:4], 0])
-    label_cam = [cwe / 2 - M / s_end, cwe * A / 2 - 300 / s_end, cwe]
+    label_cam = [cwe / 2 - M / s_end, cwe * A / 2 - END_TOP / s_end, cwe]
     cam.append([end_start + 1.6, *label_cam, 0])
     loop_start = None
     if LOOP:
@@ -496,7 +497,7 @@ def story_props(folder: Path, image: Path, beats: list[dict], voice, pt: dict, s
     return {"fps": FPS, "duration": round(dur * FPS), "pw": pw, "ph": ph,
             "cam": [[round(x, 3) for x in k] for k in cam], "marks": marks,
             "loopStart": round(loop_start, 3) if loop_start else None, "coverT": round(max(0.8, out[0]["end"] - 0.35), 2),
-            "beats": out, "sfx": events, "slack": list(HOOK_SLACK), "endStart": round(end_start, 3), "labelTop": round(300 + ph * s_end + 60),
+            "beats": out, "sfx": events, "slack": list(HOOK_SLACK), "endStart": round(end_start, 3), "labelTop": round(END_TOP + ph * s_end + 60),
             "title": pt.get("title") or "", "sub": ", ".join(x for x in (pt.get("author"), year) if x),
             "rubric": pt.get("rubric") or RUBRIC, "series": " · ".join(x for x in (pt.get("title"), year) if x), "meta": meta,
             "image": str(image), "voice": str(voice_path) if voice_path else None, "_dur": dur,
@@ -559,8 +560,8 @@ def _timeline(beats: list[dict], voice, min_part: float = 1.6) -> tuple[list[dic
 # в шторке — половина на половину, в растворении — B поверх A. Переход — на слове-якоре ^.
 
 PAIR_TR = {"wipe": 1.4, "dissolve": 1.3, "split": 1.0}
-SPLIT_TOP, SPLIT_BOTTOM = 300, 1300                    # сравнение — в этом поясе экрана
-END_BOX = (M, 330, W - 2 * M, 700)                     # две картинки рядом на титре
+SPLIT_TOP, SPLIT_BOTTOM = 340, 1300                    # сравнение — в этом поясе экрана
+END_BOX = (M, 350, W - 2 * M, 680)                     # две картинки рядом на титре
 
 
 def _view_at(pw, ph, x, y, w, h):
@@ -820,7 +821,7 @@ def paper_color(path: Path) -> str:
 # целиком, как на стене. Без наездов на детали. Смена работ — через короткое затемнение, кадры не накладываются.
 
 BLEED = float(os.getenv("REEL_BLEED_MAX", "0.72"))   # все работы уже этого (ширина / высота) — подборка на весь кадр
-BOX_W, BOX_TOP, BOX_BOTTOM = 936, 260, 1126          # поле картины; низ картины — на одной линии у всех работ
+BOX_W, BOX_TOP, BOX_BOTTOM = 936, 340, 1126          # поле картины; низ картины — на одной линии у всех работ
 TEXT_TOP = 1190                                       # подпись — на одном месте у всех работ
 RHYTHM = [1.0, 0.85, 1.15, 0.9, 1.1, 0.95]
 
