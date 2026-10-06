@@ -108,6 +108,43 @@ class ReelError(RuntimeError):
     """Понятная автору причина, почему рилс не собрался."""
 
 
+class SwapObject(ReelError):
+    """С этим объектом рилс не собрать (нет хорошей картинки, не скачалась, нет сюжета) — бот сам берёт другой."""
+
+    def __init__(self, msg: str, what: str = ""):
+        super().__init__(msg)
+        self.what = what
+
+
+# Сколько объектов бот перебирает сам, прежде чем сдаться. Каждая попытка — 1–2 вызова Claude.
+PICK_TRIES = int(os.getenv("REEL_PICK_TRIES", "5"))
+THEME_TRIES = int(os.getenv("REEL_THEME_TRIES", "3"))     # тем подборки
+MORE_ROUNDS = int(os.getenv("REEL_MORE_ROUNDS", "3"))     # добор работ в одну тему
+
+
+def _fkey(it: dict) -> str:
+    """Имя файла от источника: новый объект не подхватит картинку прежнего."""
+    return hashlib.md5(str(it.get("url") or it.get("file") or it.get("title")).encode()).hexdigest()[:8]
+
+
+def _mark_tried(d: dict, what: str) -> None:
+    """Запомнить неудачный объект — ни сейчас, ни на «Ещё раз» Claude его больше не предложит."""
+    t = d.setdefault("tried", [])
+    if what and what not in t:
+        t.append(what)
+    del t[:-40]
+
+
+def _tried_prompt(d: dict, noun: str = "works") -> str:
+    t = d.get("tried") or []
+    if not t:
+        return ""
+    return (f"\n\nThese {noun} were already tried and have no usable large image online (or no story) — "
+            "do NOT suggest them again, pick something else:\n" + "\n".join(f"- {x}" for x in t)
+            + ("\nIf the requested work itself is in this list, pick the closest alternative that still fits "
+               "the request." if d.get("request") else ""))
+
+
 class ReelEdit(StatesGroup):
     caption = State()
     theme = State()
@@ -437,8 +474,22 @@ async def verify(client: httpx.AsyncClient, works: list[dict], background: bool,
         async with sem:
             own = list(w.get("cands") or [])
             mus = await museum_candidates(client, w) if museums and not own else []
-            c = await commons_candidates(client, w.get("commons") or f"{w.get('title')} {w.get('author')}", per + 2) \
-                if w.get("commons") or not own else []
+            c = []
+            if w.get("commons") or not own:
+                # запрос Claude, потом «название автор», потом просто название — пока не наберётся кандидатов
+                qs: list[str] = []
+                for q in (w.get("commons"), f"{w.get('title') or ''} {w.get('author') or ''}", w.get("title")):
+                    q = re.sub(r"\s+", " ", str(q or "")).strip()
+                    if q and q.lower() not in (x.lower() for x in qs):
+                        qs.append(q)
+                seen = set()
+                for q in qs:
+                    for x in await commons_candidates(client, q, per + 2):
+                        if x["title"] not in seen:
+                            seen.add(x["title"])
+                            c.append(x)
+                    if len(c) >= per:
+                        break
             c = own + mus + c
             if max_aspect:
                 c = [x for x in c if not x["w"] or x["w"] / max(1, x["h"]) <= max_aspect]
@@ -865,43 +916,78 @@ async def _collection(rid: int, d: dict, background: bool, client: httpx.AsyncCl
     if not d.get("items"):
         topic = d.get("topic") or await _next_topic()
         req = d.get("request")
-        prompt = ((f"Theme requested by the author: {req}\n" if req else
-                   f"Area for this reel: {topic} — {TOPIC_HINT.get(topic, topic)}.\n")
-                  + "Avoid these earlier reel titles:\n" + ("\n".join(await _avoid("collection")) or "—"))
-        plan = await _ask(prompt, system=rk.localize(COLLECTION_SYSTEM, lang, rk.RU_NAMES_WORKS), max_tokens=4000,
-                          background=background)
-        works = [w for w in plan.get("works") or [] if w.get("title")]
-        if not works:
-            raise ReelError("Claude не предложил работ")
-        vertical = str(plan.get("format") or "").lower() == "vertical"
-        tall = reelplan.BLEED + 0.03 if vertical else None
-        good = await verify(client, works[:12], background, max_aspect=tall)
-        if len(good) < MIN_ITEMS:
-            more = await _ask(
-                f"Theme: {plan.get('title')}\nFormat: {'vertical — only tall portrait-format works' if vertical else 'framed'}"
-                + "\nAlready in the reel: " + "; ".join(f"{w['title']} — {w['author']}" for w in good)
-                + "\nNot found on Commons: " + "; ".join(w["title"] for w in works
-                                                           if w["title"] not in {g["title"] for g in good})
-                + f"\nGive {MAX_ITEMS} more works.", system=rk.localize(MORE_SYSTEM, lang, rk.RU_NAMES_WORKS),
-                max_tokens=2500, background=background)
-            good += await verify(client, (more.get("works") or [])[:MAX_ITEMS], background, max_aspect=tall)
-        if vertical and len(good) < MIN_ITEMS:
-            # вертикальных не хватило — подборка станет «целиком», добираем любые
-            log.info("Рилс: вертикальных работ %s — собираю подборку целиком", len(good))
-            have = {g["title"] for g in good}
-            good += await verify(client, [w for w in works[:12] if w["title"] not in have], background)
-        if len(good) < MIN_ITEMS:
-            raise ReelError(f"хороших картинок нашлось только {len(good)} из {MIN_ITEMS} нужных — попробуй другую тему")
+        plan, good = {}, []
+        for attempt in range(1, THEME_TRIES + 1):
+            prompt = ((f"Theme requested by the author: {req}\n" if req else
+                       f"Area for this reel: {topic} — {TOPIC_HINT.get(topic, topic)}.\n")
+                      + "Avoid these earlier reel titles:\n" + ("\n".join(await _avoid("collection")) or "—")
+                      + _tried_prompt(d, "themes and works"))
+            plan = await _ask(prompt, system=rk.localize(COLLECTION_SYSTEM, lang, rk.RU_NAMES_WORKS), max_tokens=4000,
+                              background=background)
+            works = [w for w in plan.get("works") or [] if w.get("title")]
+            if not works:
+                log.info("Рилс %s: тема %s — Claude не дал работ, беру другую", rid, attempt)
+                continue
+            vertical = str(plan.get("format") or "").lower() == "vertical"
+            tall = reelplan.BLEED + 0.03 if vertical else None
+            good = await verify(client, works[:12], background, max_aspect=tall)
+            missing = [w["title"] for w in works if w["title"] not in {g["title"] for g in good}]
+            for _ in range(MORE_ROUNDS):
+                if len(good) >= MIN_ITEMS:
+                    break
+                more = await _ask(
+                    f"Theme: {plan.get('title')}\nFormat: {'vertical — only tall portrait-format works' if vertical else 'framed'}"
+                    + "\nAlready in the reel: " + "; ".join(f"{w['title']} — {w['author']}" for w in good)
+                    + "\nNot found on Commons, do not repeat: " + "; ".join(missing)
+                    + f"\nGive {MAX_ITEMS} more works.", system=rk.localize(MORE_SYSTEM, lang, rk.RU_NAMES_WORKS),
+                    max_tokens=2500, background=background)
+                cand = [w for w in (more.get("works") or []) if w.get("title")][:MAX_ITEMS]
+                got = await verify(client, cand, background, max_aspect=tall)
+                files = {g["file"] for g in good}
+                good += [g for g in got if g["file"] not in files]
+                missing += [w["title"] for w in cand if w["title"] not in {g["title"] for g in got}]
+                log.info("Рилс %s: добор — нашлось ещё %s, всего %s", rid, len(got), len(good))
+            if vertical and len(good) < MIN_ITEMS:
+                # вертикальных не хватило — подборка станет «целиком», добираем любые
+                log.info("Рилс: вертикальных работ %s — собираю подборку целиком", len(good))
+                have = {g["title"] for g in good}
+                good += await verify(client, [w for w in works[:12] if w["title"] not in have], background)
+            if len(good) >= MIN_ITEMS:
+                if attempt > 1:
+                    d["swap_note"] = f"собрал с {attempt}-й темы — в прежних не хватило картинок"
+                break
+            log.info("Рилс %s: тема «%s» — картинок %s из %s, беру другую", rid, plan.get("title"), len(good), MIN_ITEMS)
+            _mark_tried(d, f"theme: {plan.get('title')}")
+            for t in missing[:10]:
+                _mark_tried(d, t)
+            await _set(rid, data=d)
+        else:
+            raise ReelError(f"перебрал {THEME_TRIES} темы — ни в одной не набралось {MIN_ITEMS} хороших картинок. "
+                            "«Ещё раз» продолжит с новыми темами")
         title_em = str(plan.get("title") or "")[:44]
         d.update(intro=plan.get("intro") or "", intro_delivery=plan.get("intro_delivery") or "")
         d.update(title=title_em.replace("*", ""), title_em=title_em, theme_ru=plan.get("theme_ru") or "",
                  caption=plan.get("caption") or "", hashtags=plan.get("hashtags") or [],
                  music=(plan.get("music") or [])[:3], topic=topic, items=good[:MAX_ITEMS], spare=good[MAX_ITEMS:])
-    for n, it in enumerate(d["items"]):
-        path = folder / f"{n:02d}_{hashlib.md5((it.get('url') or it['file']).encode()).hexdigest()[:8]}.jpg"
-        if not path.exists():
-            await fetch_image(client, it, path)
+    # картинка не скачалась — выкидываем её и берём запасную, а не роняем весь рилс
+    pool, ok, bad = list(d["items"]) + list(d.get("spare") or []), [], []
+    for it in pool:
+        if len(ok) >= len(d["items"]):
+            break
+        path = folder / f"{len(ok):02d}_{hashlib.md5((it.get('url') or it['file']).encode()).hexdigest()[:8]}.jpg"
+        try:
+            if not path.exists():
+                await fetch_image(client, it, path)
+        except Exception as exc:
+            log.warning("Рилс %s: не скачалась «%s»: %s", rid, it.get("title"), exc)
+            bad.append(it)
+            continue
         it["path"] = str(path)
+        ok.append(it)
+    if len(ok) < MIN_ITEMS:
+        d.pop("items", None)
+        raise ReelError(f"скачалось только {len(ok)} картинок из {MIN_ITEMS} — «Ещё раз» соберёт с новыми работами")
+    d["items"], d["spare"] = ok, [it for it in pool if it not in ok and it not in bad]
     render_items = [{"path": it["path"], "label": _disp(it, lang)["title"],
                      "sub": _disp(it, lang)["author"] if lang == "ru" else f"By {it['author']}",
                      "focus": it.get("focus") or [0.5, 0.5]} for it in d["items"]]
@@ -931,61 +1017,91 @@ async def _details(rid: int, d: dict, background: bool, client: httpx.AsyncClien
     kind = d.get("kind") or "details"
     folder = DIR / str(rid)
     lang = rk.lang_of(d)
-    if not d.get("painting"):
-        req = d.get("request")
-        prompt = ((f"The author asks for: {req}\n" if req else "")
-                  + "Avoid (already done):\n" + (("\n".join(await _avoid(kind))) or "—"))
-        tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
-        system = rk.localize_pick(PAINTING_SYSTEM if kind == "details" else rk.PICK[kind], lang)
-        p = await _ask(prompt, system=system, max_tokens=4000, tools=tools, background=background)
-        if not p.get("title"):
-            raise ReelError(f"Claude не выбрал: {rk.KINDS[kind]['obj']}")
-        p["need"] = rk.NEED.get(kind, "")
-        good = await verify(client, [p], background, per=4, museums=kind in ("details", "photo"))
-        if not good:
-            raise ReelError(f"не нашлось хорошей картинки «{p['title']}» — попробуй другую")
-        d.update(painting=good[0], title=f"{p['title']}", music=(p.get("music") or [])[:3],
-                 facts=p.get("facts") or [])
-        d.pop("frames", None)
-        d.pop("story", None)
-    pt = d["painting"]
-    path = Path(pt.get("path") or folder / "painting.jpg")
-    if not path.exists():
-        await fetch_image(client, pt, path)
-    pt["path"] = str(path)
-    if not d.get("story") and not d.get("frames"):
-        with Image.open(path) as im:
-            block = _img_block(im.convert("RGB"))
-        avoid = d.get("avoid_frames") or []
-        noun = {"details": "Painting", "photo": "Photograph"}.get(kind, "Building")
-        text = (f"{noun}: {pt['title']} — {pt['author']}, {pt.get('year')}. {pt.get('museum') or ''}\n\nFacts:\n"
-                + "\n".join(f"- {f}" for f in d.get("facts") or [])
-                + ("\n\nThe previous version used these details and lines, choose others where possible:\n"
-                   + "\n".join(avoid) if avoid else ""))
-        system = rk.localize(STORY_SYSTEM if kind == "details" else rk.story_system(kind), lang)
-        st = await _ask([block, {"type": "text", "text": text}], system=system, max_tokens=5000,
-                        background=background)
-        hooks = [h for h in st.get("hooks") or [] if h.get("text")]
-        reveals = [r for r in st.get("reveals") or [] if r.get("text") and _box(r.get("box"))][:4]
-        if not hooks or len(reveals) < 2:
-            raise ReelError("Claude не собрал сюжет — попробуй другой объект")
+    picked_now, last, attempt = False, "", 0
+    for attempt in range(1, PICK_TRIES + 1):
         try:
-            pick = int(st.get("hook_pick") or 0)
-        except (TypeError, ValueError):
-            pick = 0
-        # выбранный хук — первым, остальные — для кнопки «Другой хук»
-        pick = pick if 0 <= pick < len(hooks) else 0
-        hooks = [hooks[pick]] + [h for i, h in enumerate(hooks) if i != pick]
-        d["story"] = {"hooks": hooks, "hook_i": 0, "context": st.get("context") or "", "reveals": reveals,
-                      "climax": st.get("climax") or {}, "final": st.get("final") or "",
-                      "context_delivery": st.get("context_delivery") or "", "final_delivery": st.get("final_delivery") or "",
-                      "voice_direction": st.get("voice_direction") or ""}
-        for k in ("figure_label", "context_box"):
-            if st.get(k):
-                d["story"][k] = st[k]
-        d.update(caption=st.get("caption") or "", hashtags=st.get("hashtags") or [])
-        n = await refine_boxes(path, d["story"], background)
-        log.info("Рилс: уточнил рамок %s", n)
+            if not d.get("painting"):
+                picked_now = True
+                req = d.get("request")
+                prompt = ((f"The author asks for: {req}\n" if req else "")
+                          + "Avoid (already done):\n" + (("\n".join(await _avoid(kind))) or "—")
+                          + _tried_prompt(d, "objects"))
+                tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
+                system = rk.localize_pick(PAINTING_SYSTEM if kind == "details" else rk.PICK[kind], lang)
+                p = await _ask(prompt, system=system, max_tokens=4000, tools=tools, background=background)
+                if not p.get("title"):
+                    raise SwapObject(f"Claude не выбрал: {rk.KINDS[kind]['obj']}")
+                what = f"{p['title']} — {p.get('author') or ''}".strip(" —")
+                p["need"] = rk.NEED.get(kind, "")
+                good = await verify(client, [p], background, per=4, museums=kind in ("details", "photo"))
+                if not good:
+                    raise SwapObject(f"не нашлось хорошей картинки «{p['title']}»", what)
+                d.update(painting=good[0], title=f"{p['title']}", music=(p.get("music") or [])[:3],
+                         facts=p.get("facts") or [])
+                d.pop("frames", None)
+                d.pop("story", None)
+            pt = d["painting"]
+            what = f"{pt.get('title')} — {pt.get('author') or ''}".strip(" —")
+            path = Path(pt.get("path") or folder / f"painting_{_fkey(pt)}.jpg")
+            if not path.exists():
+                try:
+                    await fetch_image(client, pt, path)
+                except Exception as exc:
+                    raise SwapObject(f"картинка «{pt.get('title')}» не скачалась ({str(exc)[:60]})", what) from exc
+            pt["path"] = str(path)
+            if not d.get("story") and not d.get("frames"):
+                with Image.open(path) as im:
+                    block = _img_block(im.convert("RGB"))
+                avoid = d.get("avoid_frames") or []
+                noun = {"details": "Painting", "photo": "Photograph"}.get(kind, "Building")
+                text = (f"{noun}: {pt['title']} — {pt['author']}, {pt.get('year')}. {pt.get('museum') or ''}\n\nFacts:\n"
+                        + "\n".join(f"- {f}" for f in d.get("facts") or [])
+                        + ("\n\nThe previous version used these details and lines, choose others where possible:\n"
+                           + "\n".join(avoid) if avoid else ""))
+                system = rk.localize(STORY_SYSTEM if kind == "details" else rk.story_system(kind), lang)
+                hooks, reveals, st = [], [], {}
+                for _ in range(2):                  # сюжет не сложился — ещё раз, потом другой объект
+                    st = await _ask([block, {"type": "text", "text": text}], system=system, max_tokens=5000,
+                                    background=background)
+                    hooks = [h for h in st.get("hooks") or [] if h.get("text")]
+                    reveals = [r for r in st.get("reveals") or [] if r.get("text") and _box(r.get("box"))][:4]
+                    if hooks and len(reveals) >= 2:
+                        break
+                else:
+                    raise SwapObject(f"Claude не собрал сюжет про «{pt['title']}»", what)
+                try:
+                    pick = int(st.get("hook_pick") or 0)
+                except (TypeError, ValueError):
+                    pick = 0
+                # выбранный хук — первым, остальные — для кнопки «Другой хук»
+                pick = pick if 0 <= pick < len(hooks) else 0
+                hooks = [hooks[pick]] + [h for i, h in enumerate(hooks) if i != pick]
+                d["story"] = {"hooks": hooks, "hook_i": 0, "context": st.get("context") or "", "reveals": reveals,
+                              "climax": st.get("climax") or {}, "final": st.get("final") or "",
+                              "context_delivery": st.get("context_delivery") or "", "final_delivery": st.get("final_delivery") or "",
+                              "voice_direction": st.get("voice_direction") or ""}
+                for k in ("figure_label", "context_box"):
+                    if st.get(k):
+                        d["story"][k] = st[k]
+                d.update(caption=st.get("caption") or "", hashtags=st.get("hashtags") or [])
+                n = await refine_boxes(path, d["story"], background)
+                log.info("Рилс: уточнил рамок %s", n)
+            break
+        except SwapObject as exc:
+            if not picked_now:
+                # объект выбран раньше (переделка рассказа) — молча менять его нельзя
+                raise ReelError(f"{exc} — попробуй «Другая картина»") from exc
+            last = str(exc)
+            log.info("Рилс %s: попытка %s — %s, беру другой объект", rid, attempt, last)
+            _mark_tried(d, exc.what)
+            for k in ("painting", "story", "frames", "facts", "music", "title"):
+                d.pop(k, None)
+            await _set(rid, data=d)
+    else:
+        raise ReelError(f"перебрал {PICK_TRIES} вариантов — ни один не подошёл (последний: {last}). "
+                        "«Ещё раз» продолжит с новыми")
+    if attempt > 1:
+        d["swap_note"] = f"собрал с {attempt}-й попытки — до этого: {last}"
     if lang == "ru":
         await _ensure_ru([pt], background)
     show = _disp(pt, lang)
@@ -1019,82 +1135,114 @@ async def _pair(rid: int, d: dict, background: bool, client: httpx.AsyncClient) 
     spec = rk.KINDS[kind]
     folder = DIR / str(rid)
     lang = rk.lang_of(d)
-    if not d.get("pair"):
-        req = d.get("request")
-        prompt = ((f"The author asks for: {req}\n" if req else "")
-                  + "Avoid (already done):\n" + (("\n".join(await _avoid(kind))) or "—"))
-        tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}]
-        p = await _ask(prompt, system=rk.localize_pick(rk.pair_pick_system(kind), lang, rk.RU_NAMES_PAIR), max_tokens=4000,
-                       tools=tools, background=background)
-        a, b = p.get("a") or {}, p.get("b") or {}
-        if not a.get("title") or not b.get("title"):
-            raise ReelError("Claude не подобрал пару")
-        got = []
-        for side, role in ((a, spec["roles"][0]), (b, spec["roles"][1])):
-            w = {k: side.get(k) for k in ("title", "author", "year", "museum", "commons", "role", "ru")}
-            w["need"] = rk.PAIR_NEED.get(side.get("role") or "", "") or rk.PAIR_NEED.get(role, "")
-            if kind == "film" and side is b:
-                w["cands"] = await tmdb_candidates(client, b.get("film") or {"title": b.get("title"), "year": b.get("year")})
-                if not w["cands"] and not w.get("commons"):
-                    raise ReelError("кадров фильма нет: задай TMDB_API_KEY или возьми фильм в общественном достоянии")
-            museums = (side.get("role") or "").lower() in ("drawing", "painted", "painting", "visible", "a", "b")
-            good = await verify(client, [w], background, per=4, museums=museums)
-            if not good:
-                raise ReelError(f"не нашлось хорошей картинки «{w['title']}» — попробуй другую пару")
-            got.append(good[0])
-        d.update(pair={"a": got[0], "b": got[1], "title": p.get("title") or a["title"], "answer": p.get("answer"),
-                       "title_ru": p.get("title_ru") or ""},
-                 title=p.get("title") or a["title"], music=(p.get("music") or [])[:3], facts=p.get("facts") or [])
-        d.pop("story", None)
-    pr = d["pair"]
-    paths = []
-    for n, side in enumerate(("a", "b")):
-        it = pr[side]
-        path = Path(it.get("path") or folder / f"pair_{side}.jpg")
-        if not path.exists():
-            await fetch_image(client, it, path)
-        it["path"] = str(path)
-        paths.append(path)
-    if not d.get("story"):
-        blocks = []
-        for side, path in zip(("A", "B"), paths):
-            it = pr[side.lower()]
-            blocks.append({"type": "text", "text": f"Image {side}: {it.get('title')} — {it.get('author') or ''}, {it.get('year') or ''}"})
-            with Image.open(path) as im:
-                blocks.append(_img_block(im.convert("RGB"), 1400))
-        avoid = d.get("avoid_frames") or []
-        text = ("Facts:\n" + "\n".join(f"- {f}" for f in d.get("facts") or [])
-                + (f"\nThe answer to the question: image {str(pr.get('answer')).upper()}" if kind == "which" and pr.get("answer") else "")
-                + ("\n\nThe previous version used these lines, write a different story:\n" + "\n".join(avoid) if avoid else ""))
-        st = await _ask(blocks + [{"type": "text", "text": text}], system=rk.localize(rk.pair_story_system(kind), lang),
-                        max_tokens=5000,
-                        background=background)
-        hooks = [h for h in st.get("hooks") or [] if h.get("text")]
-        reveals = [r for r in st.get("reveals") or [] if r.get("text")][:4]
-        if not hooks or len(reveals) < 2:
-            raise ReelError("Claude не собрал сюжет — попробуй другую пару")
+    picked_now, last, attempt = False, "", 0
+    for attempt in range(1, PICK_TRIES + 1):
         try:
-            pick = int(st.get("hook_pick") or 0)
-        except (TypeError, ValueError):
-            pick = 0
-        pick = pick if 0 <= pick < len(hooks) else 0
-        hooks = [hooks[pick]] + [h for i, h in enumerate(hooks) if i != pick]
-        fin = st.get("final")
-        d["story"] = {"hooks": hooks, "hook_i": 0, "context": st.get("context") if isinstance(st.get("context"), dict)
-                      else {"text": st.get("context") or "", "show": "a"}, "reveals": reveals,
-                      "climax": st.get("climax") or {}, "final": fin if isinstance(fin, dict) else {"text": fin or "", "show": "b"},
-                      "voice_direction": st.get("voice_direction") or ""}
-        d.update(caption=st.get("caption") or "", hashtags=st.get("hashtags") or [])
-        # рамки деталей — вторым проходом, отдельно по каждой картинке
-        parts = [d["story"]["hooks"], d["story"]["reveals"], [d["story"]["climax"]]]
-        for side, path in zip(("a", "b"), paths):
-            sub = {"hooks": [x for x in parts[0] if str(x.get("show")).lower() == side and _box(x.get("box"))],
-                   "reveals": [x for x in parts[1] if str(x.get("show")).lower() == side and _box(x.get("box"))]}
-            cl = d["story"]["climax"]
-            if str(cl.get("show")).lower() == side and _box(cl.get("box")):
-                sub["climax"] = cl
-            if sub["hooks"] or sub["reveals"] or sub.get("climax"):
-                await refine_boxes(path, sub, background)
+            if not d.get("pair"):
+                picked_now = True
+                req = d.get("request")
+                prompt = ((f"The author asks for: {req}\n" if req else "")
+                          + "Avoid (already done):\n" + (("\n".join(await _avoid(kind))) or "—")
+                          + _tried_prompt(d, "pairs"))
+                tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}]
+                p = await _ask(prompt, system=rk.localize_pick(rk.pair_pick_system(kind), lang, rk.RU_NAMES_PAIR), max_tokens=4000,
+                               tools=tools, background=background)
+                a, b = p.get("a") or {}, p.get("b") or {}
+                if not a.get("title") or not b.get("title"):
+                    raise SwapObject("Claude не подобрал пару")
+                what = f"{a['title']} + {b['title']}"
+                got = []
+                for side, role in ((a, spec["roles"][0]), (b, spec["roles"][1])):
+                    w = {k: side.get(k) for k in ("title", "author", "year", "museum", "commons", "role", "ru")}
+                    w["need"] = rk.PAIR_NEED.get(side.get("role") or "", "") or rk.PAIR_NEED.get(role, "")
+                    if kind == "film" and side is b:
+                        w["cands"] = await tmdb_candidates(client, b.get("film") or {"title": b.get("title"), "year": b.get("year")})
+                        if not w["cands"] and not w.get("commons"):
+                            from app import tmdb
+                            if not tmdb.configured():
+                                raise ReelError("кадров фильма нет: задай TMDB_API_KEY или возьми фильм в общественном достоянии")
+                            raise SwapObject(f"у фильма «{w['title']}» нет кадров в TMDB", what)
+                    museums = (side.get("role") or "").lower() in ("drawing", "painted", "painting", "visible", "a", "b")
+                    good = await verify(client, [w], background, per=4, museums=museums)
+                    if not good:
+                        raise SwapObject(f"не нашлось хорошей картинки «{w['title']}»", what)
+                    got.append(good[0])
+                d.update(pair={"a": got[0], "b": got[1], "title": p.get("title") or a["title"], "answer": p.get("answer"),
+                               "title_ru": p.get("title_ru") or ""},
+                         title=p.get("title") or a["title"], music=(p.get("music") or [])[:3], facts=p.get("facts") or [])
+                d.pop("story", None)
+            pr = d["pair"]
+            paths = []
+            for n, side in enumerate(("a", "b")):
+                it = pr[side]
+                path = Path(it.get("path") or folder / f"pair_{side}_{_fkey(it)}.jpg")
+                if not path.exists():
+                    try:
+                        await fetch_image(client, it, path)
+                    except Exception as exc:
+                        raise SwapObject(f"картинка «{it.get('title')}» не скачалась ({str(exc)[:60]})",
+                                         f"{pr['a'].get('title')} + {pr['b'].get('title')}") from exc
+                it["path"] = str(path)
+                paths.append(path)
+            if not d.get("story"):
+                blocks = []
+                for side, path in zip(("A", "B"), paths):
+                    it = pr[side.lower()]
+                    blocks.append({"type": "text", "text": f"Image {side}: {it.get('title')} — {it.get('author') or ''}, {it.get('year') or ''}"})
+                    with Image.open(path) as im:
+                        blocks.append(_img_block(im.convert("RGB"), 1400))
+                avoid = d.get("avoid_frames") or []
+                text = ("Facts:\n" + "\n".join(f"- {f}" for f in d.get("facts") or [])
+                        + (f"\nThe answer to the question: image {str(pr.get('answer')).upper()}" if kind == "which" and pr.get("answer") else "")
+                        + ("\n\nThe previous version used these lines, write a different story:\n" + "\n".join(avoid) if avoid else ""))
+                hooks, reveals, st = [], [], {}
+                for _ in range(2):                          # сюжет не сложился — ещё раз, потом другая пара
+                    st = await _ask(blocks + [{"type": "text", "text": text}], system=rk.localize(rk.pair_story_system(kind), lang),
+                                    max_tokens=5000, background=background)
+                    hooks = [h for h in st.get("hooks") or [] if h.get("text")]
+                    reveals = [r for r in st.get("reveals") or [] if r.get("text")][:4]
+                    if hooks and len(reveals) >= 2:
+                        break
+                else:
+                    raise SwapObject("Claude не собрал сюжет про эту пару", f"{pr['a'].get('title')} + {pr['b'].get('title')}")
+                try:
+                    pick = int(st.get("hook_pick") or 0)
+                except (TypeError, ValueError):
+                    pick = 0
+                pick = pick if 0 <= pick < len(hooks) else 0
+                hooks = [hooks[pick]] + [h for i, h in enumerate(hooks) if i != pick]
+                fin = st.get("final")
+                d["story"] = {"hooks": hooks, "hook_i": 0, "context": st.get("context") if isinstance(st.get("context"), dict)
+                              else {"text": st.get("context") or "", "show": "a"}, "reveals": reveals,
+                              "climax": st.get("climax") or {}, "final": fin if isinstance(fin, dict) else {"text": fin or "", "show": "b"},
+                              "voice_direction": st.get("voice_direction") or ""}
+                d.update(caption=st.get("caption") or "", hashtags=st.get("hashtags") or [])
+                # рамки деталей — вторым проходом, отдельно по каждой картинке
+                parts = [d["story"]["hooks"], d["story"]["reveals"], [d["story"]["climax"]]]
+                for side, path in zip(("a", "b"), paths):
+                    sub = {"hooks": [x for x in parts[0] if str(x.get("show")).lower() == side and _box(x.get("box"))],
+                           "reveals": [x for x in parts[1] if str(x.get("show")).lower() == side and _box(x.get("box"))]}
+                    cl = d["story"]["climax"]
+                    if str(cl.get("show")).lower() == side and _box(cl.get("box")):
+                        sub["climax"] = cl
+                    if sub["hooks"] or sub["reveals"] or sub.get("climax"):
+                        await refine_boxes(path, sub, background)
+            break
+        except SwapObject as exc:
+            if not picked_now:
+                raise ReelError(f"{exc} — попробуй «Другая пара»") from exc
+            last = str(exc)
+            log.info("Рилс %s: попытка %s — %s, беру другую пару", rid, attempt, last)
+            _mark_tried(d, exc.what)
+            for k in ("pair", "story", "facts", "music", "title"):
+                d.pop(k, None)
+            await _set(rid, data=d)
+    else:
+        raise ReelError(f"перебрал {PICK_TRIES} пар — ни одна не подошла (последняя: {last}). "
+                        "«Ещё раз» продолжит с новыми")
+    if attempt > 1:
+        d["swap_note"] = f"собрал с {attempt}-й попытки — до этого: {last}"
+    pr = d["pair"]
     bs = beats(d)
     voice = await _voice(folder, d, bs)
     video = folder / f"reel_{int(datetime.now().timestamp())}.mp4"
@@ -1214,6 +1362,7 @@ async def generate(bot: Bot, rid: int, background: bool = True) -> None:
             return
         await _set(rid, status="building", note=None)
         d = _data(r)
+        d.pop("swap_note", None)
         old_video = d.get("video")
         try:
             if not reelrender.ffmpeg_ok():
@@ -1313,6 +1462,8 @@ def _card_text(r, d: dict, note: str | None = None) -> str:
     mus = _music_lines(d)
     if mus:
         lines += ["", "🎵 Музыка:"] + mus
+    if d.get("swap_note"):
+        lines.append(f"\n🔄 {html.escape(d['swap_note'])}")
     if d.get("render_note"):
         lines.append(f"\n⚠️ {html.escape(d['render_note'])}")
     if r["kind"] != "collection" or d.get("voice"):
@@ -2071,8 +2222,9 @@ async def on_cb(cb: CallbackQuery, bot: Bot, state: FSMContext):
         if r["status"] != "failed":
             return
         d = _data(r)
-        if "хороших картинок" in (r["note"] or "") or "не нашлось" in (r["note"] or ""):
-            d = {k: v for k, v in d.items() if k in ("request", "lang")}     # тема не удалась — берём новую
+        if any(x in (r["note"] or "") for x in ("хороших картинок", "не нашлось", "перебрал", "скачалось")):
+            # объект не удался — берём новый; «tried» оставляем, чтобы не предложить те же самые снова
+            d = {k: v for k, v in d.items() if k in ("request", "lang", "tried")}
         await _set(rid, data=d)
         start(bot, rid)
         if cb.message.photo:
