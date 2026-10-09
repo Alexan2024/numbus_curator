@@ -151,12 +151,12 @@ async def _publish(bot: Bot, pid: int, how: str, slot_key: str | None) -> bool:
     site_kind = sitepub.wants(post)
     if site_kind == "object" and post["format"] == "std":
         url = await sitepub.prepare_safe(post)
-        if url:
+        if url and await sitepub.links_on():
             caption = sitepub.with_archive_link(
                 caption, url, formatter.visible_len(caption) <= config.CAPTION_LIMIT and bool(files))
     elif site_kind == "note":
         url = await sitepub.publish_note_safe(post)
-        if url:
+        if url and await sitepub.links_on():   # без ссылок заметка выходит в канале целиком
             caption, preview = sitepub.note_announcement(post, url)
 
     if preview:

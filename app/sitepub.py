@@ -12,6 +12,10 @@
 • Подборки на сайт не идут.
 Если сайт недоступен или не настроен, посты выходят как раньше: без ссылки, заметка целиком в канале.
 
+Ссылки на сайт в канале и в сторис включаются отдельно (/site → «🔗 Ссылки»), по умолчанию выключены: пока сайт
+не афишируем, записи тихо попадают на сайт, а посты выходят без «в архиве →», заметка — целиком в канале,
+фон для сторис к заметке — без ссылки.
+
 Сайт собирается целиком (site/sitebuild.py и site/prerender.js, около секунды) и сверяется со списком файлов,
 которые уже лежат на хостинге (assets/manifest.json): по FTP уходят только изменённые файлы.
 
@@ -25,7 +29,8 @@
   SITE_FTP_DIR — папка сайта на FTP, по умолчанию theahmag.com/public_html (для отдельного FTP-аккаунта,
   который смотрит прямо в папку сайта, — пустая строка или «/»);
   SITE_URL — адрес сайта, по умолчанию https://theahmag.com;  SITE=0 — выключить публикацию на сайт;
-  IV_RHASH — номер шаблона Instant View: ссылки на заметки пойдут через t.me/iv.
+  IV_RHASH — номер шаблона Instant View: ссылки на заметки пойдут через t.me/iv;
+  SITE_LINKS=1 — ссылки на сайт включены с самого начала (иначе — кнопкой в /site).
 """
 import asyncio
 import ftplib
@@ -76,6 +81,7 @@ FTP_TLS = os.getenv("SITE_FTP_TLS", "auto").strip().lower()     # auto | 1 | 0
 IV_RHASH = os.getenv("IV_RHASH", "").strip()
 LINK_STD = os.getenv("SITE_LINK_TEXT", "в архиве →")
 LINK_NOTE = os.getenv("SITE_NOTE_LINK_TEXT", "читать →")
+LINKS_DEFAULT = os.getenv("SITE_LINKS", "0").strip().lower() in ("1", "true", "yes", "on")
 PREPARE_TIMEOUT = int(os.getenv("SITE_TIMEOUT", "120"))        # сек.: дольше пост не ждёт сайт
 
 ROOT = config.DATA_DIR / "site"
@@ -824,6 +830,11 @@ async def publish_note_safe(post) -> str | None:
 
 # ======================= подпись в канал =======================
 
+async def links_on() -> bool:
+    """Ставить ли ссылки на сайт в канал и сторис. Пока сайт не афишируем — нет."""
+    return bool(await db.get_setting("site_links", LINKS_DEFAULT))
+
+
 def iv_link(url: str) -> str:
     """Ссылка с Instant View: Telegram покажет страницу по шаблону, пока шаблон не одобрен для всех."""
     if not IV_RHASH:
@@ -1195,21 +1206,24 @@ async def view_text() -> str:
         waiting = pending_updates(cs)
         if waiting:
             lines.append(f"Правки записей ждут выкладки: {len(waiting)}")
+    lines.append("Ссылки на сайт в канале и сторис: " + ("включены" if await links_on() else "выключены"))
     lines.append("Instant View для заметок: " + ("включён" if IV_RHASH else "нет (переменная IV_RHASH)"))
     return "\n".join(lines)
 
 
-def _kb(on: bool) -> InlineKeyboardMarkup:
+def _kb(on: bool, links: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔍 Проверить связь", callback_data="site:check"),
          InlineKeyboardButton(text="🔁 Повторить", callback_data="site:retry")],
         [InlineKeyboardButton(text="🔄 Пересобрать сайт", callback_data="site:rebuild"),
-         InlineKeyboardButton(text="⏸ Выключить" if on else "▶️ Включить", callback_data="site:toggle")]])
+         InlineKeyboardButton(text="⏸ Выключить" if on else "▶️ Включить", callback_data="site:toggle")],
+        [InlineKeyboardButton(text="🔗 Ссылки: убрать" if links else "🔗 Ссылки: поставить",
+                              callback_data="site:links")]])
 
 
 @router.message(Command("site"))
 async def cmd_site(msg: Message):
-    await msg.answer(await view_text(), reply_markup=_kb(bool(await db.get_setting("site_enabled", True))),
+    await msg.answer(await view_text(), reply_markup=_kb(bool(await db.get_setting("site_enabled", True)), await links_on()),
                      disable_web_page_preview=True)
 
 
@@ -1232,9 +1246,12 @@ async def on_site(cb: CallbackQuery, bot: Bot):
     if act == "toggle":
         await db.set_setting("site_enabled", not bool(await db.get_setting("site_enabled", True)))
         await cb.answer("Готово")
+    elif act == "links":
+        await db.set_setting("site_links", not await links_on())
+        await cb.answer("Ссылки на сайт " + ("включены" if await links_on() else "выключены"))
     else:
         await cb.answer()
-    await cb.message.answer(await view_text(), reply_markup=_kb(bool(await db.get_setting("site_enabled", True))),
+    await cb.message.answer(await view_text(), reply_markup=_kb(bool(await db.get_setting("site_enabled", True)), await links_on()),
                             disable_web_page_preview=True)
 
 

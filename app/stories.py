@@ -81,8 +81,9 @@ async def after_post(bot, pid: int) -> None:
         return await publish(bot, pid)
     # лонгрид: фон приходит всегда, со ссылкой на заметку на сайте — для стикера-ссылки в сторис
     from app import sitepub
-    link = sitepub.story_link(post) if sitepub.wants(post) == "note" else None
-    if m == "bg" and link:
+    note = sitepub.wants(post) == "note"
+    link = sitepub.story_link(post) if note and await sitepub.links_on() else None
+    if m == "bg" and (link or note):
         try:
             await send_background(bot, pid, link=link)
         except Exception:
