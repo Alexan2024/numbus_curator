@@ -15,6 +15,11 @@
 Сайт собирается целиком (site/sitebuild.py и site/prerender.js, около секунды) и сверяется со списком файлов,
 которые уже лежат на хостинге (assets/manifest.json): по FTP уходят только изменённые файлы.
 
+Обновления сайта приходят вместе с ботом. Вёрстка — папка site/, правки записей — site/updates/*.json
+(формат — в site/updates/README.md). После перезапуска (новая версия из GitHub) бот сам пересобирает сайт,
+выкладывает изменившиеся файлы, убирает страницы удалённых записей и пишет автору, что сделано. Большую
+выкладку (новая вёрстка меняет все страницы) не начинает ближе чем за 25 минут до слота публикации.
+
 Переменные Railway
   SITE_FTP_HOST, SITE_FTP_USER, SITE_FTP_PASSWORD — FTP на Beget (пароль хранится только в Railway);
   SITE_FTP_DIR — папка сайта на FTP, по умолчанию theahmag.com/public_html (для отдельного FTP-аккаунта,
@@ -24,6 +29,7 @@
 """
 import asyncio
 import ftplib
+import hashlib
 import html
 import io
 import json
@@ -36,7 +42,7 @@ import shutil
 import ssl
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -559,38 +565,80 @@ def _open_ftp() -> tuple[ftplib.FTP, str]:
     raise SiteError("FTP не пускает — " + "; ".join(errors)[:400])
 
 
-def upload(files: list[tuple[str, bytes]]) -> str:
+# связь оборвалась, сервер занят — то, после чего стоит войти заново и продолжить (отказ 5xx сюда не входит)
+_NET_ERRORS = (OSError, EOFError, ftplib.error_temp, ftplib.error_reply, ftplib.error_proto)
+
+
+def upload(files: list[tuple[str, bytes]], remove: list[str] | tuple = ()) -> str:
     """Файлы на хостинг. Каждый пишется рядом под временным именем и подменяет старый, чтобы посетитель
-    не застал половину файла. → режим соединения (tls / tls-noverify / plain)."""
-    if not files:
+    не застал половину файла. Если связь оборвётся посреди большой выкладки, бот входит заново и продолжает
+    с того же файла. remove — страницы, которых в новой сборке нет (убранные записи): они удаляются после
+    выкладки. → режим соединения (tls / tls-noverify / plain)."""
+    remove = [r for r in remove if r.endswith("/index.html")]     # удаляем только страницы, и никогда — главную
+    if not files and not remove:
         return "—"
     ftp, mode = _open_ftp()
     made: set[str] = set()
-    try:
-        for rel, data in files:
-            d = posixpath.dirname(rel)
-            if d and d not in made:
-                path = ""
-                for part in d.split("/"):
-                    path = f"{path}/{part}" if path else part
-                    if path in made:
-                        continue
-                    try:
-                        ftp.mkd(path)
-                    except ftplib.error_perm:
-                        pass       # уже есть
-                    made.add(path)
-            tmp = rel + ".part"
-            ftp.storbinary("STOR " + tmp, io.BytesIO(data))
-            try:
-                ftp.rename(tmp, rel)
-            except ftplib.error_perm:
-                # сервер не переименовывает поверх файла: пишем прямо на место, живой файл не удаляем
-                ftp.storbinary("STOR " + rel, io.BytesIO(data))
+
+    def put(rel: str, data: bytes) -> None:
+        d = posixpath.dirname(rel)
+        if d and d not in made:
+            path = ""
+            for part in d.split("/"):
+                path = f"{path}/{part}" if path else part
+                if path in made:
+                    continue
                 try:
-                    ftp.delete(tmp)
+                    ftp.mkd(path)
                 except ftplib.error_perm:
+                    pass       # уже есть
+                made.add(path)
+        tmp = rel + ".part"
+        ftp.storbinary("STOR " + tmp, io.BytesIO(data))
+        try:
+            ftp.rename(tmp, rel)
+        except ftplib.error_perm:
+            # сервер не переименовывает поверх файла: пишем прямо на место, живой файл не удаляем
+            ftp.storbinary("STOR " + rel, io.BytesIO(data))
+            try:
+                ftp.delete(tmp)
+            except ftplib.error_perm:
+                pass
+
+    try:
+        i, reconnects = 0, 0
+        while i < len(files):
+            rel, data = files[i]
+            try:
+                put(rel, data)
+                i += 1
+            except _NET_ERRORS as exc:
+                reconnects += 1
+                if reconnects > 3:
+                    raise
+                log.warning("FTP: связь оборвалась на %s (%r) — вхожу заново", rel, exc)
+                try:
+                    ftp.close()
+                except Exception:
                     pass
+                time.sleep(3 * reconnects)
+                ftp, mode = _open_ftp()
+        if remove:
+            try:
+                dirs = set()
+                for rel in remove:
+                    try:
+                        ftp.delete(rel)
+                    except ftplib.error_perm:
+                        pass      # уже нет
+                    dirs.add(posixpath.dirname(rel))
+                for d in sorted(dirs, key=lambda x: -x.count("/")):
+                    try:
+                        ftp.rmd(d)
+                    except ftplib.error_perm:
+                        pass      # в папке что-то ещё есть — пусть остаётся
+            except _NET_ERRORS as exc:
+                log.warning("FTP: старые страницы не удалились (%r) — сайт от этого не ломается", exc)
     finally:
         try:
             ftp.quit()
@@ -836,6 +884,215 @@ def story_link(post) -> str | None:
     return data.get("_site_url_en") or data.get("_site_url")
 
 
+# ======================= обновления сайта вместе с ботом =======================
+
+SITE_DIR = Path(__file__).resolve().parent.parent / "site"
+UPDATES = SITE_DIR / "updates"
+CODE_STATE = ROOT / "code.json"     # {"version": вёрстка на сайте, "at": когда выложена, "updates": {файл правки: итог}}
+BIG = 150                           # столько файлов и больше — выкладка надолго: не перед самым слотом
+CALM_MIN = 25                       # … то есть не ближе чем за столько минут до слота
+_BOOT_DELAY = 90                    # сек. после запуска: сначала бот поднимается, потом сайт
+_LABEL = {"objects": "запись", "notes": "заметка", "people": "имя", "countries": "страна"}
+
+
+def _code_files() -> list[Path]:
+    """Из чего собираются страницы: изменился любой из этих файлов — у сайта новая вёрстка."""
+    files = [SITE_DIR / "prerender.js", SITE_DIR / "sitebuild.py"]
+    web = SITE_DIR / "web"
+    if web.exists():
+        files += [f for f in web.rglob("*") if f.is_file() and "__pycache__" not in f.parts]
+    return sorted(f for f in files if f.exists())
+
+
+def code_version() -> str:
+    """Отпечаток вёрстки: 12 знаков, меняется от любой правки в site/web, prerender.js, sitebuild.py."""
+    h = hashlib.sha256()
+    for f in _code_files():
+        h.update(f.relative_to(SITE_DIR).as_posix().encode() + b"\0" + f.read_bytes() + b"\0")
+    return h.hexdigest()[:12]
+
+
+def _state() -> dict:
+    try:
+        return json.loads(CODE_STATE.read_text("utf-8"))
+    except Exception:
+        return {}
+
+
+def _put_state(st: dict) -> None:
+    ROOT.mkdir(parents=True, exist_ok=True)
+    tmp = CODE_STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, ensure_ascii=False, indent=1), "utf-8")
+    tmp.replace(CODE_STATE)
+
+
+def pending_updates(st: dict | None = None) -> list[Path]:
+    """Файлы правок, которые бот ещё не применял. Каждый применяется один раз, по порядку имён."""
+    done = (st if st is not None else _state()).get("updates") or {}
+    if not UPDATES.exists():
+        return []
+    return [f for f in sorted(UPDATES.glob("*.json")) if f.name not in done]
+
+
+def apply_update(D: dict, patch) -> list[str]:
+    """Правка записей сайта (файл из site/updates) → строки для отчёта. Поле заменяется целиком, null убирает
+    поле, запись или заметка целиком null — убирается с сайта. Имена и страны правятся и добавляются (новым
+    нужны ru и en), лишние уходят сами вместе с последней записью. Ошибка — SiteError, и тогда D не меняется:
+    файл применяется весь или никак."""
+    if not isinstance(patch, dict):
+        raise SiteError("в файле не объект JSON")
+    extra = set(patch) - {"objects", "notes", "people", "countries", "comment"}
+    if extra:
+        raise SiteError("непонятные разделы: " + ", ".join(sorted(extra)))
+    W = json.loads(json.dumps(D))
+    done = []
+    for sec in ("objects", "notes"):
+        part = patch.get(sec) or {}
+        if not isinstance(part, dict):
+            raise SiteError(f"{sec}: нужен объект {{номер: поля}}")
+        for k, fields in part.items():
+            try:
+                rid = int(k)
+            except (TypeError, ValueError):
+                raise SiteError(f"{sec}: «{k}» — не номер") from None
+            idx = next((i for i, r in enumerate(W[sec]) if r.get("id") == rid), None)
+            if idx is None:
+                raise SiteError(f"{_LABEL[sec]} {rid}: такой на сайте нет")
+            if fields is None:
+                W[sec].pop(idx)
+                done.append(f"{_LABEL[sec]} {rid} убрана с сайта")
+                continue
+            if not isinstance(fields, dict) or not fields:
+                raise SiteError(f"{_LABEL[sec]} {rid}: нужен объект с полями")
+            if "id" in fields:
+                raise SiteError(f"{_LABEL[sec]} {rid}: номер записи не меняют")
+            rec = W[sec][idx]
+            for f, v in fields.items():
+                if v is None:
+                    rec.pop(f, None)
+                else:
+                    rec[f] = v
+            done.append(f"{_LABEL[sec]} {rid}: " + ", ".join(fields))
+    for sec in ("people", "countries"):
+        part = patch.get(sec) or {}
+        if not isinstance(part, dict):
+            raise SiteError(f"{sec}: нужен объект {{id: поля}}")
+        for k, fields in part.items():
+            if not isinstance(fields, dict) or not fields:
+                raise SiteError(f"{_LABEL[sec]} «{k}»: нужен объект с полями (удалять не нужно — уйдёт сам "
+                                "вместе с последней записью)")
+            cur = W[sec].get(k)
+            if cur is None:
+                if not (fields.get("ru") and fields.get("en")):
+                    raise SiteError(f"{_LABEL[sec]} «{k}»: новому нужны ru и en")
+                cur = W[sec][k] = {"roles": ["architect"], "objs": []} if sec == "people" else {"n": 0}
+            for f, v in fields.items():
+                if f in ("objs", "n"):
+                    continue          # считаются сами
+                if v is None:
+                    cur.pop(f, None)
+                else:
+                    cur[f] = v
+            done.append(f"{_LABEL[sec]} {k}: " + ", ".join(fields))
+    recount(W)
+    problems = [f"запись {o['id']}: имени «{x.get('id')}» нет в указателе"
+                for o in W["objects"] for x in (o.get("p") or []) if x.get("id") not in W["people"]]
+    problems += [f"запись {o['id']}: страны «{c}» нет" for o in W["objects"] for c in (o.get("co") or [])
+                 if c not in W["countries"]]
+    if problems:
+        raise SiteError("; ".join(problems[:3]))
+    D.clear()
+    D.update(W)
+    return done
+
+
+def _calm(minutes: int = CALM_MIN) -> bool:
+    """До ближайшего слота публикации не меньше minutes минут: можно надолго занять сайт."""
+    now = datetime.now(ZoneInfo(config.TZ_NAME))
+    m = now.hour * 60 + now.minute
+    return all((h * 60 + mm - m) % 1440 >= minutes for h, mm, _ in config.SLOTS)
+
+
+async def refresh(bot: Bot | None = None, force: bool = False) -> str | None:
+    """Новая вёрстка сайта или правки записей пришли вместе с обновлением бота → сайт пересобирается, по FTP
+    уходят изменившиеся файлы, страницы убранных записей удаляются. → отчёт для автора или None: делать
+    нечего, сайт выключен или большую выкладку лучше начать в паузе между слотами (повтор через 20 минут).
+    force — кнопка «🔄 Пересобрать сайт»: всё равно пересобрать и не ждать паузы."""
+    if not await enabled():
+        return None
+    st = _state()
+    ver = code_version()
+    ups = pending_updates(st)
+    if not force and not ups and st.get("version") == ver:
+        return None
+    async with _lock:
+        D = await load()
+        notes, skipped, marks = [], [], {}
+        for f in ups:
+            try:
+                notes += apply_update(D, json.loads(f.read_text("utf-8")))
+                marks[f.name] = "ok"
+            except Exception as exc:
+                why = str(exc) if isinstance(exc, SiteError) else f"файл не читается: {exc}"
+                skipped.append(f"{f.name} — {why}")
+                marks[f.name] = "пропущен: " + why[:200]
+        batch, manifest = await asyncio.to_thread(build_diff, D)
+        old = json.loads(MANIFEST.read_text("utf-8")) if MANIFEST.exists() else {}
+        gone = [r for r in old if r not in manifest and r.endswith("/index.html")]
+        sent = [r for r, _ in batch if r != sitebuild.MANIFEST]
+        if not force and len(sent) >= BIG and not _calm():
+            log.info("Сайт: выкладка на %s файлов отложена — скоро слот", len(sent))
+            return None
+        await asyncio.to_thread(upload, batch, gone)
+        _save(D, manifest)
+        first = "version" not in st
+        new_code = st.get("version") != ver
+        st.setdefault("updates", {}).update(marks)
+        st.update(version=ver, at=db.now())
+        _put_state(st)
+    lines = ["🌐 <b>Сайт обновлён</b>"]
+    if first:
+        lines.append("Автообновление включено: новая вёрстка и правки записей выкладываются сами, "
+                     "как только обновление бота приходит в GitHub.")
+    elif new_code:
+        lines.append(f"Новая вёрстка сайта (версия {ver}).")
+    if notes:
+        lines.append("Правки:\n" + "\n".join("• " + html.escape(x) for x in notes[:12])
+                     + (f"\n• … и ещё {len(notes) - 12}" if len(notes) > 12 else ""))
+    if skipped:
+        lines.append("⚠️ Не применены:\n" + "\n".join("• " + html.escape(x) for x in skipped[:5]))
+    if sent or gone:
+        lines.append(f"Выложено файлов: {len(sent)}" + (f", убрано страниц: {len(gone)}" if gone else "") + ".")
+    else:
+        lines.append("Файлы на хостинге и так совпадали с новой сборкой.")
+    return "\n\n".join(lines)
+
+
+async def refresh_and_tell(bot: Bot) -> None:
+    """refresh + отчёт автору. Сбой не роняет бота: повтор через 20 минут, уведомление — раз в час."""
+    try:
+        text = await refresh(bot)
+    except Exception as exc:
+        log.exception("Сайт: новая версия не выложилась")
+        await _status(False, f"новая версия сайта не выложилась: {exc}")
+        await _alert(bot, f"🌐 Новая версия сайта не выложилась: {html.escape(str(exc)[:300])}\nПовторю сам через 20 минут.")
+        return
+    if not text:
+        return
+    await _status(True, "сайт обновлён до новой версии")
+    try:
+        await bot.send_message(config.ADMIN_ID, text, disable_web_page_preview=True)
+    except Exception:
+        log.warning("Сайт: отчёт об обновлении не ушёл", exc_info=True)
+
+
+async def tick(bot: Bot) -> None:
+    """Раз в 20 минут: новая версия сайта, если сразу после перезапуска её выложить не вышло или выкладку
+    отложили до паузы между слотами, и посты, которые вышли в канал, но не попали на сайт."""
+    await refresh_and_tell(bot)
+    await retry_queue(bot)
+
+
 # ======================= очередь повторов и пульт =======================
 
 _qlock = asyncio.Lock()
@@ -927,6 +1184,17 @@ async def view_text() -> str:
         lines.append(("✅ " if st["ok"] else "⚠️ ") + html.escape(st["text"]) + f" · {st['at'][5:16].replace('T', ' ')}")
     if q:
         lines.append(f"Ждут повтора: {len(q)}")
+    cs = _state()
+    if sitebuild is not None:
+        ver = code_version()
+        if cs.get("version"):
+            lines.append(f"Вёрстка: {cs['version']} · выложена {cs['at'][5:16].replace('T', ' ')}"
+                         + ("" if cs["version"] == ver else f" · новая ({ver}) ждёт выкладки"))
+        else:
+            lines.append(f"Вёрстка: {ver} · выложится сама после запуска")
+        waiting = pending_updates(cs)
+        if waiting:
+            lines.append(f"Правки записей ждут выкладки: {len(waiting)}")
     lines.append("Instant View для заметок: " + ("включён" if IV_RHASH else "нет (переменная IV_RHASH)"))
     return "\n".join(lines)
 
@@ -935,7 +1203,8 @@ def _kb(on: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔍 Проверить связь", callback_data="site:check"),
          InlineKeyboardButton(text="🔁 Повторить", callback_data="site:retry")],
-        [InlineKeyboardButton(text="⏸ Выключить" if on else "▶️ Включить", callback_data="site:toggle")]])
+        [InlineKeyboardButton(text="🔄 Пересобрать сайт", callback_data="site:rebuild"),
+         InlineKeyboardButton(text="⏸ Выключить" if on else "▶️ Включить", callback_data="site:toggle")]])
 
 
 @router.message(Command("site"))
@@ -954,6 +1223,12 @@ async def on_site(cb: CallbackQuery, bot: Bot):
         await cb.answer("Повторяю…")
         n = await retry_queue(bot, force=True)
         return await cb.message.answer(f"Готово: на сайт ушло {n}.")
+    if act == "rebuild":
+        await cb.answer("Пересобираю…")
+        if not await enabled():
+            return await cb.message.answer("Публикация на сайт выключена или не настроена — пересобирать нечего.")
+        text = await refresh(bot, force=True)
+        return await cb.message.answer(text or "Готово.", disable_web_page_preview=True)
     if act == "toggle":
         await db.set_setting("site_enabled", not bool(await db.get_setting("site_enabled", True)))
         await cb.answer("Готово")
@@ -964,5 +1239,8 @@ async def on_site(cb: CallbackQuery, bot: Bot):
 
 
 def schedule(sched, bot: Bot, guarded) -> None:
-    sched.add_job(guarded(bot, "сайт: повтор", retry_queue, bot), "interval", minutes=20, id="site_retry",
+    sched.add_job(guarded(bot, "сайт: повтор", tick, bot), "interval", minutes=20, id="site_retry",
                   max_instances=1)
+    # бот перезапускается после каждого обновления из GitHub: сразу проверить, не пришла ли новая версия сайта
+    sched.add_job(guarded(bot, "сайт: обновление", refresh_and_tell, bot), "date", id="site_refresh",
+                  run_date=datetime.now(ZoneInfo(config.TZ_NAME)) + timedelta(seconds=_BOOT_DELAY))

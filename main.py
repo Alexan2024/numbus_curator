@@ -167,7 +167,7 @@ async def main():
     sched.add_job(guarded(bot, "очистка", cleanup), "cron", hour=4, minute=30, id="cleanup")
     growth.schedule(sched, bot, guarded)
     instagram.schedule(sched, bot, guarded)
-    sitepub.schedule(sched, bot, guarded)   # посты, не попавшие на сайт, — повтор раз в 20 минут
+    sitepub.schedule(sched, bot, guarded)   # новая версия сайта после запуска; повтор для постов — раз в 20 минут
     stats.schedule(sched, bot, guarded)
     taste.schedule(sched, bot, guarded)
     dates.schedule(sched, bot, guarded)
