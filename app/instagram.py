@@ -623,7 +623,7 @@ async def _v_ig(arg: dict):
     if failed:
         rows.append([btn(f"🔁 Повторить неудачные · {len(failed)}", "ig:retryall")])
     rows.append([btn("📤 Отправить последний пост из канала", "ig:last")])
-    rows.append([btn("← Пульт", "h:home")])
+    rows.append([btn("← Инста", "h:pf:ig"), btn("🏠 Пульт", "h:home")])
     return screen.banner(), "\n".join(lines)[:1020], screen._kb(rows), arg
 
 

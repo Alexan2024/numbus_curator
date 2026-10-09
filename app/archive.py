@@ -1299,7 +1299,15 @@ async def cmd_archive(msg: Message):
 
 @router.callback_query(F.data.startswith("ar:"))
 async def on_archive(cb: CallbackQuery, bot: Bot):
+    """Кнопки архива. На экране бота (сообщение с картинкой) — перерисовка экрана, в сообщении /archive — его правка."""
+    from app import screen      # здесь: экран сам пользуется этим модулем
     act = cb.data.split(":", 1)[1]
+    on_screen = bool(getattr(cb.message, "photo", None))
+    if on_screen:
+        await screen.adopt(cb.message)
+    if act == "show":
+        await cb.answer()
+        return await (screen.show(bot, "arch") if on_screen else screen.move_down(bot, "arch"))
     st = load_state()
     c = ctl()
     if act == "pause":
@@ -1317,9 +1325,14 @@ async def on_archive(cb: CallbackQuery, bot: Bot):
         await cb.answer("Продолжаю")
     elif act == "hidden":
         await cb.answer()
-        return await bot.send_message(config.ADMIN_ID, _hidden_list(st))
+        m = await bot.send_message(config.ADMIN_ID, _hidden_list(st))
+        if on_screen:                  # список уберётся, когда экран сменится
+            await screen.add_temp([m.message_id])
+        return
     else:
         await cb.answer()
+    if on_screen:
+        return await screen.show(bot, "arch")
     try:
         await cb.message.edit_text(await status_text(st), reply_markup=_kb(st))
     except Exception:

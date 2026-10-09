@@ -1284,20 +1284,46 @@ async def cmd_site(msg: Message):
 
 @router.callback_query(F.data.startswith("site:"))
 async def on_site(cb: CallbackQuery, bot: Bot):
+    """Кнопки сайта. На экране бота (сообщение с картинкой) ответ рисуется на нём же; в сообщении /site — как раньше,
+    отдельным сообщением."""
+    from app import screen      # здесь: экран сам пользуется этим модулем
     act = cb.data.split(":", 1)[1]
+    on_screen = bool(getattr(cb.message, "photo", None))
+    if on_screen:
+        await screen.adopt(cb.message)
+        view, _ = await screen.current()
+    else:
+        view = None
+
+    async def say(text: str, **kw):
+        if on_screen:
+            if view == "pf":
+                return await screen.show(bot, "pf", pf="web", note=formatter.plain_text(text)[:300])
+            return await screen.show(bot, "site", note=formatter.plain_text(text)[:400])
+        return await cb.message.answer(text, **kw)
+
+    if act in ("home", "go"):
+        await cb.answer()
+        if on_screen:
+            return await screen.show(bot, "site")
+        try:
+            await bot.delete_message(config.ADMIN_ID, cb.message.message_id)
+        except Exception:
+            pass
+        return await screen.move_down(bot, "site")
     if act == "check":
         await cb.answer("Проверяю…")
-        return await cb.message.answer(await check())
+        return await say(await check())
     if act == "retry":
         await cb.answer("Повторяю…")
         n = await retry_queue(bot, force=True)
-        return await cb.message.answer(f"Готово: на сайт ушло {n}.")
+        return await say(f"Готово: на сайт ушло {n}.")
     if act == "rebuild":
         await cb.answer("Пересобираю…")
         if not await enabled():
-            return await cb.message.answer("Публикация на сайт выключена или не настроена — пересобирать нечего.")
+            return await say("Публикация на сайт выключена или не настроена — пересобирать нечего.")
         text = await refresh(bot, force=True)
-        return await cb.message.answer(text or "Готово.", disable_web_page_preview=True)
+        return await say(text or "Готово.", disable_web_page_preview=True)
     if act == "toggle":
         await db.set_setting("site_enabled", not bool(await db.get_setting("site_enabled", True)))
         await cb.answer("Готово")
@@ -1306,6 +1332,8 @@ async def on_site(cb: CallbackQuery, bot: Bot):
         await cb.answer("Ссылки на сайт " + ("включены" if await links_on() else "выключены"))
     else:
         await cb.answer()
+    if on_screen:
+        return await screen.show(bot, "site")
     await cb.message.answer(await view_text(), reply_markup=_kb(bool(await db.get_setting("site_enabled", True)), await links_on()),
                             disable_web_page_preview=True)
 

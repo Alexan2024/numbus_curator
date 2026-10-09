@@ -176,15 +176,14 @@ async def on_home(cb: CallbackQuery, bot: Bot, state: FSMContext):
         await cb.answer("Обновлено")
         return await screen.show(bot, "home", day=int(p[2]))
     if action == "mode":
+        if p[2] not in slots.MODES:
+            return await cb.answer()
         await db.set_setting("mode", p[2])
-        hints = {
-            "manual": f"Ручной: в {', '.join(map(str, config.DELIVERY_HOURS))} ч кладу посты во входящие, решаешь ты",
-            "semi": f"Полуавтомат: в {config.PLAN_TIME[0]:02d}:{config.PLAN_TIME[1]:02d} собираю план на завтра — "
-                    "по посту на слот, ты одобряешь. Сейчас соберу план на остаток дня",
-            "auto": f"Автомат: анонс за {config.SLOT_LEAD_MIN} мин, публикую сам от {config.AUTO_MIN_SCORE}/10",
-        }
-        await cb.answer(hints[p[2]], show_alert=True)
-        await screen.show(bot, "home", day=0)
+        hint = f"{slots.MODES[p[2]].capitalize()}: {screen.mode_hint(p[2])}"
+        if p[2] == "semi":
+            hint += ". Сейчас соберу план на остаток дня"
+        await cb.answer(hint[:200], show_alert=True)
+        await screen.show(bot, "more")
 
         async def plan_now():
             text = await slots.on_mode_change(p[2])
@@ -198,19 +197,29 @@ async def on_home(cb: CallbackQuery, bot: Bot, state: FSMContext):
         if not now_paused:
             await slots.reschedule()
         await cb.answer("Пауза: ничего не публикую" if now_paused else "Работаю", show_alert=now_paused)
-        return await screen.show(bot, "home", day=0)
+        return await screen.show(bot, "more") if p[2:3] == ["more"] else await screen.show(bot, "home", day=0)
+    if action == "more":
+        await cb.answer()
+        return await screen.show(bot, "more")
+    if action == "pf":
+        await cb.answer()
+        return await screen.show(bot, "pf", pf=p[2])
+    if action == "pl":
+        await cb.answer()
+        return await screen.show(bot, "list", mode="plan", pf=p[2], pid=int(p[3]), kb=None)
     if action == "inbox":
         await cb.answer()
-        return await screen.show(bot, "list", mode="inbox", idx=0)
+        return await screen.show(bot, "list", mode="inbox", idx=0, **({"pf": p[2]} if len(p) > 2 else {}))
     if action == "stock":
         await cb.answer()
-        return await screen.show(bot, "stockmenu")
+        return await screen.show(bot, "stockmenu", **({"pf": p[2]} if len(p) > 2 else {}))
     if action == "stk":
         await cb.answer()
-        return await screen.show(bot, "list", mode="stock", cat=p[2], idx=0)
+        cat = None if p[2] == "any" else p[2]
+        return await screen.show(bot, "list", mode="stock", cat=cat, idx=0, **({"pf": p[3]} if len(p) > 3 else {}))
     if action == "next":
         await cb.answer()
-        return await screen.show(bot, "next", fmt=p[2])
+        return await screen.show(bot, "next", fmt=p[2], **({"pf": p[3]} if len(p) > 3 else {}))
     if action == "nx":
         return await _next_post(cb, bot, p[2], None if p[3] == "any" else p[3])
     if action == "plan" and len(p) == 2:
@@ -351,7 +360,7 @@ async def on_post(cb: CallbackQuery, bot: Bot, state: FSMContext):
 
     if action == "nav":
         view, arg = await screen.current()
-        ids = await screen._list_ids(arg.get("mode", "inbox"), arg.get("cat"), pid)
+        ids = await screen._list_ids(arg.get("mode", "inbox"), arg.get("cat"), pid, arg.get("pf"))
         if not ids:
             await cb.answer()
             return await _list(bot)

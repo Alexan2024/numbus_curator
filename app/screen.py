@@ -1,5 +1,6 @@
 """Экран бота — одно закреплённое сообщение (картинка + подпись + кнопки), которое перерисовывается на месте:
-пульт, входящие, запас, слот, план, статистика, источники, голос. Уведомления приходят отдельными
+пульт, три площадки (✈️ канал, 📸 инста, 🌐 сайт — app/platforms.py), «☰ Ещё», входящие, запас, слот, план,
+статистика, источники, голос, настройки сайта и архив. Уведомления приходят отдельными
 сообщениями; их кнопка «Открыть» переносит экран вниз и сама исчезает."""
 import asyncio
 import html
@@ -91,15 +92,26 @@ def _stock_totals(stock: dict) -> tuple[int, int, int]:
     return mini + std, mini, std
 
 
+def mode_hint(md: str) -> str:
+    return {
+        "manual": f"в {', '.join(map(str, config.DELIVERY_HOURS))} ч кладу посты во входящие, в слоты ставишь ты",
+        "semi": f"в {config.PLAN_TIME[0]:02d}:{config.PLAN_TIME[1]:02d} собираю план на завтра — по посту на слот, "
+                "ты одобряешь; пустой слот страхую автопостом",
+        "auto": f"за {config.SLOT_LEAD_MIN} мин до слота анонсирую пост и публикую сам от {config.AUTO_MIN_SCORE}/10, "
+                "если не отменишь",
+    }.get(md, "")
+
+
 async def _home(arg: dict):
+    """Пульт: день по слотам, три площадки и главное. Остальное — в «☰ Ещё»."""
+    from app import platforms
     day = int(arg.get("day", 0))
     md, ps = await slots.mode(), await slots.paused()
     state, other = await slots.day_state(day), await slots.day_state(1 - day)
     inbox = await db.inbox_posts()
-    sched = await db.scheduled_posts(slots.key_of(slots._now()))
-    stock = await db.stock_counts()
-    total, mini, std = _stock_totals(stock)
+    total, _, _ = _stock_totals(await db.stock_counts())
     cc = await db.candidate_counts()
+    pf = await platforms.summary()
     lines = [f"<b>AHMAG</b> · {slots.MODES[md]}" + (" · ⏸ <b>пауза</b>" if ps else "")]
     err = await db.get_setting("api_error")
     if err:
@@ -108,53 +120,69 @@ async def _home(arg: dict):
     lines += ["", f"<b>{title}, {state[0]['dt']:%d.%m}</b>" if state else f"<b>{title}</b>"]
     lines += [_slot_line(s) for s in state]
     lines += [("Завтра: " if day == 0 else "Сегодня: ") + "".join(slots.ICON[x["state"]] for x in other), ""]
-    lines.append(f"📥 Ждут решения: <b>{len(inbox)}</b>")
-    lines.append(f"🗓 Стоят в слотах: {len(sched)}")
-    lines.append(f"📦 В запасе: {total} · {cards.FORMAT_LABEL['mini']} {mini} · {cards.FORMAT_LABEL['std']} {std}")
-    if total:
-        lines.append("      " + " · ".join(f"{cards.cat_label(c)} {sum(stock[c].values())}"
-                                           for c in config.CATEGORIES if c in stock))
-    waiting = cc.get("new", 0) + cc.get("triaged", 0)
-    lines.append(f"🔎 Найдено, ждёт оценки: {waiting}" + (f" · на оценке: {cc['batched']}" if cc.get("batched") else ""))
-    lines.append(f"💵 Сегодня {reports.money(await db.cost_today())} · за 7 дней {reports.money(await db.cost_days(7))}")
-    lines += ["", LEGEND]
+
+    def pf_line(key: str, tail: str = "") -> str:
+        x = pf[key]
+        parts = [f"в плане <b>{x['plan']}</b>"]
+        if key != "web":
+            parts += [f"ждут {x['inbox']}", f"запас {x['stock']}"]
+        return f"{platforms.title(key)}: " + " · ".join(parts) + (f" · {tail}" if tail else "")
+
+    lines.append(pf_line("tg"))
+    if config.MINI_IG or pf["ig"]["plan"]:
+        lines.append(pf_line("ig"))
+    lines.append(pf_line("web", await platforms.site_line()))
+    waiting = cc.get("new", 0) + cc.get("triaged", 0) + cc.get("batched", 0)
+    lines += ["", f"🔎 На оценке {waiting} · 💵 сегодня {reports.money(await db.cost_today())}, "
+                  f"за 7 дней {reports.money(await db.cost_days(7))}", LEGEND]
 
     slot_btns = [btn(f"{x['dt']:%H:%M} {slots.ICON[x['state']]}", f"h:slot:{slots.enc(x['key'])}") for x in state]
+    rows = [slot_btns[i:i + 4] for i in range(0, len(slot_btns), 4)]
+    rows += [
+        [btn(f"✈️ Канал · {pf['tg']['plan']}", "h:pf:tg"), btn(f"📸 Инста · {pf['ig']['plan']}", "h:pf:ig"),
+         btn(f"🌐 Сайт · {pf['web']['plan']}", "h:pf:web")],
+        [btn(f"📥 Входящие · {len(inbox)}", "h:inbox"), btn(f"📦 Запас · {total}", "h:stock")],
+        [btn("▶️ Следующий пост", "h:next:mini"), btn("✍️ По запросу", "rq:ask")],
+        [btn("Завтра ▸" if day == 0 else "◂ Сегодня", f"h:day:{1 - day}"), btn("🗓 План", "h:plan"),
+         btn("☰ Ещё", "h:more")],
+    ]
+    if ps:
+        rows.append([btn("▶️ Снять с паузы", "h:pause:home")])
+    return banner(), "\n".join(lines), _kb(rows), arg
+
+
+async def _more(arg: dict):
+    """☰ Ещё: режим, сбор, разделы со своей логикой и настройки. Модули импортируются здесь, а не наверху:
+    они сами пользуются экраном."""
+    from app import finds, request
+    md, ps = await slots.mode(), await slots.paused()
+    cc = await db.candidate_counts()
+    lines = ["<b>☰ Ещё</b>", "", f"Режим: <b>{slots.MODES[md]}</b> — {mode_hint(md)}."]
+    if ps:
+        lines.append("⏸ <b>Пауза</b>: ничего не публикую, слоты стоят.")
+    waiting = cc.get("new", 0) + cc.get("triaged", 0)
+    lines.append(f"🔎 Найдено, ждёт оценки: {waiting}" + (f" · в пакете на оценке: {cc['batched']}" if cc.get("batched") else ""))
+    if arg.get("note"):
+        lines += ["", f"<b>{html.escape(arg['note'])}</b>"]
 
     def mode_btn(key: str, label: str):
         return btn(("● " if md == key else "") + label, f"h:mode:{key}")
 
-    rows = [slot_btns[i:i + 4] for i in range(0, len(slot_btns), 4)]
-    rows += [
-        [btn("Завтра ▸" if day == 0 else "◂ Сегодня", f"h:day:{1 - day}"), btn("🔄 Обновить", f"h:day:{day}")],
-        [btn(f"📥 Входящие · {len(inbox)}", "h:inbox"), btn(f"📦 Запас · {total}", "h:stock")],
-        [btn("▶️ Следующий пост", "h:next:mini"), btn("🗓 План", "h:plan")],
-        [mode_btn("manual", "✋ Ручной"), mode_btn("semi", "🤝 Полуавто"), mode_btn("auto", "🤖 Авто")],
-        [btn("📝 #ahmagnotes", "h:notes"), btn("🔎 Собрать сейчас", "h:collect")],
-        [btn("📊 Статистика", "h:stats"), btn("📡 Источники", "h:src")],
-    ]
-    rows += await _home_extras()
-    rows.append([btn("✍️ Голос", "h:voice"), btn("▶️ Снять с паузы" if ps else "⏸ Пауза", "h:pause")])
-    return banner(), "\n".join(lines), _kb(rows), arg
-
-
-async def _home_extras() -> list[list]:
-    """Разделы, у которых своя логика в отдельных модулях: запрос и отложенные, очередь, находки, рост, Instagram.
-    Модули импортируются здесь, а не наверху: они сами пользуются экраном."""
-    from app import finds, instagram, request
-    rows = []
+    rows = [[mode_btn("manual", "✋ Ручной"), mode_btn("semi", "🤝 Полуавто"), mode_btn("auto", "🤖 Авто")],
+            [btn("🔎 Собрать сейчас", "h:collect"), btn("📝 #ahmagnotes", "h:notes")]]
+    pair = []
     try:
         n = len(await request.wishlist())
-        rows.append([btn("✍️ Пост по запросу", "rq:ask"), btn(f"🕓 Отложенные · {n}" if n else "🕓 Отложенные", "rq:wl")])
+        pair.append(btn(f"🕓 Отложенные · {n}" if n else "🕓 Отложенные", "rq:wl"))
     except Exception:
-        log.warning("Кнопка «Пост по запросу»", exc_info=True)
+        log.warning("Кнопка «Отложенные»", exc_info=True)
     try:
         from app import dates
         n = len(await dates.items("proposed"))
-        rows.append([btn("🗂 Очередь публикаций", "qv:show"), btn(f"📅 Даты · {n} новых" if n else "📅 Даты", "dt:home")])
+        pair.append(btn(f"📅 Даты · {n} новых" if n else "📅 Даты", "dt:home"))
     except Exception:
         log.warning("Кнопка «Даты»", exc_info=True)
-        rows.append([btn("🗂 Очередь публикаций", "qv:show")])
+    rows.append(pair)
     try:
         from app import reels
         rows.append([btn(await reels.home_label(), "rl:home")])
@@ -164,13 +192,39 @@ async def _home_extras() -> list[list]:
         rows.append([btn(await finds.home_label(), "fa:info")])
     except Exception:
         log.warning("Кнопка «Находки»", exc_info=True)
-    try:
-        ig = f"📸 Instagram {await instagram.status_icon()}"
-    except Exception:
-        log.warning("Кнопка «Instagram»", exc_info=True)
-        ig = "📸 Instagram"
-    rows.append([btn("📈 Рост", "g:home"), btn(ig, "ig:home")])
-    return rows
+    rows += [[btn("🗂 Очередь картинками", "qv:show")],
+             [btn("📊 Статистика", "h:stats"), btn("📈 Рост", "g:home")],
+             [btn("📡 Источники", "h:src"), btn("✍️ Голос", "h:voice")],
+             [btn("▶️ Снять с паузы" if ps else "⏸ Пауза", "h:pause:more")],
+             [btn("🏠 Пульт", "h:home")]]
+    return banner(), "\n".join(lines), _kb(rows), arg
+
+
+async def _pf(arg: dict):
+    from app import platforms
+    return await platforms.view(arg)
+
+
+async def _site(arg: dict):
+    """Настройки сайта на экране (те же кнопки site:…, что у /site)."""
+    from app import sitepub
+    text = await sitepub.view_text()
+    if arg.get("note"):
+        text += f"\n\n<b>{html.escape(arg['note'][:400])}</b>"
+    kb = sitepub._kb(bool(await db.get_setting("site_enabled", True)), await sitepub.links_on())
+    rows = kb.inline_keyboard + [[btn("← Сайт", "h:pf:web"), btn("🏠 Пульт", "h:home")]]
+    return banner(), text[:1020], _kb(rows), arg
+
+
+async def _arch(arg: dict):
+    """🗄 Архив сайта на экране (кнопки ar:…, что у /archive)."""
+    from app import archive
+    st = archive.load_state()
+    text = await archive.status_text(st)
+    if arg.get("note"):
+        text += f"\n\n<b>{html.escape(arg['note'][:300])}</b>"
+    rows = archive._kb(st).inline_keyboard + [[btn("← Сайт", "h:pf:web"), btn("🏠 Пульт", "h:home")]]
+    return banner(), text[:1020], _kb(rows), arg
 
 
 async def _slot(arg: dict):
@@ -218,21 +272,34 @@ async def _slot(arg: dict):
 
 async def _next(arg: dict):
     fmt = arg.get("fmt", "mini")
+    pf = arg.get("pf")
+    tail = f":{pf}" if pf else ""
     stock = await db.stock_counts()
     total = sum(v.get(fmt, 0) for v in stock.values())
     text = ("<b>▶️ Какой пост показать?</b>\nПоложу его во входящие. Цифры — сколько в запасе этого формата."
             + ("\n\nНужного формата нет — возьму другой и переделаю." if not total else ""))
-    rows = [[btn(("● " if fmt == "mini" else "") + ("📸 Инста" if config.MINI_IG else "▫️ Мини"), "h:next:mini"),
-             btn(("● " if fmt == "std" else "") + ("◻️ Канал" if config.MINI_IG else "◻️ Большой"), "h:next:std")],
+    rows = [[btn(("● " if fmt == "mini" else "") + ("📸 Инста" if config.MINI_IG else "▫️ Мини"), f"h:next:mini{tail}"),
+             btn(("● " if fmt == "std" else "") + ("✈️ Канал" if config.MINI_IG else "◻️ Большой"), f"h:next:std{tail}")],
             [btn(f"Любая рубрика · {total}", f"h:nx:{fmt}:any")]]
     cats = [btn(f"{config.CATEGORIES[c]} · {stock.get(c, {}).get(fmt, 0)}", f"h:nx:{fmt}:{c}")
             for c in config.CATEGORIES]
     rows += [cats[i:i + 2] for i in range(0, len(cats), 2)]
-    rows.append([btn("← Пульт", "h:home")])
+    rows.append(_back(pf))
     return banner(), text, _kb(rows), arg
 
 
+def _back(pf: str | None, extra: list | None = None) -> list:
+    """Нижняя строка: к площадке, откуда пришли, и на пульт."""
+    from app import platforms
+    row = list(extra or [])
+    if pf in platforms.PF:
+        row.append(btn(f"← {platforms.PF[pf][1]}", f"h:pf:{pf}"))
+    return row + [btn("🏠 Пульт", "h:home")]
+
+
 async def _stockmenu(arg: dict):
+    if arg.get("pf"):
+        return await _stockmenu_pf(arg)
     stock = await db.stock_counts()
     total, mini, std = _stock_totals(stock)
     lines = ["<b>📦 Запас</b> — оценено и готово, но тебе ещё не показано", ""]
@@ -251,6 +318,31 @@ async def _stockmenu(arg: dict):
         lines.append("Запас пуст — нажми «🔎 Собрать сейчас» на пульте.")
     rows += [cats[i:i + 2] for i in range(0, len(cats), 2)]
     rows.append([btn("← Пульт", "h:home")])
+    return banner(), "\n".join(lines), _kb(rows), arg
+
+
+async def _stockmenu_pf(arg: dict):
+    """Запас одной площадки по рубрикам: канал — посты с текстом, инста — фото-посты."""
+    from app import platforms
+    pf = arg["pf"]
+    fm = platforms.fmts(pf)
+    stock = await db.stock_counts()
+    counts = {c: sum(n for f, n in v.items() if f in fm) for c, v in stock.items()}
+    total = sum(counts.values())
+    what = {"tg": "посты для канала", "ig": "фото-посты для Instagram"}.get(pf, "посты")
+    lines = [f"<b>📦 Запас · {platforms.PF[pf][1]}</b> — {what}: оценено и готово, но тебе ещё не показано", ""]
+    lines += [f"{label}: {counts.get(c, 0)}" for c, label in config.CATEGORIES.items()]
+    lines += ["", f"Всего {total}."]
+    if pf == "tg" and total:
+        ready = await platforms.stock("tg")
+        n = sum(1 for p in ready if p["format"] == "std" and not formatter.has_body(json.loads(p["data"])))
+        if n:
+            lines.append(f"Без текста {n} — напишу, когда выберешь.")
+    if not total:
+        lines.append("Пусто — «☰ Ещё → 🔎 Собрать сейчас».")
+    cats = [btn(f"{label} · {counts[c]}", f"h:stk:{c}:{pf}") for c, label in config.CATEGORIES.items() if counts.get(c)]
+    rows = ([[btn(f"Все подряд · {total}", f"h:stk:any:{pf}")]] if total else []) + [cats[i:i + 2] for i in range(0, len(cats), 2)]
+    rows.append(_back(pf))
     return banner(), "\n".join(lines), _kb(rows), arg
 
 
@@ -310,17 +402,32 @@ async def _voice(arg: dict):
 
 # ---------- просмотр постов (входящие, слоты, запас, один пост) ----------
 
-MODE_HEAD = {"inbox": "📥 Входящие", "sched": "🗓 В слотах", "stock": "📦 Запас", "one": ""}
+MODE_HEAD = {"inbox": "📥 Входящие", "sched": "🗓 В слотах", "stock": "📦 Запас", "plan": "🗓 План", "one": ""}
 
 
-async def _list_ids(mode: str, cat: str | None, pid: int | None) -> list[int]:
+async def _list_ids(mode: str, cat: str | None, pid: int | None, pf: str | None = None) -> list[int]:
+    """Посты, которые листаются ◀ ▶ в этом режиме. pf — площадка (tg, ig, web): только её посты."""
+    from app import platforms
+    if pf not in platforms.PF:
+        pf = None
+    if mode == "plan":
+        return await platforms.planned_ids(pf or "tg")
     if mode == "inbox":
-        return [p["id"] for p in await db.inbox_posts()]
+        return [p["id"] for p in (await platforms.inbox(pf) if pf else await db.inbox_posts())]
     if mode == "sched":
         return [p["id"] for p in await db.scheduled_posts(slots.key_of(slots._now()))]
     if mode == "stock":
-        return [p["id"] for p in await db.ready_posts(None, cat)]
+        return [p["id"] for p in (await platforms.stock(pf, cat) if pf else await db.ready_posts(None, cat))]
     return [pid] if pid and await db.get_post(pid) else []
+
+
+def _head(mode: str, pf: str | None) -> str:
+    from app import platforms
+    if pf in platforms.PF:
+        name = platforms.PF[pf][1].lower()
+        return {"plan": f"{platforms.title(pf)} · план", "inbox": f"📥 Входящие · {name}",
+                "stock": f"📦 Запас · {name}"}.get(mode, MODE_HEAD.get(mode, ""))
+    return MODE_HEAD.get(mode, "")
 
 
 def _status_line(post) -> str:
@@ -338,10 +445,10 @@ def _status_line(post) -> str:
     return f"❌ снят: {post['reject_reason'] or ''}"
 
 
-def _post_caption(post, mode: str, idx: int, n: int, note: str | None) -> tuple[str, bool]:
+def _post_caption(post, mode: str, idx: int, n: int, note: str | None, pf: str | None = None) -> tuple[str, bool]:
     data = json.loads(post["data"])
     fmt = post["format"]
-    head = MODE_HEAD.get(mode, "")
+    head = _head(mode, pf)
     pos = f" {idx + 1}/{n}" if n > 1 else ""
     first = (f"<b>{head}{pos}</b> · " if head else "") + _status_line(post)
     info = f"{cards.FORMAT_LABEL.get(fmt, fmt)} · {cards.cat_label(post['category'])}"
@@ -353,6 +460,11 @@ def _post_caption(post, mode: str, idx: int, n: int, note: str | None) -> tuple[
     if post["url"]:
         info += f' · <a href="{html.escape(post["url"])}">источник</a>'
     must = [first, info]
+    if pf == "ig" and mode == "plan" and not cards.ig_only(post):
+        must.append("↪ <i>в Instagram — копией после выхода в канале, подпись по-английски</i>")
+    elif pf == "web" and mode == "plan" and fmt == "std" and formatter.has_body(data):
+        must.append("🌐 <i>на сайте — с продолжением текста</i>" if data.get("site_more")
+                    else "🌐 <i>на сайте — тот же текст, что в канале</i>")
     if note:
         must.append(f"<b>{html.escape(note)}</b>")
     if fmt == "std" and not formatter.has_body(data):
@@ -380,7 +492,8 @@ def _post_caption(post, mode: str, idx: int, n: int, note: str | None) -> tuple[
     return meta + sep + clipped + ("\n<i>…дальше — «📄 Весь текст»</i>" if cut else ""), cut
 
 
-async def _post_kb(post, mode: str, idx: int, n: int, clipped: bool, sub: str | None) -> InlineKeyboardMarkup:
+async def _post_kb(post, mode: str, idx: int, n: int, clipped: bool, sub: str | None,
+                   pf: str | None = None) -> InlineKeyboardMarkup:
     pid, st, fmt = post["id"], post["status"], post["format"]
     images = json.loads(post["images"])
     if sub in ("photos", "cover"):
@@ -454,7 +567,10 @@ async def _post_kb(post, mode: str, idx: int, n: int, clipped: bool, sub: str | 
         rows.append([btn("🗑 Убрать из запаса" if st == "ready" else "❌ Отклонить", f"v:rej:{pid}")])
     if n > 1:
         rows.append([btn("◀", f"v:nav:{pid}:-1"), btn(f"{idx + 1} / {n}", "v:noop"), btn("▶", f"v:nav:{pid}:1")])
-    rows.append(([btn("← Запас", "h:stock")] if mode == "stock" else []) + [btn("🏠 Пульт", "h:home")])
+    if pf:
+        rows.append(_back(pf, [btn("← Запас", f"h:stock:{pf}")] if mode == "stock" else []))
+    else:
+        rows.append(([btn("← Запас", "h:stock")] if mode == "stock" else []) + [btn("🏠 Пульт", "h:home")])
     return _kb(rows)
 
 
@@ -475,8 +591,18 @@ async def _bump_rows(post) -> list[list]:
 
 
 async def _list(arg: dict):
-    mode, cat = arg.get("mode", "inbox"), arg.get("cat")
-    ids = await _list_ids(mode, cat, arg.get("pid"))
+    mode, cat, pf = arg.get("mode", "inbox"), arg.get("cat"), arg.get("pf")
+    ids = await _list_ids(mode, cat, arg.get("pid"), pf)
+    if not ids and pf and mode in ("plan", "inbox", "stock"):
+        from app import platforms
+        arg.update(pid=None, idx=0, kb=None)
+        name = platforms.title(pf)
+        text = {"plan": f"<b>{name}</b>: в плане пусто.",
+                "inbox": f"<b>📥 {name}</b>: ничего не ждёт решения.",
+                "stock": f"<b>📦 {name}</b>: в запасе пусто."}[mode]
+        if arg.get("note"):
+            text += f"\n\n<b>{html.escape(arg['note'])}</b>"
+        return banner(), text, _kb([_back(pf)]), arg
     if not ids:
         arg.update(pid=None, idx=0, kb=None)
         if mode == "inbox":
@@ -498,14 +624,15 @@ async def _list(arg: dict):
         pid = ids[idx]
         arg["kb"] = None
     post = await db.get_post(pid)
-    caption, clipped = _post_caption(post, mode, idx, len(ids), arg.get("note"))
-    kb = await _post_kb(post, mode, idx, len(ids), clipped, arg.get("kb"))
+    caption, clipped = _post_caption(post, mode, idx, len(ids), arg.get("note"), pf)
+    kb = await _post_kb(post, mode, idx, len(ids), clipped, arg.get("kb"), pf)
     arg.update(pid=pid, idx=idx)
     return cards.cover_path(post) or banner(), caption, kb, arg
 
 
 VIEWS = {"home": _home, "slot": _slot, "next": _next, "stockmenu": _stockmenu, "plan": _plan,
-         "stats": _stats, "digest": _digest, "src": _sources, "voice": _voice, "list": _list}
+         "stats": _stats, "digest": _digest, "src": _sources, "voice": _voice, "list": _list,
+         "more": _more, "pf": _pf, "site": _site, "arch": _arch}
 
 
 # ======================= управление сообщением экрана =======================
@@ -620,7 +747,7 @@ async def refresh(bot: Bot) -> None:
     if not st.get("msg"):
         return
     view, arg = st.get("view", "home"), dict(st.get("arg") or {})
-    if view not in ("home", "list", "slot", "stockmenu", "plan") or arg.get("kb") in ("pick", "reject", "confirm"):
+    if view not in ("home", "list", "slot", "stockmenu", "plan", "pf", "more") or arg.get("kb") in ("pick", "reject", "confirm"):
         return
     async with LOCK:
         try:
