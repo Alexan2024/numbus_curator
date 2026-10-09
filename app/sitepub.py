@@ -364,11 +364,13 @@ async def object_record(post, D: dict, key) -> tuple[dict, dict[str, bytes]]:
         pid = slug(str(p.get("id") or p.get("en") or p.get("ru") or ""))
         if pid in (x["id"] for x in people) or pid == "x":
             continue
-        people.append({"id": pid})
-        if pid not in D["people"] and (p.get("ru") or p.get("en")):
+        if pid not in D["people"]:
+            if not (p.get("ru") or p.get("en")):
+                continue      # без имени в указатель не попадёт — ссылка на него сломала бы правки сайта
             role = p.get("role") if p.get("role") in ROLES else "architect"
             new_people[pid] = {"ru": str(p.get("ru") or p.get("en")), "en": str(p.get("en") or p.get("ru")),
                                "roles": [role], "objs": []}
+        people.append({"id": pid})
     countries, new_countries = [], {}
     for c in out.get("countries") or []:
         cid = slug(str((c.get("id") if isinstance(c, dict) else c) or ""))
@@ -431,8 +433,15 @@ def with_object(D: dict, rec: dict) -> dict:
         D["countries"].setdefault(k, v)
     D["objects"] = [o for o in D["objects"] if o["id"] != rec["id"]]
     D["objects"].insert(0, rec)
-    D["objects"].sort(key=lambda o: o["id"], reverse=True)   # номера постов растут со временем; временный — самый большой
+    order(D)
     return recount(D)
+
+
+def order(D: dict) -> dict:
+    """Записи — от новых к старым: по дате, при равной дате — по номеру. Записи из Instagram (номера от 100000)
+    встают по дате своего поста среди записей канала; временная запись — сегодняшняя, с самым большим номером."""
+    D["objects"].sort(key=lambda o: (str(o.get("d") or ""), o["id"]), reverse=True)
+    return D
 
 
 async def note_record(post, D: dict, nid: int) -> tuple[dict, dict[str, bytes]]:

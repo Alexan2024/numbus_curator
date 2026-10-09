@@ -1,6 +1,7 @@
 """Все обращения к Claude: первичный фильтр (Haiku), оценка (Sonnet, пакетами и с кэшем),
 тексты больших постов и заметок (Opus), учёт расходов в долларах."""
 import base64
+import contextvars
 import json
 import logging
 import re
@@ -115,12 +116,28 @@ def cost_of(model: str, usage, batch: bool = False) -> float:
     return c + searches * 0.01
 
 
+# Отдельный счёт для долгих работ (архив сайта): пока внутри контекста задан список [сумма], каждый вызов
+# Claude прибавляет туда свою стоимость. Так у архива свой потолок, отдельный от дневного.
+_sink: contextvars.ContextVar = contextvars.ContextVar("cost_sink", default=None)
+
+
+def cost_sink(acc: list):
+    """with-блока нет: token = cost_sink(acc) … _sink.reset(token)."""
+    return _sink.set(acc)
+
+
 async def _record(model: str, usage, background: bool, batch: bool = False) -> None:
+    acc = _sink.get()
+    if acc is not None:          # свой бюджет: дневной лимит бота не трогаем
+        try:
+            acc[0] += cost_of(model, usage, batch)
+        except Exception:
+            pass
     try:
         cw = getattr(usage, "cache_creation_input_tokens", 0) or 0
         cr = getattr(usage, "cache_read_input_tokens", 0) or 0
         await db.add_usage((usage.input_tokens or 0) + cw + cr, usage.output_tokens or 0,
-                           cost_of(model, usage, batch), background)
+                           cost_of(model, usage, batch), background and acc is None, count_call=acc is None)
     except Exception:
         log.warning("расход не записан", exc_info=True)
 
@@ -534,8 +551,9 @@ async def _complete_branding(data: dict, params: dict, background: bool) -> dict
 
 # ---------- пакеты (Message Batches): вдвое дешевле, ответ — в пределах суток ----------
 
-async def batch_create(requests: list[dict]) -> str:
-    if not await budget_ok():
+async def batch_create(requests: list[dict], check_budget: bool = True) -> str:
+    """check_budget=False — у пакета свой бюджет (архив сайта), дневной потолок к нему не относится."""
+    if check_budget and not await budget_ok():
         raise BudgetExceeded()
     try:
         batch = await client.messages.batches.create(requests=requests)

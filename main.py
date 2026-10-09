@@ -14,7 +14,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app import (attribution, config, curator, db, growth, instagram, pipeline, repeats, reports, request, screen,
                  sitepub, slots, stats, stories, taste, ui)
-from app import dates, reels
+from app import archive, dates, reels
 from app.bot import router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -117,6 +117,7 @@ async def main():
     await reels.init()
     await growth.init()
     await instagram.init()
+    await archive.init()
     screen.banner()
     bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     ui.BOT = bot                      # для уведомлений из фоновых задач
@@ -131,6 +132,7 @@ async def main():
     dp.include_router(growth.router)        # раздел «Рост» — раньше основного, чтобы кнопки g:… не ушли в «старые»
     dp.include_router(instagram.router)     # кнопки ig:…
     dp.include_router(sitepub.router)       # /site и кнопки site:…
+    dp.include_router(archive.router)       # /archive и кнопки ar:…
     dp.include_router(router)
 
     @dp.error()
@@ -178,6 +180,7 @@ async def main():
     taste.schedule(sched, bot, guarded)
     dates.schedule(sched, bot, guarded)
     reels.schedule(sched, bot, guarded)
+    archive.schedule(sched, bot, guarded)   # чистка старых записей сайта и перенос Instagram (6.2)
     sched.start()
 
     await instagram.start_server()   # Instagram забирает фото по публичной ссылке
@@ -189,6 +192,7 @@ async def main():
         BotCommand(command="diag", description="Проверить, всё ли работает"),
         BotCommand(command="date", description="Пост к дате: /date 9.03 о чём"),
         BotCommand(command="site", description="Сайт: публикация и связь"),
+        BotCommand(command="archive", description="Архив сайта: чистка и перенос Instagram"),
         BotCommand(command="cancel", description="Отменить ввод"),
     ])
     asyncio.create_task(guarded(bot, "запуск", startup, bot)())

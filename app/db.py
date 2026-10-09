@@ -187,14 +187,18 @@ async def set_setting(key: str, value) -> None:
 
 # ---------- usage ----------
 
-async def add_usage(in_tok: int, out_tok: int, cost: float = 0.0, background: bool = False) -> None:
+async def add_usage(in_tok: int, out_tok: int, cost: float = 0.0, background: bool = False,
+                    count_call: bool = True) -> None:
+    """count_call=False — вызов со своим бюджетом (архив сайта): в расходе дня он виден, но дневной лимит
+    вызовов и фоновых трат не съедает."""
     day = _now_dt().date().isoformat()
+    n = 1 if count_call else 0
     async with connect() as db:
         await db.execute(
-            "INSERT INTO usage(day, calls, in_tok, out_tok, cost, bg_cost) VALUES (?,1,?,?,?,?) "
-            "ON CONFLICT(day) DO UPDATE SET calls=calls+1, in_tok=in_tok+excluded.in_tok, "
+            "INSERT INTO usage(day, calls, in_tok, out_tok, cost, bg_cost) VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(day) DO UPDATE SET calls=calls+excluded.calls, in_tok=in_tok+excluded.in_tok, "
             "out_tok=out_tok+excluded.out_tok, cost=cost+excluded.cost, bg_cost=bg_cost+excluded.bg_cost",
-            (day, in_tok, out_tok, cost, cost if background else 0.0),
+            (day, n, in_tok, out_tok, cost, cost if background else 0.0),
         )
         await db.commit()
 

@@ -57,6 +57,8 @@ def variants(url: str) -> list[str]:
     WordPress (-1024x683.jpg → .jpg), Squarespace (?format=750w → 2500w), CDN с ?w=460 (Sanity, imgix, Contentful)."""
     out: list[str] = []
     base, _, query = url.partition("?")
+    if "images.metmuseum.org" in base:           # The Met: web-large / web-additional → original
+        out.append(re.sub(r"/web-(?:large|additional|highlight)/", "/original/", base))
     # WordPress: размер в имени файла (у Sanity такие же цифры — часть имени файла, не размер)
     if "sanity.io" not in base and re.search(r"-\d{2,4}x\d{2,4}" + _IMG_EXT + "$", base, re.I):
         out.append(re.sub(r"-\d{2,4}x\d{2,4}(?=" + _IMG_EXT + "$)", "", base, flags=re.I))
@@ -210,7 +212,7 @@ def _ahash(im: Image.Image) -> int:
 
 async def download_images(client: httpx.AsyncClient, urls: list[str], dest: Path,
                           max_ratio: float = MAX_RATIO, min_short: int | None = None,
-                          min_long: int | None = None) -> list[Path]:
+                          min_long: int | None = None, max_keep: int = 14) -> list[Path]:
     """Качает, отбрасывает мелкие, пережатые, дубли и странные пропорции, сохраняет JPEG.
     Для каждого фото сначала пробует оригинал (variants): у многих сайтов в статье стоит уменьшенная копия.
     max_ratio, min_short и min_long — для кадров из фильмов мягче: широкий кадр 1280×536 — нормальный кадр.
@@ -275,12 +277,12 @@ async def download_images(client: httpx.AsyncClient, urls: list[str], dest: Path
             continue
         tmp = got["path"]
         w, h = got["w"], got["h"]
-        if len(saved) >= 14 or max(w, h) / min(w, h) > max_ratio \
+        if len(saved) >= max_keep or max(w, h) / min(w, h) > max_ratio \
                 or any(bin(got["hash"] ^ x).count("1") <= 5 for x in hashes):
             tmp.unlink(missing_ok=True)
             continue
         hashes.append(got["hash"])
-        p = dest / f"{len(saved):02d}.jpg"           # запас, Claude выберет до 10
+        p = dest / f"{len(saved):02d}.jpg"           # запас (14): Claude выберет до 10
         tmp.replace(p)
         saved.append(p)
     for t in dest.glob("_tmp*.jpg"):

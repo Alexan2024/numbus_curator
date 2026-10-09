@@ -29,7 +29,7 @@
       sNew: 'Сначала новые', sOld: 'Сначала ранние публикации', sYear: 'По году создания',
       grid: 'Галерея', list: 'Список', more: 'Показать ещё', clear: 'Сбросить всё', hint: 'Наведите на снимок',
       nothing: 'По этим фильтрам ничего нет', inSel: 'в выборке', archiveSub: 'архитектура, искусство, фотография, кино и находки из архивов',
-      tgPost: 'Пост в Telegram', related: 'Рядом в архиве', prev: 'Предыдущий', next: 'Следующий', since: 'В архиве с',
+      tgPost: 'Пост в Telegram', igPost: 'Пост в Instagram', related: 'Рядом в архиве', prev: 'Предыдущий', next: 'Следующий', since: 'В архиве с',
       video: 'Видео в посте Telegram', inIndex: 'в указателе', photos: 'фото',
       readNext: 'Читать дальше', notesSub: 'Длинные тексты AH Magazine о том, что стоит за архивом',
       names: 'Имена', countries: 'Страны', time: 'Время', indexSub: 'Люди, страны и годы всех объектов архива',
@@ -56,7 +56,7 @@
       sNew: 'Newest first', sOld: 'Earliest posts first', sYear: 'By year made',
       grid: 'Grid', list: 'List', more: 'Show more', clear: 'Clear all', hint: 'Hover over an image',
       nothing: 'Nothing matches these filters', inSel: 'in this selection', archiveSub: 'architecture, art, photography, cinema and archival finds',
-      tgPost: 'Telegram post', related: 'Related', prev: 'Previous', next: 'Next', since: 'In the archive since',
+      tgPost: 'Telegram post', igPost: 'Instagram post', related: 'Related', prev: 'Previous', next: 'Next', since: 'In the archive since',
       video: 'Video in the Telegram post', inIndex: 'in the index', photos: 'photos',
       readNext: 'Read next', notesSub: 'Longer essays from AH Magazine on what lies behind the archive',
       names: 'Names', countries: 'Countries', time: 'Period', indexSub: 'People, countries and years across the archive',
@@ -565,7 +565,8 @@
     }
     function vObject(id) {
       var o = BY[id], next = OBJ[o.ix + 1], prev = OBJ[o.ix - 1];
-      var title = tr(o.t), key = ik(o), tgId = o.tmp ? null : o.id;
+      // записи из Instagram (src: 'ig') — без поста в Telegram и без номера AH-, со ссылкой на пост в Instagram
+      var title = tr(o.t), key = ik(o), tgId = o.tmp || o.src === 'ig' ? null : o.id;
       var h = '<div class="wrap"><nav class="crumb" aria-label="' + t('crumbs') + '"><a href="' + ua({}) + '">' + t('archive') + '</a><span>/</span><a href="' + ua({ cat: o.cats[0] }) + '">' + catLabel(o.cats[0]) + '</a></nav>';
       h += '<div class="obj"><div class="lead-ph">' + photo(key, o.img, 0, title, tgId, true) + '</div>';
       h += '<aside class="obj-tx" id="otx"><span class="k">' + o.cats.map(catLabel).join(' · ') + '</span><h1>' + esc(title) + '</h1>';
@@ -579,9 +580,10 @@
           return '<dt>' + (t('cr')[c[0]] || t('cr').other) + '</dt><dd>' + v + '</dd>';
         }).join('') + '</dl>';
       }
-      h += '<div class="obj-meta"><span>' + (o.tmp ? '' : 'AH-' + o.id + ' · ') + t('since') + ' ' + fdate(o.d) + '</span>' +
+      h += '<div class="obj-meta"><span>' + (o.tmp || o.src === 'ig' ? '' : 'AH-' + o.id + ' · ') + t('since') + ' ' + fdate(o.d) + '</span>' +
         (o.co.length ? '<span>' + o.co.map(function (c) { return '<a href="' + ua({ co: c }) + '" style="border-bottom:1px solid var(--rule)">' + esc(tr(COUNTRIES[c])) + '</a>'; }).join(', ') + (o.per ? ' · <a href="' + ua({ per: o.per }) + '" style="border-bottom:1px solid var(--rule)">' + perLabel(o.per) + '</a>' : '') + '</span>' : '') + '</div>';
       if (tgId) h += '<div class="obj-links"><a href="' + TG + '/' + tgId + '" target="_blank" rel="noopener">' + t('tgPost') + ' ↗</a></div>';
+      else if (o.ig && /^https:\/\/(www\.)?instagram\.com\//.test(o.ig)) h += '<div class="obj-links"><a href="' + esc(o.ig) + '" target="_blank" rel="noopener">' + t('igPost') + ' ↗</a></div>';
       h += '</aside>';
       var rest = '';
       for (var i = 0; i < o.img.segs.length; i++) rest += photo(key, o.img, i, title, tgId, i === 0);
