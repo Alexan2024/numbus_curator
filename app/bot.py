@@ -450,7 +450,7 @@ async def on_post(cb: CallbackQuery, bot: Bot, state: FSMContext):
             data = json.loads(post["data"])
             lost = bool(data.get("_manual"))
             await cb.answer(("Твоя ручная правка сброшена. " if lost else "")
-                            + ("Пишу текст большого поста…" if fmt == "std" and not formatter.has_body(data) else
+                            + ("Пишу текст поста для канала…" if fmt == "std" and not formatter.has_body(data) else
                                f"Теперь {cards.FORMAT_LABEL[fmt]}"), show_alert=lost)
             if fmt == "std" and not formatter.has_body(data):
                 await _list(bot, pid=pid, note="✍️ Пишу текст…")

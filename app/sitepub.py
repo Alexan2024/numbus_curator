@@ -5,7 +5,9 @@
   AHMAG) и выкладывает её временную страницу /a/<номер поста в боте>/. В подпись уходит тихая строчка
   «в архиве →» с этой ссылкой. Когда канал дал посту номер, запись получает постоянный адрес /o/<номер>/,
   временный адрес начинает вести на него, сайт пересобирается.
-• Мини-пост. В канале без ссылки; на сайт попадает сразу после выхода.
+• Пост для канала (std): на сайте полнее — к тексту из канала добавляется продолжение site_more (факты, контекст).
+• Фото-пост (mini) с 6.0 выходит только в Instagram и на сайт не идёт (MINI_TO=tg — по-старому: на сайт сразу
+  после выхода, без ссылки в канале).
 • #ahmagnotes. Полный текст сначала выходит на сайте (/n/<номер>/), в канал уходит короткий анонс со ссылкой
   и большим превью страницы (через Instant View, если задан IV_RHASH). Фон для сторис приходит со ссылкой
   для стикера.
@@ -112,13 +114,15 @@ async def enabled() -> bool:
 
 
 def wants(post) -> str | None:
-    """Что этот пост на сайте: 'object' (большой и мини), 'note' (#ahmagnotes) или None (подборки и прочее)."""
+    """Что этот пост на сайте: 'object' (пост для канала; мини — только по-старому, MINI_TO=tg),
+    'note' (#ahmagnotes) или None (фото-посты для Instagram, подборки и прочее)."""
     if not post:
         return None
     src = post["source"] or ""
     if src == "digest":
         return None
-    if post["format"] in ("std", "mini"):
+    # мини, вышедший в канале (до 6.0 или с MINI_TO=tg), — на сайт как раньше; фото-пост для Instagram — нет
+    if post["format"] == "std" or (post["format"] == "mini" and (not config.MINI_IG or post["channel_msg_id"])):
         return "object"
     if post["format"] == "notes" and src == "notes":
         return "note"
@@ -338,12 +342,15 @@ async def object_record(post, D: dict, key) -> tuple[dict, dict[str, bytes]]:
     parts = formatter.headline_parts(data)
     text_ru = paragraphs(data.get("body", "")) if fmt == "std" else (
         [plain(data.get("mini_line"))] if plain(data.get("mini_line")) else [])
+    if fmt == "std" and data.get("site_more"):     # на сайте пост полнее, чем в канале
+        text_ru += paragraphs(data["site_more"])
     credits = {k: v for k, v in (data.get("credits") or {}).items() if v and str(v).strip().lower() != "null"}
     photos = await asyncio.to_thread(_photos, post)          # раньше Claude: без фото запись не нужна
     content = (
         f"# Headline parts\n{json.dumps(parts, ensure_ascii=False)}\n\n"
         f"# Section\n{config.CATEGORY_ALIASES.get(post['category'] or '', post['category'] or '')}\n\n"
-        f"# Text ({'full post' if fmt == 'std' else 'short post: one line'})\n" + ("\n\n".join(text_ru) or "(none)") + "\n\n"
+        f"# Text ({'full post' if fmt == 'std' else 'short post: one line'}, {len(text_ru)} paragraph(s): "
+        f"text_en must have exactly {len(text_ru)})\n" + ("\n\n".join(text_ru) or "(none)") + "\n\n"
         f"# Credits\n{json.dumps(credits, ensure_ascii=False)}\n\n"
         f"# Hashtags\n{' '.join(formatter.normalize_tags(data.get('tags', []), fmt))}\n\n"
         f"# Index of people already on the site (id | Russian | English)\n{_people_list(D)}\n\n"

@@ -82,6 +82,11 @@ async def cleanup():
 
 async def startup(bot: Bot):
     """После перезапуска: забрать пакеты, при пустом запасе — собрать, освежить экран."""
+    audit = await pipeline.quality_audit()   # запас по новым правилам фото — один раз на версию
+    if audit and any(audit.values()):
+        await screen.notify(bot, "🖼 Запас проверен по новым правилам фото: "
+                                 f"выключено мелких фото {audit['photos']}, снято постов {audit['removed']}, "
+                                 f"переведено в фото-посты {audit['to_mini']}.")
     await poll(bot)
     await repeats.backfill()          # отпечатки для защиты от повторов у постов, собранных до v4
     await attribution.snapshot(bot)   # первая точка кривой подписчиков
@@ -162,6 +167,7 @@ async def main():
     ph, pm = config.PLAN_TIME
     sched.add_job(guarded(bot, "план на завтра", slots.evening, bot), "cron", hour=ph, minute=pm, id="evening")
     sched.add_job(guarded(bot, "срок входящих", slots.expire_inbox, bot), "interval", hours=1, id="expire")
+    sched.add_job(guarded(bot, "срок новостей", pipeline.expire_news), "interval", hours=1, id="expire_news")
     sched.add_job(guarded(bot, "дайджест", digest, bot), "cron",
                   day_of_week=config.DIGEST_DOW, hour=config.DIGEST_HOUR, id="digest")
     sched.add_job(guarded(bot, "очистка", cleanup), "cron", hour=4, minute=30, id="cleanup")
@@ -186,9 +192,11 @@ async def main():
         BotCommand(command="cancel", description="Отменить ввод"),
     ])
     asyncio.create_task(guarded(bot, "запуск", startup, bot)())
-    log.info("AHMAG curator v%s запущен · режим %s · слоты %s · слот находки %s · страховка %s", config.VERSION,
-             await slots.mode(), config.SLOTS, "%02d:%02d" % slots.find_slot() if slots.find_slot() else "нет",
-             "вкл" if config.SEMI_FALLBACK else "выкл")
+    log.info("AHMAG curator v%s запущен · режим %s · слоты %s · слот находки %s · страховка %s · мини → %s · "
+             "новости %s", config.VERSION, await slots.mode(), config.SLOTS,
+             "%02d:%02d" % slots.find_slot() if slots.find_slot() else "нет",
+             "вкл" if config.SEMI_FALLBACK else "выкл", "Instagram" if config.MINI_IG else "канал",
+             "вкл" if config.NEWS else "выкл")
     # chat_member приходит только если явно запрошен — список собирается по подключённым обработчикам
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 

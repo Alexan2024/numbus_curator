@@ -10,13 +10,14 @@ from urllib.parse import urljoin
 
 import httpx
 from bs4 import BeautifulSoup
-from PIL import Image
+from PIL import Image, ImageDraw, ImageOps, ImageStat
 
 from app import config
 
 log = logging.getLogger(__name__)
 
 MAX_RATIO = 2.2          # обычный предел пропорций кадра
+MAX_BYTES = 30_000_000   # файл больше — не качаем (оригиналы на 10 000 px)
 
 SKIP_IMG = re.compile(r"logo|avatar|icon|sprite|banner|(?<![a-z])ads?[_/-]|pixel|gravatar|placeholder|\.svg|\.gif", re.I)
 
@@ -42,6 +43,62 @@ def _upgrade(url: str) -> str:
     # ArchDaily отдаёт превью; подменяем на крупный размер
     url = re.sub(r"/(thumb_jpg|small_jpg|medium_jpg|newsletter|slideshow|square)/", "/large_jpg/", url)
     return url.split("?")[0] if "adsttc.com" in url else url
+
+
+# ---------- крупнее: где у сайтов лежит оригинал ----------
+
+BIG = 2560          # столько просим у CDN, которые режут по параметру
+_SIZE_PARAMS = ("w", "width", "h", "height", "maxwidth", "max-w", "mw")
+_IMG_EXT = r"\.(?:jpe?g|png|webp)"
+
+
+def variants(url: str) -> list[str]:
+    """Адреса одного фото, от самого крупного к исходному: сначала пробуем оригинал, не вышло — тот, что был.
+    WordPress (-1024x683.jpg → .jpg), Squarespace (?format=750w → 2500w), CDN с ?w=460 (Sanity, imgix, Contentful)."""
+    out: list[str] = []
+    base, _, query = url.partition("?")
+    # WordPress: размер в имени файла (у Sanity такие же цифры — часть имени файла, не размер)
+    if "sanity.io" not in base and re.search(r"-\d{2,4}x\d{2,4}" + _IMG_EXT + "$", base, re.I):
+        out.append(re.sub(r"-\d{2,4}x\d{2,4}(?=" + _IMG_EXT + "$)", "", base, flags=re.I))
+    if query:
+        params = urlparse_mod.parse_qsl(query, keep_blank_values=True)
+        keys = {k.lower() for k, _ in params}
+        if "format" in keys and "squarespace" in url:
+            out.append(base + "?format=2500w")
+        elif keys & set(_SIZE_PARAMS):
+            sized = []
+            for k, v in params:
+                kl = k.lower()
+                if kl in ("w", "width", "maxwidth", "max-w", "mw") and v.isdigit() and int(v) < BIG:
+                    sized.append((k, str(BIG)))
+                elif kl in ("h", "height") and v.isdigit():
+                    continue          # высоту не задаём: пропорции сохранит сам CDN
+                else:
+                    sized.append((k, v))
+            if sized != params:
+                out.append(base + "?" + urlparse_mod.urlencode(sized))
+    out.append(url)
+    return list(dict.fromkeys(out))
+
+
+# ---------- качество файла ----------
+
+# стандартная таблица квантования яркости JPEG (IJG), по ней оценивается качество сжатия
+_STD_LUMA = [16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56,
+             14, 17, 22, 29, 51, 87, 80, 62, 18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92,
+             49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99]
+
+
+def jpeg_quality(im: Image.Image) -> int | None:
+    """Примерное качество сжатия JPEG (1–100) по таблице квантования; не JPEG — None."""
+    q = getattr(im, "quantization", None)
+    if not q or 0 not in q:
+        return None
+    t = list(q[0])
+    if len(t) != 64:
+        return None
+    scale = sum(t) / sum(_STD_LUMA) * 100
+    return round((200 - scale) / 2) if scale <= 100 else round(5000 / scale)
 
 
 def parse_html(html_text: str, base_url: str) -> dict:
@@ -152,46 +209,143 @@ def _ahash(im: Image.Image) -> int:
 
 
 async def download_images(client: httpx.AsyncClient, urls: list[str], dest: Path,
-                          max_ratio: float = MAX_RATIO, min_short: int | None = None) -> list[Path]:
-    """Качает, отбрасывает мелкие/дубли/странные пропорции, сохраняет JPEG.
-    max_ratio и min_short — для кадров из фильмов мягче: широкий кадр 1280×536 — нормальный кадр."""
+                          max_ratio: float = MAX_RATIO, min_short: int | None = None,
+                          min_long: int | None = None) -> list[Path]:
+    """Качает, отбрасывает мелкие, пережатые, дубли и странные пропорции, сохраняет JPEG.
+    Для каждого фото сначала пробует оригинал (variants): у многих сайтов в статье стоит уменьшенная копия.
+    max_ratio, min_short и min_long — для кадров из фильмов мягче: широкий кадр 1280×536 — нормальный кадр.
+    Память: каждое фото сразу ужимается до 2560 px и ложится на диск, в памяти не копятся оригиналы."""
     min_short = config.MIN_SHORT_SIDE if min_short is None else min_short
+    min_long = config.MIN_LONG_SIDE if min_long is None else min_long
     dest.mkdir(parents=True, exist_ok=True)
-    sem = asyncio.Semaphore(6)
+    sem = asyncio.Semaphore(4)
+
+    def verdict(w: int, h: int, q: int | None) -> str | None:
+        if max(w, h) < min_long or min(w, h) < min_short:
+            return "small"
+        if q is not None and q < config.JPEG_MIN_QUALITY:
+            return "squeezed"
+        return None
+
+    def process(raw: bytes, tmp: Path) -> dict | None:
+        """Байты → проверка по заголовку файла (без распаковки) → ужатая копия на диске."""
+        try:
+            im = Image.open(io.BytesIO(raw))
+            w, h = im.size
+            q = jpeg_quality(im)
+            bad = verdict(w, h, q)
+            if bad:
+                return {"bad": bad, "w": w, "h": h}
+            im.load()
+            hsh = _ahash(im)
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            im.thumbnail((2560, 2560), Image.LANCZOS)
+            im.save(tmp, "JPEG", quality=92)
+            return {"bad": None, "w": w, "h": h, "hash": hsh, "path": tmp}
+        except Exception:
+            return None
 
     async def fetch(i: int, u: str):
         async with sem:
-            try:
-                r = await client.get(u, timeout=40, follow_redirects=True)
-                r.raise_for_status()
-                im = Image.open(io.BytesIO(r.content))
-                im.load()
-                return i, im
-            except Exception:
-                return i, None
+            res = None
+            for v in variants(u):
+                try:
+                    r = await client.get(v, timeout=40, follow_redirects=True)
+                    r.raise_for_status()
+                except Exception:
+                    continue
+                if len(r.content) > MAX_BYTES:
+                    continue
+                got = await asyncio.to_thread(process, r.content, dest / f"_tmp{i:02d}.jpg")
+                if got is None:
+                    continue
+                if not got["bad"]:
+                    return i, got
+                res = res or got          # мелкое или пережатое — запомним причину, попробуем следующий вариант
+            return i, res
 
-    results = sorted(await asyncio.gather(*(fetch(i, u) for i, u in enumerate(urls))))
-    saved, hashes = [], []
-    for i, im in results:
-        if im is None:
+    results = sorted(await asyncio.gather(*(fetch(i, u) for i, u in enumerate(urls))), key=lambda x: x[0])
+    saved, hashes, small, squeezed = [], [], 0, 0
+    for i, got in results:
+        if not got:
             continue
-        w, h = im.size
-        if max(w, h) < config.MIN_LONG_SIDE or min(w, h) < min_short:
+        if got["bad"]:
+            small += got["bad"] == "small"
+            squeezed += got["bad"] == "squeezed"
             continue
-        if max(w, h) / min(w, h) > max_ratio:
+        tmp = got["path"]
+        w, h = got["w"], got["h"]
+        if len(saved) >= 14 or max(w, h) / min(w, h) > max_ratio \
+                or any(bin(got["hash"] ^ x).count("1") <= 5 for x in hashes):
+            tmp.unlink(missing_ok=True)
             continue
-        hsh = _ahash(im)
-        if any(bin(hsh ^ x).count("1") <= 5 for x in hashes):
-            continue
-        hashes.append(hsh)
-        im = im.convert("RGB")
-        im.thumbnail((2560, 2560))
-        p = dest / f"{len(saved):02d}.jpg"
-        im.save(p, "JPEG", quality=90)
+        hashes.append(got["hash"])
+        p = dest / f"{len(saved):02d}.jpg"           # запас, Claude выберет до 10
+        tmp.replace(p)
         saved.append(p)
-        if len(saved) >= 14:  # запас, Claude выберет до 10
-            break
+    for t in dest.glob("_tmp*.jpg"):
+        t.unlink(missing_ok=True)
+    if small or squeezed:
+        log.info("Фото отсеяны: мелкие %s, пережатые %s (%s)", small, squeezed, dest.name)
     return saved
+
+
+# ---------- 100%: фрагменты для проверки резкости ----------
+
+def _busiest(g: Image.Image, tile: int) -> tuple[int, int]:
+    """Левый верхний угол окна tile×tile с самой богатой деталями областью (по разбросу яркости)."""
+    w, h = g.size
+    step = max(tile // 2, 1)
+    best, at = -1.0, (max(0, (w - tile) // 2), max(0, (h - tile) // 2))
+    for y in range(0, max(1, h - tile + 1), step):
+        for x in range(0, max(1, w - tile + 1), step):
+            v = ImageStat.Stat(g.crop((x, y, x + tile, y + tile))).stddev[0]
+            if v > best:
+                best, at = v, (x, y)
+    return at
+
+
+def save_detail_sheet(paths: list, out: Path) -> str | None:
+    """Лист фрагментов — в файл рядом с фото кандидата (собирается в отдельном потоке, бот не замирает)."""
+    b64 = detail_sheet(paths)
+    if not b64:
+        return None
+    out.write_bytes(base64.b64decode(b64))
+    return str(out)
+
+
+def detail_sheet(paths: list, tile: int = 256, cols: int = 4) -> str | None:
+    """Лист фрагментов: из каждого фото — окно tile×tile в 100% (без уменьшения), там, где больше всего деталей.
+    В углу номер фото. По такому листу видно мыло, растянутое увеличение, шум и артефакты сжатия, которые
+    на превью 480 px не разглядеть. → base64 JPEG или None."""
+    crops = []
+    for p in paths:
+        try:
+            with Image.open(p) as im:
+                im = im.convert("RGB")
+                g = im.convert("L")
+                g.thumbnail((640, 640))                      # где искать — по уменьшенной копии, быстро
+                k = im.width / g.width
+                small_tile = max(8, round(tile / k))
+                x, y = _busiest(g, small_tile)
+                x, y = round(x * k), round(y * k)
+                x, y = min(x, max(0, im.width - tile)), min(y, max(0, im.height - tile))
+                crops.append(im.crop((x, y, x + tile, y + tile)))
+        except Exception:
+            crops.append(Image.new("RGB", (tile, tile), (128, 128, 128)))
+    if not crops:
+        return None
+    rows = (len(crops) + cols - 1) // cols
+    sheet = Image.new("RGB", (cols * tile + (cols - 1) * 4, rows * tile + (rows - 1) * 4), (255, 255, 255))
+    draw = ImageDraw.Draw(sheet)
+    for n, c in enumerate(crops):
+        x, y = (n % cols) * (tile + 4), (n // cols) * (tile + 4)
+        sheet.paste(c, (x, y))
+        draw.rectangle((x, y, x + 22, y + 16), fill=(0, 0, 0))
+        draw.text((x + 5, y + 2), str(n), fill=(255, 255, 255))
+    buf = io.BytesIO()
+    sheet.save(buf, "JPEG", quality=95)
+    return base64.b64encode(buf.getvalue()).decode()
 
 
 def thumb_b64(path: Path, size: int = 640) -> str:

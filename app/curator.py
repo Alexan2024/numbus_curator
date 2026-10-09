@@ -1,10 +1,12 @@
 """Все обращения к Claude: первичный фильтр (Haiku), оценка (Sonnet, пакетами и с кэшем),
 тексты больших постов и заметок (Opus), учёт расходов в долларах."""
+import base64
 import json
 import logging
 import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import anthropic
 from anthropic import AsyncAnthropic
@@ -268,6 +270,9 @@ async def ping() -> None:
 
 # ---------- 1. первичный фильтр (Haiku, текст без фото) ----------
 
+NEWS_YES = ("\n• новость о вещи нашего вкуса: открылось построенное здание, открылась выставка художника или фотографа "
+            "из нашего круга, реставрация, снос или угроза сносу, находка, умер мастер, вышла книга." if config.NEWS else "")
+
 TRIAGE_SYSTEM = """Ты — первый фильтр для Telegram-канала AHMAG об архитектуре, искусстве, фотографии, архивах и кино. По заголовку и началу текста реши, стоит ли показывать материал редактору. Подробно его посмотрят потом; сейчас важно отсеять явно чужое.
 
 yes — похоже на вкус канала:
@@ -275,12 +280,12 @@ yes — похоже на вкус канала:
 • искусство без кича: сюрреализм и тихая метафизика, лэнд-арт, объекты в среде, мастер за работой, визуальная культура (гравюры, манускрипты, вывески, мультипликация), тёплый юмор;
 • документальная, уличная, архивная фотография, этнография;
 • исторические серии и находки из прошлого;
-• авторское кино с сильной визуальной стороной, закулисье съёмок.
+• авторское кино с сильной визуальной стороной, закулисье съёмок.{NEWS_YES}
 
 no — не наше:
 • рендеры, конкурсы, концепции и неосуществлённые проекты; небоскрёбы, девелоперские комплексы, офисы, торговые центры, сетевые отели;
 • продуктовый и промышленный дизайн, мебель, гаджеты, мода, автомобили, еда;
-• новости индустрии, премии, вакансии, мероприятия, подборки и рейтинги, реклама, интервью без конкретной работы, политика и скандалы;
+• новости индустрии (бизнес, назначения, рейтинги, финансы), анонсы мероприятий, вакансии, подборки и рейтинги, реклама, интервью без конкретной работы, политика;
 • обзоры мейнстримного кино и сериалов.
 
 maybe — если не ясно.
@@ -288,7 +293,8 @@ maybe — если не ясно.
 Архитектуры в потоке много, к ней будь строже. К искусству, фотографии, архиву и кино — мягче.
 Рубрика cat: architecture (включая интерьеры), art, photography, archive, cinema.
 
-Верни ТОЛЬКО JSON: {"r": [{"i": 0, "v": "yes|maybe|no", "cat": "architecture", "why": "3–6 слов"}]}"""
+Верни ТОЛЬКО JSON: {"r": [{"i": 0, "v": "yes|maybe|no", "cat": "architecture", "why": "3–6 слов"}]}""".replace(
+    "{NEWS_YES}", NEWS_YES)
 
 
 async def triage(items: list[dict]) -> dict[int, dict]:
@@ -307,28 +313,47 @@ async def triage(items: list[dict]) -> dict[int, dict]:
 
 # ---------- 2. оценка (Sonnet, с фото) ----------
 
-EVAL_SYSTEM = f"""Ты — редактор-куратор Telegram-канала AHMAG. Ниже профиль канала: вкус, темы и формат.
+if config.MINI_IG:
+    _FORMAT_RULES = f"""- "std" — пост для Telegram-канала и сайта (в Instagram он тоже уйдёт, с короткой подписью). Только если есть угол — см. «Правило угла» выше: история, которой не видно на фото. Угол запиши в angle. И нужно не меньше {config.MIN_PHOTOS_ARTICLE} хороших фото.
+- "mini" — фото-пост только для Instagram: красивые фото, а истории нет или фото говорят сами. В канал и на сайт он не идёт. Если сомневаешься, есть ли угол, — mini."""
+else:
+    _FORMAT_RULES = f"""- "std" — большой пост: заголовок, 1–2 абзаца, кредиты, теги. Только если есть угол — см. «Правило угла» выше. Угол запиши в angle. И нужно не меньше {config.MIN_PHOTOS_ARTICLE} хороших фото.
+- "mini" — всё остальное: заголовок, одна простая фраза, кредиты и теги, от 1 до {config.MINI_MAX_PHOTOS} фото. Если сомневаешься — mini."""
+
+_NEWS_RULES = """
+# Новость (kind)
+kind = "news", если материал сообщает о событии последних дней: открылось построенное здание или выставка, реставрация, снос или угроза сносу, находка, умер мастер, конкретная работа получила важную премию, вышла книга. И только если сам объект или человек — из вкуса канала: AHMAG написал бы о нём и без повода. Новость — всегда std, angle_type — «новость», в news_date — дата события, если она есть в тексте. Анонсы мероприятий, отраслевые новости, рейтинги, назначения, деньги и политика — не наши новости: низкая оценка.
+Обычная публикация проекта или работы — kind = "object".
+Для новости already_posted = false, даже если о самой вещи канал уже писал: событие новое. Для новости всегда заполняй kind.
+""" if config.NEWS else ""
+
+_PHOTO_RULES = """# Качество фото (soft_photos)
+Если после превью есть лист фрагментов — из каждого фото кусок в 100% масштабе, без уменьшения; номер в углу — номер фото, — суди о качестве по нему, а не по превью. В soft_photos перечисли номера фото, которые на 100% явно плохи: мыло (вне фокуса, смазано), растянутое увеличение (контуры мягкие и «оплывшие», как у апскейла), сильные артефакты сжатия (квадраты, ореолы вокруг контуров), сильный цифровой шум, водяной знак или текст поверх. Плёночное зерно и мягкость старой фотографии — не дефект. Сомневаешься — не включай. Эти фото в пост не попадут. Листа нет — soft_photos пустой, если только превью не показывает явный брак.""" if config.PHOTO_CHECK else """# Качество фото (soft_photos)
+В soft_photos перечисли номера фото с явным браком на превью: сильное мыло, водяной знак или текст поверх. Сомневаешься — не включай."""
+
+EVAL_SYSTEM = f"""Ты — редактор-куратор AHMAG: Telegram-канал, Instagram и сайт. Ниже профиль канала: вкус, темы и формат.
 
 {PROFILE}
+
+{voice.EDITORIAL}
 
 {voice.RULES}
 
 # Твоя задача
-Тебе дают материал-кандидат: текст источника и пронумерованные превью фото.
+Тебе дают материал-кандидат: текст источника, пронумерованные превью фото и, если есть, лист фрагментов этих фото в 100% масштабе.
 1. Проверь стоп-лист и повтор: сравни со списком «Уже опубликовано» ниже и с недавними заголовками из сообщения.
 2. Оцени соответствие вкусу канала по шкале 0–10 (раздел 6 профиля). Будь строгим: 7 и выше — только то, что автор канала опубликовал бы сам.
-3. Если оценка не ниже {config.SCORE_THRESHOLD}: определи рубрику и формат, составь заголовок, кредиты, теги, одну фразу для мини-поста и порядок фото. Основной текст большого поста сейчас НЕ пиши: его напишут отдельно, если пост выберут.
+3. Если оценка не ниже {config.SCORE_THRESHOLD}: определи рубрику, формат и угол, составь заголовок, кредиты, теги, одну фразу для фото-поста, отметь плохие фото и задай порядок фото. Основной текст поста сейчас НЕ пиши: его напишут отдельно, если пост выберут.
 
 # Рубрика (category)
 architecture — архитектура и интерьеры; art — искусство, скульптура, инсталляции, выставки, музейные предметы; photography — фотография; archive — исторические серии, старые снимки и документы визуальной культуры; cinema — кино.
 
-# Формат (format)
-Канал выходит в пропорции примерно 70% мини-постов и 30% больших.
-- "std" — большой пост: заголовок, 1–2 абзаца, кредиты, теги. Только если есть что рассказать: история, приём, контекст, судьба вещи. И нужно не меньше {config.MIN_PHOTOS_ARTICLE} хороших фото.
-- "mini" — всё остальное: заголовок, одна простая фраза, кредиты и теги, от 1 до {config.MINI_MAX_PHOTOS} фото. Если сомневаешься — mini.
-
-# Фраза мини-поста (mini_line)
-Одна простая фраза до 140 знаков: что это за вещь и что видно на фото, как сказал бы человек в переписке. Пиши её почти всегда, и для std тоже (пост могут сжать до мини). null — только если заголовок уже сказал всё.
+# Формат (format) и угол (angle)
+{_FORMAT_RULES}
+angle — одна фраза: факт из материала, ради которого стоит писать (не оценка). angle_type — тип угла: судьба, человек, конфликт, деталь, контекст, парадокс, новость. Угла в материале нет — angle и angle_type = null, формат mini.
+{_NEWS_RULES}
+# Фраза фото-поста (mini_line)
+Одна простая фраза до 140 знаков: что это за вещь и что видно на фото, как сказал бы человек в переписке. Пиши её почти всегда, и для std тоже. null — только если заголовок уже сказал всё.
 Хорошо: «Бетонная часовня посреди поля, внутри обугленные стены и дыра в потолке.» · «Большая волна в Канагаве Хокусая, та самая, с маленькой Фудзи на заднем плане.» · «Ночной Париж Брассаи: туман, фонари и мокрая брусчатка.»
 Плохо: «Архитектура, которая растворяется в тишине.» · «Не дом, а манифест.» · «Гармония света и материала.»
 
@@ -338,8 +363,10 @@ architecture — архитектура и интерьеры; art — иску�
 - Так выглядят заголовки канала:
 {HEADLINE_EXAMPLES}
 
-# Фото
-photo_order — индексы превью в порядке публикации: для std от {config.MIN_PHOTOS_ARTICLE} до {config.EVAL_PHOTOS}, для mini от 1 до {config.MINI_MAX_PHOTOS}. Последовательность: общий план → детали и материал → интерьер и свет. Исключай слабые, повторяющиеся, с текстом поверх, чертежи без необходимости.
+{_PHOTO_RULES}
+
+# Фото (photo_order)
+photo_order — индексы превью в порядке публикации, без фото из soft_photos: для std от {config.MIN_PHOTOS_ARTICLE} до {config.EVAL_PHOTOS}, для mini от 1 до {config.MINI_MAX_PHOTOS}. Последовательность: общий план → детали и материал → интерьер и свет. Исключай слабые, повторяющиеся, с текстом поверх, чертежи без необходимости.
 
 # Уже опубликовано в канале (не повторять)
 {chr(10).join(ARCHIVE_HEADLINES)}
@@ -352,15 +379,22 @@ photo_order — индексы превью в порядке публикаци
   "score": 0,
   "score_reason": "одна фраза по-русски, почему такая оценка",
   "category": "architecture|art|photography|archive|cinema",
+  "kind": "object|news",
   "format": "std|mini",
+  "angle": "одна фраза или null",
+  "angle_type": "судьба|человек|конфликт|деталь|контекст|парадокс|новость или null",
+  "news_date": null,
   "headline_parts": ["Название", "Автор/бюро или null", "Город, Страна, Год или null"],
   "mini_line": "одна простая фраза или null",
   "credits": {{"pr": null, "pr_url": null, "ph": null, "ph_url": null, "via": null}},
   "tags": ["ahmagarchitecture", "ahmagjapan"],
+  "soft_photos": [],
   "photo_order": [0, 1, 2],
   "flags": ["нет ph"]
 }}
-Если оценка ниже {config.SCORE_THRESHOLD}, stoplist или already_posted — достаточно полей stoplist, already_posted, score, score_reason и category."""
+Если оценка ниже {config.SCORE_THRESHOLD}, stoplist или already_posted — достаточно полей stoplist, already_posted, score, score_reason, category и kind."""
+
+SHEET_NOTE = "Лист фрагментов в 100% масштабе (номер в углу — номер фото):"
 
 # Метка поста, который автор заказал сам (по ссылке или по запросу): по ней evaluate() понимает,
 # что оформление нужно полностью, даже если оценка низкая.
@@ -383,7 +417,7 @@ async def eval_context() -> str:
 
 
 def eval_params(context: str, source: str, url: str, title: str, text: str, images: list,
-                allow_std: bool = True, forced: bool = False) -> dict:
+                allow_std: bool = True, forced: bool = False, published: str = "", sheet: str | None = None) -> dict:
     extra = []
     if not allow_std:
         extra.append(f"Качественных фото меньше {config.MIN_PHOTOS_ARTICLE}: возможен только формат mini.")
@@ -394,7 +428,9 @@ def eval_params(context: str, source: str, url: str, title: str, text: str, imag
     content: list = [
         {"type": "text", "text": context, "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": (
-            f"# Кандидат\nИсточник: {source}\nURL: {url}\nЗаголовок: {title}\n\n"
+            f"# Кандидат\nИсточник: {source}\nURL: {url}\nЗаголовок: {title}\n"
+            + (f"Опубликовано в источнике: {published}\n" if published else "")
+            + f"Сегодня: {datetime.now(ZoneInfo(config.TZ_NAME)):%d.%m.%Y}\n\n"
             f"Текст:\n{text[:config.EVAL_TEXT_CHARS]}\n\n"
             + ("# Важно\n" + "\n".join(extra) + "\n\n" if extra else "")
             + f"# Превью фото ({len(images)} шт., индексы по порядку)")},
@@ -402,6 +438,12 @@ def eval_params(context: str, source: str, url: str, title: str, text: str, imag
     for i, p in enumerate(images):
         content.append({"type": "text", "text": f"Фото {i}:"})
         content.append(_img(p))
+    if config.PHOTO_CHECK and sheet and Path(sheet).exists():      # лист собирается заранее, в _prepare
+        content.append({"type": "text", "text": SHEET_NOTE})
+        content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                                    "data": base64.b64encode(Path(sheet).read_bytes()).decode()}})
+    elif config.PHOTO_CHECK:
+        content.append({"type": "text", "text": "Листа фрагментов нет."})
     return {"model": config.CLAUDE_MODEL, "max_tokens": 1500, "system": _system(EVAL_SYSTEM),
             "messages": [{"role": "user", "content": content}]}
 
@@ -470,7 +512,8 @@ async def _complete_branding(data: dict, params: dict, background: bool) -> dict
     blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
     text = "\n\n".join(b["text"] for b in blocks
                        if b.get("type") == "text" and "# Кандидат" in (b.get("text") or ""))
-    n_img = sum(1 for b in blocks if b.get("type") == "image")
+    n_img = sum(1 for b in blocks if b.get("type") == "image") \
+        - any(b.get("type") == "text" and b.get("text") == SHEET_NOTE for b in blocks)   # лист фрагментов — не фото
     log.info("Заказанный пост без оформления (score=%s) — дописываю заголовок и теги", data.get("score"))
     fill = await _call(f"{text or '—'}\n\nОформи этот пост. Верни ТОЛЬКО JSON:\n{BRAND_FORMAT}",
                        system=BRAND_SYSTEM, model=config.CLAUDE_MODEL, max_tokens=1000, background=background)
@@ -536,21 +579,74 @@ async def batch_results(bid: str):
 
 # ---------- 3. тексты (Opus) ----------
 
-WRITER_SYSTEM = f"""Ты пишешь тексты для Telegram-канала AHMAG об архитектуре, искусстве, фотографии и кино. Автор канала — архитектор по образованию. Пишет для людей со вкусом, без снобизма и без восторгов.
+WRITER_SYSTEM = f"""Ты пишешь тексты для AHMAG: Telegram-канал и сайт об архитектуре, искусстве, фотографии и кино. Автор канала — архитектор по образованию. Пишет для людей со вкусом, без снобизма и без восторгов.
+
+{voice.EDITORIAL}
 
 {voice.RULES}
 
-# Большой пост
-- Основной текст (body): 1–2 абзаца, всего 250–600 знаков. Абзацы разделяй пустой строкой.
-- Выбери одну-две вещи, которые действительно стоит рассказать: историю, приём, материал, место, судьбу здания, деталь на фото. Не пытайся пересказать всё.
-- Только факты из материала. Не выдумывай ни дат, ни цифр, ни имён.
+# Пост для канала (body)
+- 1–2 абзаца, всего 350–700 знаков. Абзацы разделяй пустой строкой.
+- Строй текст вокруг угла (он дан в задании; если его нет или он слабый, найди сильнее в материале и фактах). Одна линия, не пересказ всего.
+- Первая фраза сразу о сути угла: факт, который цепляет. Без вступлений.
+- Только факты из материала и из найденных фактов. Не выдумывай ни дат, ни цифр, ни имён, ни причин.
 - Разметка: можно одно выделение <b> или <i>, лучше без них.
 - Без заголовка, кредитов и хэштегов — их добавят отдельно.
 
-# Фраза мини-поста
+# Новость
+Если пост — новость: первая фраза — что произошло и когда (по материалу). Дальше — почему это интересно: история вещи или человека. Без пресс-релизных оборотов («было объявлено», «состоялось открытие»).
+
+# Продолжение для сайта (site_more)
+На сайте пост выходит полнее. site_more — 1–3 абзаца, 400–1200 знаков: что не влезло в канал — подробности истории, люди, контекст, что было потом. Тот же голос, те же правила, только проверенные факты. body не повторяй. Добавить нечего — null.
+
+# Проверка перед ответом
+- invisible — одной фразой: что в body нельзя увидеть на фото. Если ответить нечем, перепиши body.
+- В body нет описания материалов, площадей и планировки, если в них нет истории.
+
+# Фраза фото-поста
 Одна простая фраза до 140 знаков: что это и что видно на фото, как сказал бы человек в переписке.
 
 {voice.EXAMPLES}"""
+
+RESEARCH_SYSTEM = """Ты — исследователь редакции AHMAG (архитектура, искусство, фотография, архив, кино). Перед тем как автор напишет короткий пост, ты ищешь историю вещи: то, чего не видно на фотографиях.
+
+Что искать (в порядке ценности): судьбу (что случилось потом: снос, перестройка, заброшенность, спасение), людей (заказчик, архитектор, жилец, модель, странные детали биографии), конфликт (скандал, отказ, провал, суд), деталь с объяснением, контекст (на что отвечает, что было на этом месте), парадокс. Для новости — что именно произошло, когда, и предысторию.
+
+Правила
+- Ищи именно про этот объект, работу или человека. Не путай с однофамильцами и одноимёнными зданиями.
+- Факты — только найденные в источниках, к каждому url. Пресс-релизные данные (площадь, материалы, программа) — не факты для нас, не выписывай их.
+- Ничего не нашёл — так и скажи: verdict = weak, facts пустые. Это нормально.
+
+Верни ТОЛЬКО JSON:
+{"angle": "самый сильный угол одной фразой или null", "angle_type": "судьба|человек|конфликт|деталь|контекст|парадокс|новость|null", "facts": [{"text": "факт по-русски", "url": "https://..."}], "verdict": "strong|weak"}"""
+
+
+async def research(data: dict, source_text: str) -> dict:
+    """Поиск истории объекта перед текстом поста для канала (Sonnet + веб-поиск, до WRITER_SEARCHES запросов).
+    Не получилось — пустой результат, пост пишется по материалу источника, как раньше."""
+    if not config.WRITER_RESEARCH:
+        return {}          # поиск выключен — пишем по материалу источника
+    head = " // ".join(p for p in (data.get("headline_parts") or []) if p and str(p).lower() != "null")
+    prompt = (f"# Пост\nЗаголовок: {head or data.get('headline', '')}\n"
+              f"Тип: {'новость' if data.get('kind') == 'news' else 'объект'}\n"
+              f"Угол, который увидел редактор: {data.get('angle') or '—'}\n\n"
+              f"# Материал источника (начало)\n{(source_text or '')[:2500]}\n\n"
+              "Найди историю этой вещи. Верни JSON.")
+    tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": max(1, config.WRITER_SEARCHES)}]
+    try:
+        out = await _call(prompt, system=RESEARCH_SYSTEM, model=config.CLAUDE_MODEL, max_tokens=2500, tools=tools)
+    except (NoCredits, ApiDown):
+        raise
+    except Exception as exc:
+        log.warning("Поиск фактов не сработал (%r) — пишу по материалу источника", exc)
+        return {"_failed": True}
+
+    def clean(v):
+        v = str(v or "").strip()
+        return None if v.lower() in ("", "null", "none", "—", "-") else v
+    facts = [f for f in (out.get("facts") or []) if isinstance(f, dict) and clean(f.get("text"))][:10]
+    return {"angle": clean(out.get("angle")), "angle_type": clean(out.get("angle_type")), "facts": facts,
+            "verdict": "strong" if out.get("verdict") == "strong" and facts else "weak"}
 
 
 async def _voice_context() -> str:
@@ -570,35 +666,63 @@ async def _voice_context() -> str:
 
 
 def _post_brief(data: dict) -> str:
-    return (f"Заголовок: {' // '.join(p for p in (data.get('headline_parts') or []) if p) or data.get('headline', '')}\n"
-            f"Фраза мини-поста: {data.get('mini_line') or '—'}\n"
-            f"Рубрика: {data.get('category') or '—'}")
+    out = (f"Заголовок: {' // '.join(p for p in (data.get('headline_parts') or []) if p) or data.get('headline', '')}\n"
+           f"Фраза фото-поста: {data.get('mini_line') or '—'}\n"
+           f"Рубрика: {data.get('category') or '—'}")
+    if data.get("kind") == "news":
+        out += "\nЭто новость" + (f", дата события: {data['news_date']}" if data.get("news_date") else "")
+    if data.get("angle"):
+        out += f"\nУгол ({data.get('angle_type') or 'тип не указан'}): {data['angle']}"
+    return out
 
 
-async def write_body(data: dict, source_text: str, images: list, comment: str = "") -> tuple[str, list[str]]:
-    """Основной текст большого поста. → (текст, штампы, которые не ушли после одной правки)"""
+def _facts_text(found: dict) -> str:
+    if not found or not found.get("facts"):
+        return ""
+    lines = [f"- {f.get('text', '')} ({f.get('url', '')})" for f in found["facts"]]
+    head = f"Угол по итогам поиска ({found.get('angle_type') or '—'}): {found['angle']}\n" if found.get("angle") else ""
+    return "# Найденные факты (проверенные, с источниками)\n" + head + "\n".join(lines) + "\n\n"
+
+
+async def write_body(data: dict, source_text: str, images: list, comment: str = "",
+                     found: dict | None = None) -> tuple[str, list[str], dict]:
+    """Текст поста для канала и продолжение для сайта.
+    → (текст, штампы, которые не ушли после одной правки, {"site_more", "invisible"})"""
     ctx = await _voice_context()
     head = (f"# Пост\n{_post_brief(data)}\n\n# Материал источника\n{(source_text or '')[:5000]}\n\n"
+            + _facts_text(found or {})
             + (ctx + "\n\n" if ctx else ""))
     if comment or data.get("body"):
         head += f"# Текущая версия текста\n{data.get('body') or '—'}\n\n"
     if comment:
         head += f"# Комментарий автора\n{comment}\n\n"
-    head += "Напиши основной текст большого поста. Верни ТОЛЬКО JSON: {\"body\": \"...\"}"
+    head += ("Напиши текст поста для канала и продолжение для сайта. Верни ТОЛЬКО JSON: "
+             '{"body": "...", "site_more": "... или null", "invisible": "что в body нельзя увидеть на фото"}')
     content: list = [{"type": "text", "text": head}]
     for p in images[:3]:
         content.append(_img(p))
-    out = await _call(content, system=WRITER_SYSTEM, model=config.WRITER_MODEL, max_tokens=1500)
+    out = await _call(content, system=WRITER_SYSTEM, model=config.WRITER_MODEL, max_tokens=2500)
     body = str(out.get("body") or "").strip()
-    hits = voice.check(body, await voice.banned())
-    if hits and body:  # одна попытка убрать штампы
+    banned = await voice.banned()
+    hits = voice.check(body, banned, story=True)
+    if hits and body:  # одна попытка убрать штампы и описательность
         fix = await _call(
-            f"# Текст\n{body}\n\nВ тексте есть то, чего в канале быть не должно: {', '.join(hits)}. "
-            "Перепиши без этого, сохрани факты и длину. Верни ТОЛЬКО JSON: {\"body\": \"...\"}",
+            f"# Текст\n{body}\n\n" + _facts_text(found or {})
+            + f"В тексте есть то, чего в канале быть не должно: {', '.join(hits)}. "
+            "Перепиши без этого: вместо описания — история и факты, длину сохрани. "
+            'Верни ТОЛЬКО JSON: {"body": "...", "invisible": "..."}',
             system=WRITER_SYSTEM, model=config.WRITER_MODEL, max_tokens=1500)
         body = str(fix.get("body") or body).strip()
-        hits = voice.check(body, await voice.banned())
-    return body, hits
+        out["invisible"] = fix.get("invisible") or out.get("invisible")
+        hits = voice.check(body, banned, story=True)
+    more = out.get("site_more")
+    more = str(more).strip() if more and str(more).strip().lower() not in ("null", "none", "—") else ""
+    bad_more = voice.check(more, banned, dashes=False) if more else []
+    if bad_more:           # продолжение со штампами на сайт не пускаем — там останется текст из канала
+        log.info("Продолжение для сайта отброшено: %s", ", ".join(bad_more))
+        more = ""
+    inv = str(out.get("invisible") or "").strip()
+    return body, hits, {"site_more": more, "invisible": "" if inv.lower() in ("null", "none", "—") else inv}
 
 
 async def rewrite_mini(data: dict, source_text: str, comment: str, images: list) -> dict:

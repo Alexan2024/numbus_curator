@@ -12,10 +12,26 @@ from app import brand, config, db, formatter
 
 log = logging.getLogger(__name__)
 
-FORMAT_LABEL = {"std": "большой", "mini": "мини", "notes": "#ahmagnotes"}
+# std — пост с текстом (канал, сайт, Instagram); mini — фото-пост, с 6.0 только для Instagram (config.MINI_IG)
+FORMAT_LABEL = ({"std": "канал", "mini": "инста", "notes": "#ahmagnotes"} if config.MINI_IG
+                else {"std": "большой", "mini": "мини", "notes": "#ahmagnotes"})
 _background: set = set()   # фоновые задачи после публикации (сайт) — держим ссылки, чтобы их не собрал сборщик мусора
 _publishing: set = set()   # посты, которые прямо сейчас уходят в канал: второе нажатие кнопки их не повторит
-SHORT = {"std": "бол", "mini": "мини"}
+SHORT = {"std": "канал", "mini": "инста"} if config.MINI_IG else {"std": "бол", "mini": "мини"}
+
+
+def ig_only(post) -> bool:
+    """Фото-пост только для Instagram: в канал и на сайт не идёт."""
+    return config.MINI_IG and bool(post) and post["format"] == "mini"
+
+
+async def ig_ready() -> bool:
+    """Фото-посты могут выходить: Instagram настроен, включён и у бота есть публичный адрес для фото.
+    Со старым поведением (MINI_TO=tg) мини выходит в канал — Instagram не нужен."""
+    if not config.MINI_IG:
+        return True
+    from app import instagram
+    return instagram.configured() and bool(instagram.public_url()) and await instagram.enabled()
 
 
 def cat_label(cat: str | None) -> str:
@@ -116,6 +132,12 @@ def post_link(post) -> str | None:
 
 # ---------- публикация ----------
 
+def curator_explain(exc: Exception) -> str:
+    from app import curator
+    return curator.explain(exc)
+
+
+
 async def publish_post(bot: Bot, pid: int, how: str = "", slot_key: str | None = None) -> bool:
     """Отправляет пост в канал. Большому посту без текста текст дописывается перед выходом;
     если это не удалось, пост выходит мини. slot_key остаётся на посте — расписание помнит, чем слот был занят."""
@@ -136,9 +158,14 @@ async def _publish(bot: Bot, pid: int, how: str, slot_key: str | None) -> bool:
     if post["format"] == "std" and not formatter.has_body(json.loads(post["data"])):
         try:
             post = await pipeline.ensure_text(pid)
-        except Exception:
+        except Exception as exc:
             log.exception("Текст перед публикацией %s", pid)
+            if config.MINI_IG:   # без текста в канал не выходим; пост остаётся одобренным и встанет в следующий слот
+                raise RuntimeError(f"текст поста для канала не написался ({curator_explain(exc)}) — "
+                                   "пост остался одобренным, выйдет в следующем свободном слоте канала") from exc
             post = await pipeline.set_format(pid, "mini", write=False)
+    if ig_only(post):
+        return await _publish_instagram_only(bot, post, how, slot_key)
     plan = photo_plan(post)
     files = [_media(post, i) for i in plan if Path(json.loads(post["images"])[i]).exists() or _fids(post).get(str(i))]
     caption = post["caption"]
@@ -190,6 +217,24 @@ async def _publish(bot: Bot, pid: int, how: str, slot_key: str | None) -> bool:
         await instagram.mirror(bot, pid)
     except Exception:
         log.exception("Instagram: пост %s не встал в очередь", pid)
+    return True
+
+
+async def _publish_instagram_only(bot: Bot, post, how: str, slot_key: str | None) -> bool:
+    """Фото-пост: только Instagram. В канал не идёт (в Telegram — только посты с текстом), на сайт тоже."""
+    from app import instagram, repeats
+    pid = post["id"]
+    if not await ig_ready():
+        raise RuntimeError("Instagram выключен или не настроен, а фото-посты в канал больше не идут — "
+                           "включи Instagram (кнопка «📸 Instagram») или переведи пост в канал «↔️ В канал»")
+    await db.update_post(pid, status="published", decided_at=db.now(), slot_key=slot_key or post["slot_key"],
+                         channel_msg_id=None)
+    log.info("Фото-пост %s → Instagram %s", pid, how)
+    try:
+        await repeats.remember(await db.get_post(pid))
+    except Exception:
+        log.warning("Отпечаток поста %s не записался", pid, exc_info=True)
+    await instagram.mirror(bot, pid)
     return True
 
 

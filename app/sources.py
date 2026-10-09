@@ -33,6 +33,8 @@ FEEDS = {
     "flashbak": "https://flashbak.com/feed/",
     "messynessy": "https://www.messynessychic.com/feed/",
     "socks": "https://socks-studio.com/feed/",
+    # новости (рубрика #ahmagnews: открытия, реставрации, сносы, находки)
+    "artnewspaper": "https://www.theartnewspaper.com/rss.xml",
     # кино
     "cinephilia": "https://cinephiliabeyond.org/feed/",
     # нишевые ленты (остальные нишевые источники читаются через API — app/niche.py)
@@ -47,6 +49,7 @@ HINTS = {
     "ignant": "искусство, фото, дизайн", "aperture": "фотография", "featureshoot": "фотография",
     "flashbak": "архив, старые фото", "messynessy": "архив, истории", "socks": "архив, история архитектуры",
     "cinephilia": "кино", "met": "музейный предмет", "cma": "музейный предмет",
+    "artnewspaper": "новости искусства и архитектуры: находки, реставрации, открытия",
     **niche.HINTS,
 }
 
@@ -122,7 +125,8 @@ async def collect_rss(client: httpx.AsyncClient) -> list[dict]:
                 content = e.get("content") or []
                 body = content[0].get("value", "") if content else e.get("summary", "")
                 items.append({"url": link, "title": e.get("title", ""), "source": name,
-                              "payload": {"content_html": body[:200_000]}})
+                              "payload": {"content_html": body[:200_000],
+                                          "published": e.get("published") or e.get("updated") or ""}})
         return items
 
     groups = await asyncio.gather(*(one(n, u) for n, u in (await all_feeds()).items()))

@@ -204,7 +204,7 @@ async def slot_choices(limit_today_min: int = 3) -> list[dict]:
 
 def slot_label(c: dict, short: bool = False) -> str:
     t = f"{c['dt']:%H:%M}" if c["dt"].date() == _now().date() else f"завтра {c['dt']:%H:%M}"
-    fmt = "мини" if c["fmt"] == "mini" else "большой"
+    fmt = cards.FORMAT_LABEL.get(c["fmt"], c["fmt"])
     if c["post"]:
         return f"⤵ {t} · вместо «{headline(c['post'], 18 if short else 24)}»"
     return f"⚪️ {t} · свободен · {fmt}"
@@ -279,11 +279,15 @@ async def propose(pid: int, key: str | None) -> None:
 
 
 async def build_plan(offset: int) -> tuple[list, int]:
-    """План на день: на каждый свободный слот — пост нужного формата. Большим постам сразу пишется текст.
+    """План на день: на каждый свободный слот — пост нужного формата. Постам для канала сразу пишется текст.
+    Instagram не работает — слоты фото-постов в план не идут: такие посты всё равно не выйдут.
     → (предложенные посты, сколько слотов осталось без поста)"""
     made, missing = [], 0
+    ig = await cards.ig_ready()
     for s in await day_state(offset):
         if s["state"] != "empty" or s["dt"] <= _now() + timedelta(minutes=5):
+            continue
+        if s["fmt"] == "mini" and not ig:
             continue
         post = await pipeline.pick_next(s["fmt"], exclude={p["id"] for p in made}, planned=made,
                                         find_slot=s["fmt"] == "mini" and is_find_key(s["key"]))
@@ -303,7 +307,8 @@ async def build_plan(offset: int) -> tuple[list, int]:
 def plan_summary(made: list, missing: int, day_word: str) -> str:
     mini = sum(1 for p in made if p["format"] == "mini")
     if made:
-        text = f"🗓 План на {day_word}: {len(made)} (мини {mini}, больших {len(made) - mini})"
+        text = (f"🗓 План на {day_word}: {len(made)} ({cards.FORMAT_LABEL['mini']} {mini}, "
+                f"{cards.FORMAT_LABEL['std']} {len(made) - mini})")
     elif missing:
         text = f"🗓 План на {day_word}: постов в запасе не хватило"
     else:
@@ -351,6 +356,8 @@ async def prepare(bot: Bot, h: int, m: int, fmt: str) -> None:
         return
     if md == "semi" and not config.SEMI_FALLBACK:
         return
+    if fmt == "mini" and not await cards.ig_ready():
+        return          # фото-пост без Instagram не выйдет — не тратим на него пост из запаса
     key = key_of((_now() + timedelta(minutes=config.SLOT_LEAD_MIN)).replace(hour=h, minute=m))
     if key in await skipped() or await db.approved_in_slot(key) or await db.announced_posts(key):
         return
@@ -360,9 +367,14 @@ async def prepare(bot: Bot, h: int, m: int, fmt: str) -> None:
         return await _insure(bot, key, h, m, fmt)
     from app import screen
     post = await pipeline.pick_auto(fmt, find_slot=fmt == "mini" and is_find_key(key))
+    if post and fmt == "std":
+        post = await pipeline.ensure_text(post["id"])
+        if json.loads(post["data"]).get("flags"):      # у текста есть замечания — сам не выходит, решает автор
+            await propose(post["id"], key)
+            await screen.notify(bot, f"🤖 К слоту {h:02d}:{m:02d}: у текста есть замечания — пост сам не выйдет, "
+                                     "реши сам.", [("📥 Открыть", f"n:open:{post['id']}")])
+            return screen.refresh_soon(bot)
     if post:
-        if fmt == "std":
-            post = await pipeline.ensure_text(post["id"])
         await propose(post["id"], key)
         await db.update_post(post["id"], status="announced")
         await screen.notify(bot, f"🤖 В {h:02d}:{m:02d} выйдет сам: {headline(post, 80)}",
@@ -405,6 +417,11 @@ async def _insure(bot: Bot, key: str, h: int, m: int, fmt: str) -> None:
             return await screen.notify(bot, f"🛟 К {h:02d}:{m:02d} ничего не одобрено, а текст для замены "
                                             "не написался. Одобри сам — иначе слот пройдёт пустым.",
                                        [("📥 Разобрать", "n:inbox")])
+        if json.loads(post["data"]).get("flags"):     # у текста замечания — сам не выходит
+            await db.update_post(post["id"], status="sent", slot_key=key)
+            return await screen.notify(bot, f"🛟 К {h:02d}:{m:02d} ничего не одобрено, а у текста замены есть "
+                                            "замечания. Одобри сам — иначе слот пройдёт пустым.",
+                                       [("👁 Открыть", f"n:open:{post['id']}")])
     await db.update_post(post["id"], status="announced", slot_key=key)
     await screen.notify(bot, f"🛟 К {h:02d}:{m:02d} ничего не одобрено — выйдет сам: {headline(post, 80)}",
                         [("👁 Открыть", f"n:open:{post['id']}"), ("🚫 Снять", f"n:cancel:{post['id']}")])
@@ -414,6 +431,8 @@ async def _insure(bot: Bot, key: str, h: int, m: int, fmt: str) -> None:
 async def fire(bot: Bot, h: int, m: int, fmt: str) -> None:
     from app import screen
     key = key_of(_now().replace(hour=h, minute=m))
+    if fmt == "mini" and not await cards.ig_ready():
+        return await _ig_down(bot, key)
     if not await paused():
         how = f"по слоту {h:02d}:{m:02d}"
         post = await db.approved_in_slot(key)
@@ -442,6 +461,22 @@ async def fire(bot: Bot, h: int, m: int, fmt: str) -> None:
     screen.refresh_soon(bot)
 
 
+async def _ig_down(bot: Bot, key: str) -> None:
+    """Слот фото-поста, а Instagram не работает: пост не публикуем и не сжигаем. Одобренный ждёт следующего
+    слота (reschedule), предложенные возвращаются в запас без счёта попыток. Сообщение — раз в день."""
+    from app import screen
+    await reschedule()
+    for p in await db.slot_leftovers(key):
+        await db.update_post(p["id"], status="ready", slot_key=None)
+    today = key[:10]
+    if await db.get_setting("ig_down_notice") != today:
+        await db.set_setting("ig_down_notice", today)
+        await screen.notify(bot, f"📸 Instagram не работает — фото-пост {key[-5:]} не вышел. Фото-посты в канал "
+                                 "больше не идут, поэтому одобренные ждут. Проверь «📸 Instagram».",
+                            [("📸 Instagram", "ig:go")])
+    screen.refresh_soon(bot)
+
+
 async def expire_inbox(bot: Bot) -> int:
     """Посты, которые ждут решения дольше INBOX_TTL_HOURS, уходят обратно в запас (или снимаются)."""
     from app import screen
@@ -459,16 +494,19 @@ async def expire_inbox(bot: Bot) -> int:
 
 
 async def deliver_manual(bot: Bot, n: int) -> None:
-    """Ручной режим: несколько постов во входящие, 70% мини и 30% больших, не больше DAILY_MAX в день."""
+    """Ручной режим: несколько постов во входящие в пропорции расписания (фото-посты / посты для канала),
+    не больше DAILY_MAX в день."""
     from app import screen
     if await mode() != "manual" or await paused():
         return
     left = config.DAILY_MAX - len(await db.sent_today())
     added = 0
+    ig = await cards.ig_ready()
+    share = sum(1 for *_, f in config.SLOTS if f == "mini") / max(1, len(config.SLOTS))   # доля фото-постов в расписании
     for _ in range(max(0, min(n, left))):
         today = await db.inbox_posts()
         minis = sum(1 for p in today if p["format"] == "mini")
-        fmt = "mini" if minis < 0.7 * (len(today) + 1) else "std"
+        fmt = "mini" if ig and minis < share * (len(today) + 1) else "std"
         post = await pipeline.pick_next(fmt)
         if not post:
             break

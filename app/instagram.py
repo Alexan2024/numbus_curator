@@ -1,4 +1,5 @@
-"""Instagram: каждый пост, вышедший в канале, уходит в Instagram на английском.
+"""Instagram: каждый пост, вышедший в канале, уходит в Instagram на английском — с короткой подписью (IG_CAPTION).
+Фото-посты (mini) с 6.0 выходят только здесь, в канал не идут (cards._publish_instagram_only).
 Путь: публикация в Telegram → английская подпись (Claude Sonnet, один вызов) → фото приводятся к одной
 пропорции (Instagram обрезает карусель по первому фото) → бот сам раздаёт их по публичному адресу Railway →
 контейнеры Instagram → публикация. Подборки со ссылками на Telegram не уходят.
@@ -295,11 +296,19 @@ async def english_caption(post, tags: dict | None = None) -> str:
     text_ru = re.sub(r"</?[bi]>", "", text_ru).strip()
     parts = formatter.headline_parts(data)
     en = {"headline_parts": parts, "text": ""}
+    if fmt == "mini":
+        task = "This is a photo post: the text is one simple line describing what is in the photos."
+    elif config.IG_CAPTION == "short":
+        # Instagram — про фотографии: из истории канала остаётся главное, подпись короткая
+        task = ("Instagram is about the photos, so the caption is short. Do not translate the whole text: "
+                "condense it into 1–3 short sentences, at most 300 characters, keeping the single most interesting "
+                "fact or story (not a description of what is visible in the photos). One paragraph. "
+                "Every fact must come from the text; add nothing.")
+    else:
+        task = "This is a full post: one or more paragraphs."
     if parts or text_ru:
         en = await curator._call(
-            f"# Headline parts\n{json.dumps(parts, ensure_ascii=False)}\n\n# Text\n{text_ru or '(none)'}\n\n"
-            + ("This is a short post: the text is one simple line describing what is in the photos."
-               if fmt == "mini" else "This is a full post: one or more paragraphs."),
+            f"# Headline parts\n{json.dumps(parts, ensure_ascii=False)}\n\n# Text\n{text_ru or '(none)'}\n\n" + task,
             system=EN_SYSTEM, model=config.CLAUDE_MODEL, max_tokens=2500)
     head = " // ".join(str(p).strip() for p in (en.get("headline_parts") or parts) if str(p).strip())
     body = str(en.get("text") or "").strip()
@@ -567,7 +576,8 @@ async def _v_ig(arg: dict):
     lines = ["<b>📸 Instagram</b>" + (f" · @{html.escape(h['username'])}" if h.get("username") else ""),
              f"Статус: {icon} {word}"]
     if on and configured():
-        lines.append("Каждый пост из канала уходит сюда на английском.")
+        lines.append("Каждый пост из канала уходит сюда на английском с короткой подписью; фото-посты (инста) "
+                     "выходят только здесь." if config.MINI_IG else "Каждый пост из канала уходит сюда на английском.")
     for p in h.get("problems") or []:
         lines.append(f"• {html.escape(p)}")
     if h.get("quota") is not None:

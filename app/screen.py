@@ -110,7 +110,7 @@ async def _home(arg: dict):
     lines += [("Завтра: " if day == 0 else "Сегодня: ") + "".join(slots.ICON[x["state"]] for x in other), ""]
     lines.append(f"📥 Ждут решения: <b>{len(inbox)}</b>")
     lines.append(f"🗓 Стоят в слотах: {len(sched)}")
-    lines.append(f"📦 В запасе: {total} · мини {mini} · больших {std}")
+    lines.append(f"📦 В запасе: {total} · {cards.FORMAT_LABEL['mini']} {mini} · {cards.FORMAT_LABEL['std']} {std}")
     if total:
         lines.append("      " + " · ".join(f"{cards.cat_label(c)} {sum(stock[c].values())}"
                                            for c in config.CATEGORIES if c in stock))
@@ -222,8 +222,8 @@ async def _next(arg: dict):
     total = sum(v.get(fmt, 0) for v in stock.values())
     text = ("<b>▶️ Какой пост показать?</b>\nПоложу его во входящие. Цифры — сколько в запасе этого формата."
             + ("\n\nНужного формата нет — возьму другой и переделаю." if not total else ""))
-    rows = [[btn(("● " if fmt == "mini" else "") + "▫️ Мини", "h:next:mini"),
-             btn(("● " if fmt == "std" else "") + "◻️ Большой", "h:next:std")],
+    rows = [[btn(("● " if fmt == "mini" else "") + ("📸 Инста" if config.MINI_IG else "▫️ Мини"), "h:next:mini"),
+             btn(("● " if fmt == "std" else "") + ("◻️ Канал" if config.MINI_IG else "◻️ Большой"), "h:next:std")],
             [btn(f"Любая рубрика · {total}", f"h:nx:{fmt}:any")]]
     cats = [btn(f"{config.CATEGORIES[c]} · {stock.get(c, {}).get(fmt, 0)}", f"h:nx:{fmt}:{c}")
             for c in config.CATEGORIES]
@@ -240,11 +240,13 @@ async def _stockmenu(arg: dict):
     for c, label in config.CATEGORIES.items():
         v = stock.get(c, {})
         n = sum(v.values())
-        parts = ([f"мини {v['mini']}"] if v.get("mini") else []) + ([f"больших {v['std']}"] if v.get("std") else [])
+        parts = (([f"{cards.FORMAT_LABEL['mini']} {v['mini']}"] if v.get("mini") else [])
+                 + ([f"{cards.FORMAT_LABEL['std']} {v['std']}"] if v.get("std") else []))
         lines.append(f"{label}: {n}" + (f" ({' · '.join(parts)})" if parts else ""))
         if n:
             cats.append(btn(f"{label} · {n}", f"h:stk:{c}"))
-    lines += ["", f"Всего {total}: мини {mini} · больших {std}. Цель — запас на {config.STOCK_DAYS:g} дня слотов."]
+    lines += ["", f"Всего {total}: {cards.FORMAT_LABEL['mini']} {mini} · {cards.FORMAT_LABEL['std']} {std}. "
+                  f"Цель — запас на {config.STOCK_DAYS:g} дня слотов."]
     if not total:
         lines.append("Запас пуст — нажми «🔎 Собрать сейчас» на пульте.")
     rows += [cats[i:i + 2] for i in range(0, len(cats), 2)]
@@ -332,7 +334,7 @@ def _status_line(post) -> str:
     if st == "ready":
         return "в запасе" + (f", предлагался {post['offers']} раз" if post["offers"] else ", ещё не показывался")
     if st == "published":
-        return "✅ вышел в канале"
+        return "✅ вышел в Instagram" if cards.ig_only(post) and not post["channel_msg_id"] else "✅ вышел в канале"
     return f"❌ снят: {post['reject_reason'] or ''}"
 
 
@@ -343,6 +345,8 @@ def _post_caption(post, mode: str, idx: int, n: int, note: str | None) -> tuple[
     pos = f" {idx + 1}/{n}" if n > 1 else ""
     first = (f"<b>{head}{pos}</b> · " if head else "") + _status_line(post)
     info = f"{cards.FORMAT_LABEL.get(fmt, fmt)} · {cards.cat_label(post['category'])}"
+    if config.NEWS and data.get("kind") == "news":
+        info = "📰 новость · " + info
     if fmt != "notes":
         info += f" · {post['score']}/10"
     info += f" · {html.escape(post['source'] or '')}"
@@ -359,6 +363,11 @@ def _post_caption(post, mode: str, idx: int, n: int, note: str | None) -> tuple[
     flags = [str(f) for f in (data.get("flags") or [])]
     if flags:
         optional.append("⚠️ " + html.escape("; ".join(flags))[:250])
+    if data.get("angle") and fmt == "std":
+        optional.append(f"🧭 <i>{html.escape(str(data['angle'])[:200])}</i>")
+    info = [str(f) for f in (data.get("_info") or [])]
+    if info:
+        optional.append("ℹ️ " + html.escape("; ".join(info))[:200])
     sep = "\n┈┈┈┈┈┈┈┈\n"
     body = post["caption"]
     for k in range(len(optional), -1, -1):
@@ -435,7 +444,10 @@ async def _post_kb(post, mode: str, idx: int, n: int, clipped: bool, sub: str | 
         if len(images) > 1:
             extra.append(btn(f"🖼 Фото · {len(images)}", f"v:ph:{pid}"))
         if fmt != "notes":
-            extra.append(btn("↔️ В большой" if fmt == "mini" else "↔️ В мини", f"v:fm:{pid}"))
+            if config.MINI_IG:
+                extra.append(btn("↔️ В канал" if fmt == "mini" else "↔️ В инсту", f"v:fm:{pid}"))
+            else:
+                extra.append(btn("↔️ В большой" if fmt == "mini" else "↔️ В мини", f"v:fm:{pid}"))
         if clipped:
             extra.append(btn("📄 Весь текст", f"v:txt:{pid}"))
         rows.append(extra)

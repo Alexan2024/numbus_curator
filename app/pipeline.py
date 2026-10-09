@@ -1,6 +1,7 @@
 """Путь материала: источник → отсев по заголовку и дублям → первичный фильтр (Haiku) →
 фото и текст → оценка (Sonnet, пакетом) → пост в запасе. Текст большого поста пишется
 только когда пост выбран (Opus). Плюс: пост по ссылке, заметка, выбор следующего поста."""
+import asyncio
 import json
 import logging
 import math
@@ -164,7 +165,7 @@ async def _prepare(client: httpx.AsyncClient, cand, force: bool = False) -> dict
                 return "мало текста"
         if source in niche.CINEMA_SOURCES:     # кадры из фильмов: широкие и невысокие — это нормально
             images = await media.download_images(client, urls, folder, max_ratio=niche.CINEMA_MAX_RATIO,
-                                                 min_short=niche.CINEMA_MIN_SHORT)
+                                                 min_short=niche.CINEMA_MIN_SHORT, min_long=config.CINEMA_MIN_LONG)
         else:
             images = await media.download_images(client, urls, folder)
     except Exception as exc:
@@ -180,12 +181,25 @@ async def _prepare(client: httpx.AsyncClient, cand, force: bool = False) -> dict
     if not force and (source in niche.MINI_ONLY or (source == "arena" and "meta" in payload)):
         allow_std = False       # кадры из фильма или блок Are.na без источника: фактов мало — только мини
     return {"title": title or "", "text": (text or "")[:6000], "images": [str(p) for p in images],
-            "allow_std": allow_std}
+            "allow_std": allow_std, "published": str(payload.get("published") or "")[:40],
+            "sheet": await make_sheet(images, folder)}
+
+
+async def make_sheet(images: list, folder: Path) -> str | None:
+    """Лист фрагментов в 100% для проверки резкости при оценке — в отдельном потоке, рядом с фото."""
+    if not config.PHOTO_CHECK or not images:
+        return None
+    try:
+        return await asyncio.to_thread(media.save_detail_sheet, [str(p) for p in images], folder / "sheet.jpg")
+    except Exception:
+        log.warning("Лист фрагментов не собрался (%s)", folder.name, exc_info=True)
+        return None
 
 
 def _params(context: str, cand, prep: dict, forced: bool = False) -> dict:
     return curator.eval_params(context, cand["source"], cand["url"], prep["title"], prep["text"],
-                               prep["images"], allow_std=prep["allow_std"], forced=forced)
+                               prep["images"], allow_std=prep["allow_std"], forced=forced,
+                               published=prep.get("published") or "", sheet=prep.get("sheet"))
 
 
 # ---------- результат оценки → пост в запасе ----------
@@ -203,7 +217,8 @@ async def finish(cid: int, data: dict, forced: bool = False) -> int | None:
     folder = config.IMG_DIR / f"c{cid}"
     data["flags"] = [str(f) for f in (data.get("flags") or [])]
     score = int(data.get("score") or 0)
-    passed = score >= config.SCORE_THRESHOLD and not data.get("stoplist") and not data.get("already_posted")
+    passed = (score >= config.SCORE_THRESHOLD and not data.get("stoplist")
+              and (not data.get("already_posted") or is_news(data)))
     if not passed and not forced:
         await db.mark_candidate(cid, "processed", f"авто-отказ {score}: {data.get('score_reason', '')}")
         shutil.rmtree(folder, ignore_errors=True)
@@ -217,15 +232,45 @@ async def finish(cid: int, data: dict, forced: bool = False) -> int | None:
         if data.get("already_posted"):
             data["flags"].append("похоже, уже было в канале")
 
+    news = is_news(data)
     dup = await repeats.find(data, images)
-    if dup and not forced:
+    if dup and not forced and not news:
         await db.mark_candidate(cid, "processed", f"повтор — {dup}"[:300])
         shutil.rmtree(folder, ignore_errors=True)
         return None
     if dup:
-        data["flags"].append(f"похоже, уже было — {dup}")
+        data["flags"].append(f"о нём уже был пост — {dup}" if news else f"похоже, уже было — {dup}")
+
+    # Плохие фото по фрагментам в 100% (мыло, апскейл, сжатие) — в пост не идут. Свои фото автора не трогаем.
+    soft = sorted({i for i in (data.get("soft_photos") or []) if isinstance(i, int) and 0 <= i < len(images)})
+    own = all(Path(p).name.startswith("own") for p in images)
+    good = [i for i in _order(data, len(images)) if i not in soft] if soft and not own else _order(data, len(images))
+    if not good:
+        if not forced:
+            await db.mark_candidate(cid, "processed", "все фото мыльные или пережатые")
+            shutil.rmtree(folder, ignore_errors=True)
+            return None
+        good = _order(data, len(images))
+        data["flags"].append("все фото на 100% слабые — проверь")
+    elif soft and not own:       # для сведения, не замечание: автопост такой пост не блокирует
+        data["_info"] = list(data.get("_info") or []) + [f"слабых фото убрано: {len(soft)}"]
+    data["photo_order"] = good
 
     fmt = "mini" if (data.get("format") == "mini" or not prep.get("allow_std")) else "std"
+    if news:
+        fmt = "std"                         # новость — всегда текст в канал
+        data["kind"] = "news"
+        data["angle_type"] = data.get("angle_type") or "новость"
+        data["tags"] = ["ahmagnews"] + [t for t in (data.get("tags") or []) if "news" not in str(t)]
+    else:
+        data["kind"] = "object"
+        if "angle" in data:
+            data["angle"] = clean(data["angle"])
+        # правило угла: нет истории — в канал не идёт (оценки по старому промпту, без поля angle, не трогаем)
+        if fmt == "std" and "angle" in data and not data["angle"] and not forced:
+            fmt = "mini"
+        if fmt == "std" and soft and len(good) < config.MIN_PHOTOS_ARTICLE and not forced:
+            fmt = "mini"                    # после отсева слабых фото на пост для канала не хватает
     data.pop("body", None)  # основной текст пишется позже, когда пост выберут
     line = str(data.get("mini_line") or "").strip()
     if line and line.lower() != "null":
@@ -244,23 +289,84 @@ async def finish(cid: int, data: dict, forced: bool = False) -> int | None:
     rest = [i for i in range(len(images)) if i not in order]
     ordered = [images[i] for i in order + rest]
     data["_excluded"] = list(range(len(order), len(ordered)))  # не выбранные Claude — выключены, но их можно вернуть
+    if soft and not own:          # слабые на 100% — выключены насовсем: смена формата их не вернёт
+        pos = order + rest
+        data["_bad"] = sorted(pos.index(i) for i in soft if i in pos)
     data["_source_text"] = prep.get("text", "")[:6000]
     data["_title"] = prep.get("title") or cand["title"] or ""
     category = norm_cat(data.get("category"))
     data["category"] = category
     caption = formatter.build_caption(data, fmt)
 
+    if news:
+        data["_news_at"] = db.now()
     pid = await db.add_post(
         candidate_id=cid, source=cand["source"], url=cand["url"], category=category,
         data=data, caption=caption, score=score, format=fmt,
         reason=data.get("score_reason", ""), images=ordered, status="ready",
     )
-    await db.update_candidate(cid, status="processed", note=f"в запасе {score} ({fmt})", prep=None)
+    await db.update_candidate(cid, status="processed", note=f"в запасе {score} ({fmt}{', новость' if news else ''})",
+                              prep=None)
     try:
         await repeats.remember(await db.get_post(pid))
     except Exception:
         log.warning("Отпечаток поста %s не записался", pid, exc_info=True)
+    if news and not forced:
+        await _offer_news(pid)
     return pid
+
+
+# ---------- мелочи ----------
+
+def clean(v) -> str | None:
+    """Строка от Claude без «null», «none» и прочерков."""
+    v = str(v or "").strip()
+    return None if v.lower() in ("", "null", "none", "—", "-") else v
+
+
+def usable_photos(post) -> int:
+    """Сколько фото поста можно поставить в пост для канала: без слабых и мелких (_bad)."""
+    data = json.loads(post["data"])
+    return len(json.loads(post["images"] or "[]")) - len(set(data.get("_bad") or []))
+
+
+# ---------- новости ----------
+
+def is_news(data: dict) -> bool:
+    return config.NEWS and str(data.get("kind") or "").lower() == "news"
+
+
+async def _offer_news(pid: int) -> None:
+    """Новость не ждёт плана: сразу во входящие и уведомление со звуком."""
+    from app import screen, ui
+    post = await db.get_post(pid)
+    await db.update_post(pid, status="sent", sent_at=db.now(), offers=(post["offers"] or 0) + 1)
+    if ui.BOT:
+        data = json.loads(post["data"])
+        head = " // ".join(formatter.headline_parts(data))[:120] or "без заголовка"
+        try:
+            await screen.notify(ui.BOT, f"📰 Новость: {head}\n{(data.get('angle') or '')[:200]}\n"
+                                        f"Ждёт решения во входящих {config.NEWS_TTL_DAYS} дн.",
+                                [("👁 Открыть", f"n:open:{pid}")])
+            screen.refresh_soon(ui.BOT)
+        except Exception:
+            log.warning("Уведомление о новости %s не ушло", pid, exc_info=True)
+
+
+async def expire_news() -> int:
+    """Новости старше NEWS_TTL_DAYS в запасе и во входящих снимаются: старая новость уже не новость."""
+    n = 0
+    edge = db.days_ago(config.NEWS_TTL_DAYS)
+    for p in list(await db.ready_posts()) + list(await db.inbox_posts()):
+        data = json.loads(p["data"])
+        if is_news(data) and (data.get("_news_at") or p["created_at"]) < edge:
+            await db.update_post(p["id"], status="auto_rejected", slot_key=None, reject_reason="новость устарела")
+            n += 1
+    if n:
+        from app import screen, ui
+        if ui.BOT:
+            screen.refresh_soon(ui.BOT)
+    return n
 
 
 # ---------- сбор целиком ----------
@@ -390,14 +496,28 @@ async def ensure_text(pid: int, comment: str = "") -> object:
     data = json.loads(post["data"])
     if post["format"] != "std" or (formatter.has_body(data) and not comment):
         return post
-    body, hits = await curator.write_body(data, data.get("_source_text", ""), post_images(post), comment)
+    found = data.get("_research")
+    if found is None:            # ищем один раз: переписывание по комментарию пользуется тем же
+        # пост по запросу уже собран веб-поиском — его материал и есть найденные факты
+        found = {} if post["source"] == "request" else await curator.research(data, data.get("_source_text", ""))
+        if not found.get("_failed"):          # сбой поиска не запоминаем: «🔁 Переписать» попробует снова
+            data["_research"] = found
+    if found.get("angle") and (not data.get("angle") or found.get("verdict") == "strong"):
+        data["angle"], data["angle_type"] = found["angle"], found.get("angle_type") or data.get("angle_type")
+    body, hits, extra = await curator.write_body(data, data.get("_source_text", ""), post_images(post), comment, found)
     if not body:
         raise RuntimeError("Claude вернул пустой текст")
     data["body"] = body
+    data["site_more"] = extra.get("site_more") or ""
     data.pop("_manual", None)
-    data["flags"] = [f for f in (data.get("flags") or []) if not str(f).startswith(("штамп", "длинная подпись"))]
+    data["flags"] = [f for f in (data.get("flags") or [])
+                     if not str(f).startswith(("штамп", "длинная подпись", "текст описывает", "истории не нашлось"))]
     if hits:
         data["flags"].append("штамп в тексте: " + ", ".join(hits))
+    if not extra.get("invisible"):
+        data["flags"].append("текст описывает фото — истории нет")
+    elif config.WRITER_RESEARCH and found.get("verdict") != "strong" and not data.get("angle"):
+        data["flags"].append("истории не нашлось — может, лучше в Instagram")
     caption = formatter.build_caption(data, "std")
     if formatter.visible_len(caption) > config.CAPTION_LIMIT:
         data["flags"].append("длинная подпись — уйдёт отдельным сообщением")
@@ -441,7 +561,7 @@ async def set_format(pid: int, fmt: str, write: bool = True) -> object:
     data.pop("_manual", None)
     n = len(json.loads(post["images"]))
     if fmt == "std" and n - len(data.get("_excluded") or []) < config.MIN_PHOTOS_ARTICLE:
-        data["_excluded"] = []   # мини жил на 1–4 фото, большому нужны все
+        data["_excluded"] = sorted(set(data.get("_bad") or []))   # нужны все фото, кроме слабых и мелких
     await db.update_post(pid, format=fmt, data=data, caption=formatter.build_caption(data, fmt))
     if fmt == "std" and write and not formatter.has_body(data):
         return await ensure_text(pid)
@@ -572,6 +692,8 @@ async def _pick(fmt: str | None = None, category: str | None = None, exclude: se
         + sum(1 for p in planned if p["source"] in db.MUSEUMS)
     if museums_today >= config.MUSEUM_DAILY_MAX:
         ready = [p for p in ready if p["source"] not in db.MUSEUMS]
+    if fmt == "mini":            # новость в фото-пост не превращаем: ей нужен текст в канале
+        ready = [p for p in ready if not is_news(json.loads(p["data"]))]
     if fmt:
         exact = [p for p in ready if p["format"] == fmt]
         if exact:
@@ -579,7 +701,8 @@ async def _pick(fmt: str | None = None, category: str | None = None, exclude: se
         elif fmt == "mini":
             ready = [p for p in ready if p["format"] == "std"]
         else:
-            ready = [p for p in ready if len(json.loads(p["images"])) >= config.MIN_PHOTOS_ARTICLE]
+            ready = [p for p in ready if usable_photos(p) >= config.MIN_PHOTOS_ARTICLE
+                     and (not config.MINI_IG or clean(json.loads(p["data"]).get("angle")))]
     ready = [p for p in ready if await files_ok(p)]
     if not ready:
         return None
@@ -588,7 +711,8 @@ async def _pick(fmt: str | None = None, category: str | None = None, exclude: se
 
     def weight(p):
         cat = norm_cat(p["category"])
-        return (p["score"] or 0) + 4 * (config.TARGET_MIX.get(cat, 0.05) - mix.count(cat) / total)
+        fresh = 3 if is_news(json.loads(p["data"])) else 0      # свежая новость — первой в слот канала
+        return (p["score"] or 0) + fresh + 4 * (config.TARGET_MIX.get(cat, 0.05) - mix.count(cat) / total)
 
     best = max(ready, key=weight)
     if fmt and best["format"] != fmt:
@@ -619,3 +743,64 @@ async def pick_auto(fmt: str, find_slot: bool = False):
     """Для автомата и страховки: только высокая оценка, без флагов, из источников, которым автор доверяет."""
     return await pick_next(fmt, min_score=config.AUTO_MIN_SCORE, clean_only=True,
                            skip_sources=await untrusted_sources(), find_slot=find_slot)
+
+
+# ---------- разовая проверка запаса по новым правилам фото (6.0) ----------
+
+async def quality_audit() -> dict:
+    """Посты в запасе, во входящих и в автоанонсах, собранные по старым правилам (фото от 1200 px),
+    сверяются с новыми: мелкие фото выключаются (их можно вернуть в «🖼 Фото»), пост без фото снимается,
+    пост для канала с фото меньше нормы становится фото-постом. Одобренные автором посты не трогаем.
+    Делается один раз на версию."""
+    from PIL import Image
+    done = await db.get_setting("quality_audit")
+    if done == config.VERSION:
+        return {}
+    out = {"photos": 0, "removed": 0, "to_mini": 0}
+    rows = {p["id"]: p for p in list(await db.ready_posts()) + list(await db.inbox_posts())
+            if p["format"] != "notes"}          # во входящих — и предложенные, и автоанонсы
+    for p in rows.values():
+        images = json.loads(p["images"] or "[]")
+        if not images or (p["source"] or "") in ("request", "link"):
+            continue
+        cinema = p["source"] in niche.CINEMA_SOURCES
+        min_long = config.CINEMA_MIN_LONG if cinema else config.MIN_LONG_SIDE
+        min_short = niche.CINEMA_MIN_SHORT if cinema else config.MIN_SHORT_SIDE
+        data = json.loads(p["data"])
+        excluded = set(data.get("_excluded") or [])
+        small = set()
+        for i, path in enumerate(images):
+            try:
+                with Image.open(path) as im:
+                    w, h = im.size
+            except Exception:
+                continue
+            if max(w, h) < min_long or min(w, h) < min_short:
+                small.add(i)
+        new_small = small - excluded
+        if not new_small:
+            continue
+        keep = [i for i in range(len(images)) if i not in excluded | small]
+        if not keep:             # всё включённое мелкое — включаем выключенные, но крупные
+            keep = [i for i in range(len(images)) if i not in small]
+            excluded = set(range(len(images))) - set(keep)
+        if not keep:
+            await db.update_post(p["id"], status="auto_rejected", slot_key=None,
+                                 reject_reason="фото меньше новой нормы качества")
+            out["removed"] += 1
+            continue
+        data["_excluded"] = sorted(excluded | small)
+        data["_bad"] = sorted(set(data.get("_bad") or []) | small)
+        if data.get("_cover") in small:
+            data.pop("_cover", None)
+        data["_info"] = list(data.get("_info") or []) + [f"мелких фото выключено: {len(new_small)}"]
+        fmt, fields = p["format"], {}
+        if fmt == "std" and len(keep) < config.MIN_PHOTOS_ARTICLE and not is_news(data) and not data.get("_manual"):
+            fmt = "mini"         # подпись пересобирается только при смене формата; свой текст автора не трогаем
+            fields = {"format": fmt, "caption": formatter.build_caption(data, fmt)}
+            out["to_mini"] += 1
+        await db.update_post(p["id"], data=data, **fields)
+        out["photos"] += len(new_small)
+    await db.set_setting("quality_audit", config.VERSION)
+    log.info("Проверка запаса по новым правилам фото: %s", out)
+    return out

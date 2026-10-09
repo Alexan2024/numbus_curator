@@ -37,7 +37,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardMarkup, InputMediaPhoto, Message
 from PIL import Image
 
-from app import commons, config, curator, db, media, pipeline, screen, slots, tmdb, ui
+from app import commons, config, curator, db, media, niche, pipeline, screen, slots, tmdb, ui
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -50,7 +50,8 @@ PHOTO_WAIT = 1.5           # секунд ждём остальные фото �
 PENDING_TTL = 50           # сколько последних запросов помнить
 MORE_MAX = 9               # сколько новых кадров показывать за раз
 
-FORMATS = {"std": "большой", "mini": "мини", "notes": "#ahmagnotes"}
+FORMATS = ({"std": "канал", "mini": "инста", "notes": "#ahmagnotes"} if config.MINI_IG
+           else {"std": "большой", "mini": "мини", "notes": "#ahmagnotes"})
 NEXT_FMT = {"std": "mini", "mini": "notes", "notes": "std"}
 LATER_RE = re.compile(r"^\s*(?:/later|/потом|потом)\s*[:\-—]?\s+(.+)$", re.I | re.S)
 
@@ -214,7 +215,7 @@ async def assemble(bot: Bot | None, query: str, brief: dict, photo_ids: list[str
         else:
             tried = (await _gather_urls(client, brief, film))[:40]
             if tried:
-                images = await media.download_images(client, tried, folder)
+                images = await media.download_images(client, tried, folder, **_photo_rules(brief.get("kind")))
         for extra in images[config.EVAL_PHOTOS:]:
             Path(extra).unlink(missing_ok=True)
         images = images[:config.EVAL_PHOTOS]
@@ -225,7 +226,8 @@ async def assemble(bot: Bot | None, query: str, brief: dict, photo_ids: list[str
         tip = "Кадров не нашлось" if brief.get("kind") in ("film", "tv") else "Качественных фото не нашлось"
         return None, f"{tip}. Пришли свои фото с подписью «{query}» — соберу пост на них"
 
-    prep = {"title": title, "text": _brief_text(brief)[:6000], "images": [str(p) for p in images], "allow_std": True}
+    prep = {"title": title, "text": _brief_text(brief)[:6000], "images": [str(p) for p in images], "allow_std": True,
+            "sheet": await pipeline.make_sheet(images, folder)}
     await db.update_candidate(cid, prep=prep)
     cand = await db.get_candidate(cid)
     await status_cb(f"✍️ Пишу пост: <b>{html.escape(title)}</b>")
@@ -510,6 +512,14 @@ async def wishlist_tick() -> None:
 
 # ======================= ещё кадры =======================
 
+def _photo_rules(kind: str | None) -> dict:
+    """Кадры из фильмов и сериалов (TMDB, 1280×720) — по мягкой норме для кино, остальное — по обычной."""
+    if kind in ("film", "tv"):
+        return {"max_ratio": niche.CINEMA_MAX_RATIO, "min_short": niche.CINEMA_MIN_SHORT,
+                "min_long": config.CINEMA_MIN_LONG}
+    return {}
+
+
 def _hash(path) -> int | None:
     try:
         with Image.open(path) as im:
@@ -544,7 +554,7 @@ async def more_photos(pid: int) -> list[Path]:
         if not fresh:
             return []
         tmp = folder / f"more_{int(time.time())}"
-        got = await media.download_images(client, fresh, tmp)
+        got = await media.download_images(client, fresh, tmp, **_photo_rules(req.get("kind")))
     have = [h for h in (await asyncio.to_thread(lambda: [_hash(p) for p in images])) if h is not None]
     out = []
     for p in got:

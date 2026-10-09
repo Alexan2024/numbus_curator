@@ -14,7 +14,7 @@ def _hm(raw: str) -> tuple[int, int]:
     return int(h), int(m or 0)
 
 
-VERSION = "5.8"
+VERSION = "6.0"
 
 BOT_TOKEN = _req("BOT_TOKEN")
 ADMIN_ID = int(_req("ADMIN_ID"))
@@ -48,9 +48,16 @@ def _parse_slots(raw: str) -> list[tuple[int, int, str]]:
     return sorted(out)
 
 
-# 5 мини + 2 больших: большие утром и вечером, мини между ними
-SLOTS = _parse_slots(os.getenv(
-    "SLOTS", "10:00=std,12:00=mini,13:30=mini,15:00=mini,16:30=mini,18:00=mini,20:00=std"))
+# std — пост с текстом: канал, сайт и Instagram; mini — фото-пост только в Instagram (см. MINI_IG).
+# По умолчанию: два текстовых поста в канале утром и вечером, два фото-поста в Instagram днём.
+SLOTS = _parse_slots(os.getenv("SLOTS", "10:00=std,13:00=mini,17:00=mini,20:00=std"))
+
+# ---------- площадки (редакционная политика 6.0) ----------
+# Telegram — только посты с текстом. Мини-слот — фото-пост только для Instagram: в канал и на сайт он не идёт.
+# MINI_TO=tg — вернуть старое поведение (мини выходит и в канале).
+MINI_IG = os.getenv("MINI_TO", "ig").strip().lower() not in ("tg", "telegram", "channel", "канал")
+# Подпись в Instagram к посту из канала: short — 1–3 фразы с главным из истории, full — перевод целиком
+IG_CAPTION = "full" if os.getenv("IG_CAPTION", "short").strip().lower() == "full" else "short"
 SLOT_LEAD_MIN = int(os.getenv("SLOT_LEAD_MIN", "30"))     # автомат: за сколько минут до слота анонс
 PLAN_TIME = _hm(os.getenv("PLAN_TIME", "21:00"))          # план на завтра и вечернее напоминание
 AUTO_MIN_SCORE = int(os.getenv("AUTO_MIN_SCORE", "8"))    # автомат публикует сам только от этой оценки
@@ -74,6 +81,15 @@ EVAL_PHOTOS = int(os.getenv("EVAL_PHOTOS", "8"))            # сколько ф�
 THUMB_SIZE = int(os.getenv("THUMB_SIZE", "480"))            # размер превью для Claude, px
 EVAL_TEXT_CHARS = int(os.getenv("EVAL_TEXT_CHARS", "3500")) # сколько текста статьи уходит на оценку
 
+# ---------- тексты: угол и поиск фактов ----------
+# Перед текстом поста для канала Claude ищет в сети историю объекта (WRITER_SEARCHES запросов, ~$0.05 на пост)
+WRITER_RESEARCH = os.getenv("WRITER_RESEARCH", "1").strip().lower() not in ("0", "off", "false", "no")
+WRITER_SEARCHES = int(os.getenv("WRITER_SEARCHES", "3"))
+
+# ---------- новости (#ahmagnews) ----------
+NEWS = os.getenv("NEWS", "1").strip().lower() not in ("0", "off", "false", "no")
+NEWS_TTL_DAYS = int(os.getenv("NEWS_TTL_DAYS", "5"))      # новость старше — снимается из запаса и входящих
+
 # ---------- расход ----------
 DAILY_BUDGET_USD = float(os.getenv("DAILY_BUDGET_USD", "1.0"))  # потолок фоновых трат в сутки, $
 DAILY_API_CALLS_MAX = int(os.getenv("DAILY_API_CALLS_MAX", "150"))
@@ -84,8 +100,13 @@ MUSEUM_PER_RUN = int(os.getenv("MUSEUM_PER_RUN", os.getenv("MET_PER_RUN", "2")))
 MUSEUM_DAILY_MAX = int(os.getenv("MUSEUM_DAILY_MAX", "3"))                        # музейных постов в день
 
 # ---------- фото ----------
-MIN_LONG_SIDE = int(os.getenv("MIN_LONG_SIDE", "1200"))
-MIN_SHORT_SIDE = int(os.getenv("MIN_SHORT_SIDE", "700"))
+# Меньше этого по длинной / короткой стороне — фото не берётся (раньше 1200 / 700)
+MIN_LONG_SIDE = int(os.getenv("MIN_LONG_SIDE", "1600"))
+MIN_SHORT_SIDE = int(os.getenv("MIN_SHORT_SIDE", "900"))
+CINEMA_MIN_LONG = int(os.getenv("CINEMA_MIN_LONG", "1280"))      # кадры из фильмов: 1280 — нормальный кадр
+JPEG_MIN_QUALITY = int(os.getenv("JPEG_MIN_QUALITY", "55"))      # JPEG, сжатый сильнее, — с артефактами
+# Проверка резкости: Claude при оценке смотрит фрагменты каждого фото в 100% (мыло, апскейл, артефакты)
+PHOTO_CHECK = os.getenv("PHOTO_CHECK", "1").strip().lower() not in ("0", "off", "false", "no")
 MIN_PHOTOS_ARTICLE = int(os.getenv("MIN_PHOTOS_ARTICLE", "3"))   # для большого поста
 MIN_PHOTOS_MINI = int(os.getenv("MIN_PHOTOS_MINI", "1"))         # для мини-поста
 MAX_PHOTOS = 10
