@@ -1,17 +1,20 @@
 """Фото поста, публикация в канал, альбом для просмотра и пакет для Instagram."""
+import asyncio
 import html
 import json
 import logging
 from pathlib import Path
 
 from aiogram import Bot
-from aiogram.types import FSInputFile, InputMediaDocument, InputMediaPhoto
+from aiogram.types import FSInputFile, InputMediaDocument, InputMediaPhoto, LinkPreviewOptions
 
 from app import brand, config, db, formatter
 
 log = logging.getLogger(__name__)
 
 FORMAT_LABEL = {"std": "большой", "mini": "мини", "notes": "#ahmagnotes"}
+_background: set = set()   # фоновые задачи после публикации (сайт) — держим ссылки, чтобы их не собрал сборщик мусора
+_publishing: set = set()   # посты, которые прямо сейчас уходят в канал: второе нажатие кнопки их не повторит
 SHORT = {"std": "бол", "mini": "мини"}
 
 
@@ -116,6 +119,16 @@ def post_link(post) -> str | None:
 async def publish_post(bot: Bot, pid: int, how: str = "", slot_key: str | None = None) -> bool:
     """Отправляет пост в канал. Большому посту без текста текст дописывается перед выходом;
     если это не удалось, пост выходит мини. slot_key остаётся на посте — расписание помнит, чем слот был занят."""
+    if pid in _publishing:
+        return False
+    _publishing.add(pid)
+    try:
+        return await _publish(bot, pid, how, slot_key)
+    finally:
+        _publishing.discard(pid)
+
+
+async def _publish(bot: Bot, pid: int, how: str, slot_key: str | None) -> bool:
     from app import pipeline  # здесь, чтобы не было кругового импорта
     post = await db.get_post(pid)
     if not post or post["status"] == "published":
@@ -129,14 +142,35 @@ async def publish_post(bot: Bot, pid: int, how: str = "", slot_key: str | None =
     plan = photo_plan(post)
     files = [_media(post, i) for i in plan if Path(json.loads(post["images"])[i]).exists() or _fids(post).get(str(i))]
     caption = post["caption"]
-    inline = formatter.visible_len(caption) <= config.CAPTION_LIMIT and bool(files)
 
-    msgs = await _send_photos(bot, config.CHANNEL_ID, files, caption if inline else None)
-    first_id = msgs[0].message_id if msgs else None
-    if not inline:
-        for chunk in formatter.split_blocks(caption, config.MESSAGE_LIMIT - 100):
-            m = await bot.send_message(config.CHANNEL_ID, chunk, disable_web_page_preview=True)
-            first_id = first_id or m.message_id
+    # Сайт (app/sitepub.py). Большой пост: страница на сайте до выхода и строчка «в архиве →» в подписи.
+    # #ahmagnotes: полный текст — на сайт, в канал — анонс со ссылкой и большим превью страницы.
+    # Сайт не настроен или не ответил — пост выходит как раньше.
+    from app import sitepub
+    preview = None
+    site_kind = sitepub.wants(post)
+    if site_kind == "object" and post["format"] == "std":
+        url = await sitepub.prepare_safe(post)
+        if url:
+            caption = sitepub.with_archive_link(
+                caption, url, formatter.visible_len(caption) <= config.CAPTION_LIMIT and bool(files))
+    elif site_kind == "note":
+        url = await sitepub.publish_note_safe(post)
+        if url:
+            caption, preview = sitepub.note_announcement(post, url)
+
+    if preview:
+        m = await bot.send_message(config.CHANNEL_ID, caption, link_preview_options=LinkPreviewOptions(
+            url=preview, prefer_large_media=True, show_above_text=False))
+        first_id = m.message_id
+    else:
+        inline = formatter.visible_len(caption) <= config.CAPTION_LIMIT and bool(files)
+        msgs = await _send_photos(bot, config.CHANNEL_ID, files, caption if inline else None)
+        first_id = msgs[0].message_id if msgs else None
+        if not inline:
+            for chunk in formatter.split_blocks(caption, config.MESSAGE_LIMIT - 100):
+                m = await bot.send_message(config.CHANNEL_ID, chunk, disable_web_page_preview=True)
+                first_id = first_id or m.message_id
     await db.update_post(pid, status="published", decided_at=db.now(), slot_key=slot_key or post["slot_key"],
                          channel_msg_id=first_id)
     log.info("Опубликован пост %s %s", pid, how)
@@ -145,6 +179,13 @@ async def publish_post(bot: Bot, pid: int, how: str = "", slot_key: str | None =
         await repeats.remember(await db.get_post(pid))   # отпечаток на год — пока фото ещё на диске
     except Exception:
         log.warning("Отпечаток поста %s не записался", pid, exc_info=True)
+    try:
+        if site_kind == "object" and first_id and await sitepub.enabled():
+            task = asyncio.create_task(sitepub.finalize_safe(bot, pid, first_id))   # запись получает номер поста
+            _background.add(task)
+            task.add_done_callback(_background.discard)
+    except Exception:
+        log.warning("Сайт: пост %s не встал в очередь на сайт", pid, exc_info=True)
     try:
         await instagram.mirror(bot, pid)
     except Exception:

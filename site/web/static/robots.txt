@@ -1,0 +1,15 @@
+User-agent: *
+Disallow: /a/
+Disallow: /en/a/
+Disallow: /assets/data.html
+Disallow: /data.json
+
+User-agent: Yandex
+Disallow: /a/
+Disallow: /en/a/
+Disallow: /assets/data.html
+Disallow: /data.json
+Clean-param: r&c&t&s&v /archive/
+Clean-param: r&c&t&s&v /en/archive/
+
+Sitemap: https://theahmag.com/sitemap.xml

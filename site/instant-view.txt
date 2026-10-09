@@ -1,0 +1,33 @@
+~version: "2.1"
+
+# AH Magazine · Instant View для заметок #ahmagnotes
+# Страницы: https://theahmag.com/n/<номер>/ и английские https://theahmag.com/en/n/<номер>/
+# Как подключить: instantview.telegram.org → войти через Telegram → My Templates → New template →
+# домен theahmag.com → вставить этот текст целиком → проверить на любой заметке → взять rhash
+# (кнопка «View in Telegram» в редакторе даёт ссылку t.me/iv?url=…&rhash=XXXX) → вписать XXXX в Railway
+# переменной IV_RHASH. После этого ссылки на заметки в анонсах пойдут с кнопкой Instant View.
+
+?path: /(en/)?n/[0-9]+/?$
+
+site_name:  "AH Magazine"
+channel:    "@ahmagazine"
+author:     "AH Magazine"
+author_url: "https://t.me/ahmagazine"
+
+title:       //article//section[has-class("split")]//h1
+subtitle:    //article//div[has-class("split-pn")]/p
+kicker:      //article//div[has-class("split-pn")]/span[has-class("k")]
+description: //meta[@name="description"]/@content
+cover:       //article//div[has-class("split-im")]/img
+image_url:   $cover/@src
+
+@datetime: //meta[@property="article:published_time"]/@content
+published_date: $@
+
+body: //article//div[has-class("art")]
+
+# подзаголовки внутри текста (у старых заметок): маленькая подпись над ними не нужна
+@remove: $body//span[has-class("kick")]
+<h3>: $body//div[has-class("h")]/h2
+# хештег в конце текста
+@remove: $body//p[has-class("tags")]

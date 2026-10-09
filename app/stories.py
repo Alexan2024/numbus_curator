@@ -79,6 +79,15 @@ async def after_post(bot, pid: int) -> None:
         return
     if m == "auto":
         return await publish(bot, pid)
+    # лонгрид: фон приходит всегда, со ссылкой на заметку на сайте — для стикера-ссылки в сторис
+    from app import sitepub
+    link = sitepub.story_link(post) if sitepub.wants(post) == "note" else None
+    if m == "bg" and link:
+        try:
+            await send_background(bot, pid, link=link)
+        except Exception:
+            log.warning("Фон для сторис к заметке %s не собрался", pid, exc_info=True)
+        return
     if m == "bg" and (post["score"] or 0) >= MIN_SCORE and post["format"] != "notes":
         try:
             await send_background(bot, pid)
@@ -179,8 +188,9 @@ async def _cover(bot, post, dest: Path) -> Path:
     return dest
 
 
-async def send_background(bot, pid: int) -> None:
-    """Фон для сторис — тебе в личку файлом без сжатия, с кнопкой на пост в Instagram."""
+async def send_background(bot, pid: int, link: str | None = None) -> None:
+    """Фон для сторис — тебе в личку файлом без сжатия, с кнопкой на пост в Instagram.
+    link — страница на сайте для стикера-ссылки (у лонгридов): приходит в подписи, её можно скопировать."""
     post = await db.get_post(pid)
     async with db.connect() as c:
         ig = await (await c.execute("SELECT caption, permalink FROM ig_posts WHERE post_id=?", (pid,))).fetchone()
@@ -190,14 +200,19 @@ async def send_background(bot, pid: int) -> None:
         cover = await _cover(bot, post, tmp / "cover")
         title, sub = _heading(post, ig["caption"] if ig else None)
         out = await asyncio.to_thread(render_background, cover, title, sub, tmp / "bg.jpg")
-        kb = None
+        row = []
         if ig and ig["permalink"]:
-            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📸 Пост в Instagram",
-                                                                             url=ig["permalink"])]])
+            row.append(InlineKeyboardButton(text="📸 Пост в Instagram", url=ig["permalink"]))
+        if link:
+            row.append(InlineKeyboardButton(text="🌐 Страница на сайте", url=link))
+        kb = InlineKeyboardMarkup(inline_keyboard=[row]) if row else None
+        caption = (f"📖 Фон для сторис: {html.escape(title[:80])}\nОткрой пост в Instagram → «Добавить в историю» "
+                   "→ положи этот фон.")
+        if link:
+            caption += f"\n\n🔗 Стикер «Ссылка» — на заметку на сайте:\n<code>{html.escape(link)}</code>"
         await bot.send_document(
             config.ADMIN_ID, BufferedInputFile(out.read_bytes(), filename=f"story_{pid}.jpg"),
-            caption=f"📖 Фон для сторис: {html.escape(title[:80])}\nОткрой пост в Instagram → «Добавить в историю» "
-                    "→ положи этот фон.", reply_markup=kb)
+            caption=caption, reply_markup=kb)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

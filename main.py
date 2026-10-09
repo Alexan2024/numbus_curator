@@ -13,7 +13,7 @@ from aiogram.types import BotCommand, ErrorEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app import (attribution, config, curator, db, growth, instagram, pipeline, repeats, reports, request, screen,
-                 slots, stats, stories, taste, ui)
+                 sitepub, slots, stats, stories, taste, ui)
 from app import dates, reels
 from app.bot import router
 
@@ -125,6 +125,7 @@ async def main():
     dp.include_router(attribution.router)   # вступления и выходы в канале
     dp.include_router(growth.router)        # раздел «Рост» — раньше основного, чтобы кнопки g:… не ушли в «старые»
     dp.include_router(instagram.router)     # кнопки ig:…
+    dp.include_router(sitepub.router)       # /site и кнопки site:…
     dp.include_router(router)
 
     @dp.error()
@@ -166,6 +167,7 @@ async def main():
     sched.add_job(guarded(bot, "очистка", cleanup), "cron", hour=4, minute=30, id="cleanup")
     growth.schedule(sched, bot, guarded)
     instagram.schedule(sched, bot, guarded)
+    sitepub.schedule(sched, bot, guarded)   # посты, не попавшие на сайт, — повтор раз в 20 минут
     stats.schedule(sched, bot, guarded)
     taste.schedule(sched, bot, guarded)
     dates.schedule(sched, bot, guarded)
@@ -180,6 +182,7 @@ async def main():
         BotCommand(command="stats", description="Где сейчас посты"),
         BotCommand(command="diag", description="Проверить, всё ли работает"),
         BotCommand(command="date", description="Пост к дате: /date 9.03 о чём"),
+        BotCommand(command="site", description="Сайт: публикация и связь"),
         BotCommand(command="cancel", description="Отменить ввод"),
     ])
     asyncio.create_task(guarded(bot, "запуск", startup, bot)())

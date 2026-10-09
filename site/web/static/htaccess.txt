@@ -1,0 +1,47 @@
+# AH Magazine · настройки сервера (Beget: nginx отдаёт картинки и файлы сам, страницы и всё,
+# чего нет на диске, проходят через Apache — правила ниже действуют на них).
+# Переадресацию http → https включают в панели Beget: Сайты → шестерёнка у домена → «редирект на HTTPS».
+AddDefaultCharset utf-8
+Options -Indexes
+DirectoryIndex index.html
+ErrorDocument 404 /404.html
+
+<IfModule mod_mime.c>
+  AddType application/manifest+json .webmanifest
+  AddType font/woff2 .woff2
+  AddType image/svg+xml .svg
+  AddType application/rss+xml feed.xml
+</IfModule>
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+
+  # theahmag.ru и www.theahmag.ru → theahmag.com
+  RewriteCond %{HTTP_HOST} (^|\.)theahmag\.ru$ [NC]
+  RewriteRule ^ https://theahmag.com%{REQUEST_URI} [R=301,L]
+
+  # www.theahmag.com → theahmag.com, той же схемой (http или https), что пришла
+  RewriteCond %{HTTP_HOST} ^www\.theahmag\.com$ [NC]
+  RewriteCond %{HTTP:X-Forwarded-Proto} =https
+  RewriteRule ^ https://theahmag.com%{REQUEST_URI} [R=301,L]
+  RewriteCond %{HTTP_HOST} ^www\.theahmag\.com$ [NC]
+  RewriteRule ^ http://theahmag.com%{REQUEST_URI} [R=301,L]
+
+  # адрес без косой черты в конце → с ней (/o/1374 → /o/1374/), не меняя http/https
+  RewriteCond %{REQUEST_FILENAME} -d
+  RewriteCond %{REQUEST_URI} !/$
+  RewriteCond %{HTTP:X-Forwarded-Proto} =https
+  RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI}/ [R=301,L]
+  RewriteCond %{REQUEST_FILENAME} -d
+  RewriteCond %{REQUEST_URI} !/$
+  RewriteRule ^ http://%{HTTP_HOST}%{REQUEST_URI}/ [R=301,L]
+</IfModule>
+
+<IfModule mod_headers.c>
+  Header always set X-Content-Type-Options "nosniff"
+  Header always set Referrer-Policy "strict-origin-when-cross-origin"
+  Header always set X-Frame-Options "SAMEORIGIN"
+  <FilesMatch "^data\.html$">
+    Header set X-Robots-Tag "noindex"
+  </FilesMatch>
+</IfModule>
