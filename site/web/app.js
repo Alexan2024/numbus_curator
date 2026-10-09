@@ -267,6 +267,15 @@
       return '<img src="/img/c/' + ik(o) + '.jpg" width="' + o.img.cw + '" height="' + o.img.ch + '" alt="' + esc(alt || '') + '"' +
         (eager ? ' fetchpriority="high"' : ' loading="lazy"') + ' decoding="async">';
     }
+    // hyphenated words (Сан-Роке, Jean-Louis) never break at the hyphen
+    function nowrapHy(html) {
+      return html.replace(/[\p{L}\p{N}]+(?:-[\p{L}\p{N}]+)+/gu, function (w) { return '<span class="nw">' + w + '</span>'; });
+    }
+    // headline "Object // Author // Place": when author and place are printed underneath, show only the object
+    function headTitle(o) {
+      var full = tr(o.t), head = full.split(' // ')[0].trim();
+      return head && head !== full && (o.p.length || o.pl) ? head : full;
+    }
     function personName(id) { var p = PEOPLE[id]; return p ? tr(p) : ''; }
     function byline(o) {
       var names = o.p.map(function (x) { return personName(x.id); }).filter(Boolean).join(', ');
@@ -381,9 +390,9 @@
       var h = '<div class="frame" style="padding-top:32px"><section class="split">' +
         '<a class="split-im" href="' + uo(hero.id) + '">' + cover(hero, tr(hero.t), true) + '</a>' +
         '<div class="split-pn"><span class="k">' + t('newest') + ' · ' + catLabel(hero.cats[0]) + '</span>' +
-        '<h1><a href="' + uo(hero.id) + '">' + esc(tr(hero.t)) + '</a></h1>' +
-        '<span class="by">' + metaParts(hero, false).join(' · ') + '</span>' +
-        (hero.s ? '<p>' + esc(tr(hero.s)) + '</p>' : '') +
+        '<h1><a href="' + uo(hero.id) + '">' + nowrapHy(esc(headTitle(hero))) + '</a></h1>' +
+        '<span class="by">' + nowrapHy(metaParts(hero, false).join(' · ')) + '</span>' +
+        (hero.s ? '<p>' + nowrapHy(esc(tr(hero.s))) + '</p>' : '') +
         '<a class="btn" href="' + uo(hero.id) + '" style="margin-top:10px">' + t('view') + arrow() + '</a></div></section>';
 
       h += '<section class="sec"><h2 class="lbl">' + t('latest') + '</h2>' + feed(latest) +
@@ -419,7 +428,7 @@
     function feedItem(o) {
       var r = (o.img.cw / o.img.ch).toFixed(4);
       return '<a class="fi" href="' + uo(o.id) + '" data-r="' + r + '" style="--r:' + r + '">' + cover(o, '') +
-        '<span class="card-tx"><span class="k">' + catLabel(o.cats[0]) + '</span><span class="t">' + esc(tr(o.t)) + '</span>' +
+        '<span class="card-tx"><span class="k">' + catLabel(o.cats[0]) + '</span><span class="t">' + esc(byline(o) ? headTitle(o) : tr(o.t)) + '</span>' +
         (byline(o) ? '<span class="a">' + esc(byline(o)) + '</span>' : '') + '</span></a>';
     }
     function feed(list) {
