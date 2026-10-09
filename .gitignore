@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets
+.env
+.env.*
+
+# Node / Remotion
+node_modules/
+remotion/out/
+
+# OS
+.DS_Store
