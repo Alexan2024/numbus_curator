@@ -251,10 +251,37 @@
     var ICON_FILTER = '<svg width="14" height="10" viewBox="0 0 14 10" fill="none" stroke="currentColor" stroke-width="1" aria-hidden="true"><line x1="0" y1="2" x2="14" y2="2"/><line x1="3" y1="8" x2="11" y2="8"/></svg>';
 
     // ---------- pictures ----------
-    // Per entry: img/c/<key>.jpg the first photo, img/p/<key>.jpg all photos stacked in one strip,
-    // img/t/<key>.jpg a 240 px square for the archive grid, lists and search. <key> is the entry number,
-    // or o.ik for entries whose pictures were uploaded before the number was known.
+    // Per entry: img/c/<key>.jpg the first photo (cover: feeds, link previews), img/t/<key>.jpg a 240 px square
+    // for the archive grid, lists and search. <key> is the entry number, or o.ik for entries whose pictures
+    // were uploaded before the number was known.
+    // Entries with img.v >= 2 have every photo as its own file in two sizes: img/f/<key>-<n>.jpg (up to 2000 px)
+    // and img/m/<key>-<n>.jpg (up to 1000 px); the browser picks one through srcset. Older entries keep all
+    // photos in one strip, img/p/<key>.jpg, 800 px wide, shown as background slices.
+    var MID = 1000;
+    var SZ_OBJ = '(max-width: 900px) 100vw, (max-width: 1440px) 62vw, 900px';   // photo column of an entry
+    var SZ_FIG = '(max-width: 1080px) 100vw, 1080px';                            // a photo inside a note
+    var SZ_HERO = '(max-width: 900px) 100vw, 55vw';                              // split hero, cropped to a square
     function ik(o) { return o.ik || o.id; }
+    function hi(img) { return img && img.v >= 2; }
+    // srcset of photo i: the 1000 px file and the full one, with their real widths
+    function srcset(key, img, i) {
+      var g = img.segs[i], k = Math.min(1, MID / Math.max(g[1], g[2]));
+      return '/img/m/' + key + '-' + i + '.jpg ' + Math.round(g[1] * k) + 'w, /img/f/' + key + '-' + i + '.jpg ' + g[1] + 'w';
+    }
+    function picture(key, img, i, alt, eager, sizes) {
+      var g = img.segs[i];
+      return '<img src="/img/f/' + key + '-' + i + '.jpg" srcset="' + srcset(key, img, i) + '" sizes="' + sizes + '" width="' + g[1] + '" height="' + g[2] +
+        '" alt="' + esc(alt) + '"' + (eager ? ' fetchpriority="high"' : ' loading="lazy"') + ' decoding="async">';
+    }
+    // the cover in the big split hero: for new entries the browser may take the full-size first photo
+    function heroImg(o, alt) {
+      var key = ik(o), extra = '';
+      if (hi(o.img)) {
+        var g = o.img.segs[0];
+        extra = ' srcset="/img/c/' + key + '.jpg ' + o.img.cw + 'w, /img/f/' + key + '-0.jpg ' + g[1] + 'w" sizes="' + SZ_HERO + '"';
+      }
+      return '<img src="/img/c/' + key + '.jpg"' + extra + ' width="' + o.img.cw + '" height="' + o.img.ch + '" alt="' + esc(alt || '') + '" fetchpriority="high" decoding="async">';
+    }
     function thumb(o, size) {
       return '<img src="/img/t/' + ik(o) + '.jpg" width="' + size + '" height="' + size + '" alt="" loading="lazy" decoding="async">';
     }
@@ -388,7 +415,7 @@
     function vHome() {
       var hero = OBJ[0], latest = OBJ.slice(1, 9);
       var h = '<div class="frame" style="padding-top:32px"><section class="split">' +
-        '<a class="split-im" href="' + uo(hero.id) + '">' + cover(hero, tr(hero.t), true) + '</a>' +
+        '<a class="split-im" href="' + uo(hero.id) + '">' + heroImg(hero, tr(hero.t)) + '</a>' +
         '<div class="split-pn"><span class="k">' + t('newest') + ' · ' + catLabel(hero.cats[0]) + '</span>' +
         '<h1><a href="' + uo(hero.id) + '">' + nowrapHy(esc(headTitle(hero))) + '</a></h1>' +
         '<span class="by">' + nowrapHy(metaParts(hero, false).join(' · ')) + '</span>' +
@@ -522,11 +549,15 @@
       }).sort(function (a, b) { return b[1] - a[1]; });
       return scored.slice(0, 4).map(function (e) { return e[0]; });
     }
-    // One photo of an entry. The very first photo is the cover file itself (a real <img>): it arrives sooner
-    // than the strip, and search engines and previews can see it.
+    // One photo of an entry. New entries: every photo is a real <img> in two sizes. Older entries: the very first
+    // photo is the cover file itself (a real <img>, it arrives sooner than the strip, and search engines and
+    // previews can see it), the rest are slices of the strip.
     function photo(key, img, i, alt, tgId, asCover) {
       var g = img.segs[i];
       var vid = g[3] && tgId ? '<a class="vid" href="' + TG + '/' + tgId + '" target="_blank" rel="noopener">' + ICON_PLAY + t('video') + '</a>' : '';
+      if (hi(img)) {
+        return '<div class="ph" style="aspect-ratio:' + g[1] + '/' + g[2] + '">' + picture(key, img, i, alt + ', ' + (i + 1), asCover, SZ_OBJ) + vid + '</div>';
+      }
       if (asCover) {
         return '<div class="ph" style="aspect-ratio:' + g[1] + '/' + g[2] + '"><img src="/img/c/' + key + '.jpg" width="' + g[1] + '" height="' + g[2] + '" alt="' + esc(alt + ', 1') + '" fetchpriority="high" decoding="async">' + vid + '</div>';
       }
@@ -568,7 +599,7 @@
     }
     function vNote(id) {
       var n = NBY[id], title = tr(n.t), key = ik(n);
-      var h = '<article><div class="frame" style="padding-top:32px"><section class="split"><div class="split-im"><img src="/img/c/' + key + '.jpg" width="' + n.img.cw + '" height="' + n.img.ch + '" alt="' + esc(title) + '" fetchpriority="high" decoding="async"></div>' +
+      var h = '<article><div class="frame" style="padding-top:32px"><section class="split"><div class="split-im">' + heroImg(n, title) + '</div>' +
         '<div class="split-pn"><span class="k">Notes · ' + n.cats.map(catLabel).join(' · ') + '</span><h1>' + esc(title) + '</h1>' +
         (n.sub ? '<p>' + esc(tr(n.sub)) + '</p>' : '') + '<span class="by">' + fdate(n.d) + '</span></div></section></div>';
       // the cover is the first photo of the album; the remaining photos go into the slots
@@ -584,8 +615,9 @@
         else if (b.type === 'quote') { flush(); cols.push('<blockquote>' + txt + (b.by ? '<cite>' + esc(tr(b.by)) + '</cite>' : '') + '</blockquote>'); }
         if (slots[i] != null) {
           // a note's photos are separate files (img/f/…): Instant View and search engines need real images
-          var g = n.img.segs[slots[i]];
-          flush(); cols.push('<figure><img src="/img/f/' + key + '-' + slots[i] + '.jpg" width="' + g[1] + '" height="' + g[2] + '" alt="' + esc(title + ', ' + (slots[i] + 1)) + '" loading="lazy" decoding="async"></figure>');
+          var g = n.img.segs[slots[i]], alt = title + ', ' + (slots[i] + 1);
+          flush(); cols.push('<figure>' + (hi(n.img) ? picture(key, n.img, slots[i], alt, false, SZ_FIG)
+            : '<img src="/img/f/' + key + '-' + slots[i] + '.jpg" width="' + g[1] + '" height="' + g[2] + '" alt="' + esc(alt) + '" loading="lazy" decoding="async">') + '</figure>');
         }
       });
       flush();

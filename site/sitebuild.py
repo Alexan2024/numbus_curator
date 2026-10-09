@@ -2,8 +2,8 @@
 
 Сайт — статичные файлы на Beget. Всё, что на нём есть, собирается отсюда из одного файла данных (data.json):
 страницы на двух языках (их рисует prerender.js тем же кодом, что работает в браузере), файл данных для
-браузера, иконки, robots.txt, sitemap.xml, RSS, .htaccess. Картинки записи (img/c, img/p, img/t) делаются один
-раз, когда запись появляется (make_images), и дальше не пересобираются.
+браузера, иконки, robots.txt, sitemap.xml, RSS, .htaccess. Картинки записи (img/c, img/t, img/f, img/m) делаются
+один раз, когда запись появляется (make_images), и дальше не пересобираются.
 
 Запуск руками:  python3 site/sitebuild.py build data.json out/
 Бот пользуется этим модулем из app/sitepub.py.
@@ -25,8 +25,11 @@ from PIL import Image, ImageFilter, ImageOps, ImageStat
 HERE = Path(__file__).resolve().parent
 WEB = HERE / "web"
 SITE_URL = "https://theahmag.com"
-BOX = 800        # каждое фото вписывается в 800 × 800
-GAP = 6          # просвет между фото в ленте img/p
+BOX = 1200       # обложка img/c: лента, превью ссылок, Instant View (до 6.1 — 800, и для всех фото)
+HI = 2000        # каждое фото img/f: страница записи и заметки на больших и плотных экранах
+MID = 1000       # каждое фото img/m: телефоны (srcset выбирает сам браузер)
+IMG_V = 2        # формат картинок записи: 2 — отдельные файлы f/m; без v — старая лента img/p по 800 px
+GAP = 6          # просвет между фото в ленте img/p (старые записи)
 TILE = 240       # квадрат для сетки архива
 MANIFEST = "assets/manifest.json"
 STATIC = {       # файл в web/static → путь на сайте
@@ -95,28 +98,34 @@ def _jpeg(im: Image.Image, quality: int) -> bytes:
     return buf.getvalue()
 
 
-def make_images(photos: list, key: str | int, separate: bool = False) -> tuple[dict, dict[str, bytes]]:
+def photo_files(photos: list, key: str | int) -> tuple[list, dict[str, bytes]]:
+    """Каждое фото записи отдельными файлами: img/f/<key>-<n>.jpg до 2000 px и img/m/<key>-<n>.jpg до 1000 px.
+    → (segs: [[0, ширина f, высота f, 0], …], {путь на сайте: байты})"""
+    segs, files = [], {}
+    for n, src in enumerate(photos):
+        im = _fit(_open(src), HI)
+        files[f"img/f/{key}-{n}.jpg"] = _jpeg(im, 84)
+        files[f"img/m/{key}-{n}.jpg"] = _jpeg(_fit(im, MID), 82)
+        segs.append([0, im.width, im.height, 0])
+    return segs, files
+
+
+def make_images(photos: list, key: str | int, separate: bool = True) -> tuple[dict, dict[str, bytes]]:
     """Фото записи → (описание для data.json, {путь на сайте: байты}). Первое фото — обложка.
-    separate — ещё и каждое фото отдельным файлом img/f/<key>-<n>.jpg (у заметок: их видят Instant View и поиск)."""
-    ims = [_fit(_open(p)) for p in photos]
+    Каждое фото — отдельным файлом в двух размерах (img/f, img/m), обложка — img/c, квадрат для сетки — img/t.
+    Общей ленты img/p больше нет: она ограничивала фото 800 px. separate оставлен для совместимости."""
+    ims = [_open(p) for p in photos]
     if not ims:
         raise ValueError("нет фото")
-    W = max(i.width for i in ims)
-    H = sum(i.height for i in ims) + GAP * (len(ims) - 1)
-    strip = Image.new("RGB", (W, H), (244, 244, 241))
-    segs, y = [], 0
-    for im in ims:
-        strip.paste(im, (0, y))
-        segs.append([y, im.width, im.height, 0])
-        y += im.height + GAP
-    cover = ims[0]
-    files = {f"img/f/{key}-{n}.jpg": _jpeg(im, 84) for n, im in enumerate(ims)} if separate else {}
+    segs, files = photo_files(ims, key)
+    cover = _fit(ims[0], BOX)
     files.update({
         f"img/c/{key}.jpg": _jpeg(cover, 86),
-        f"img/p/{key}.jpg": _jpeg(strip, 80),
         f"img/t/{key}.jpg": _jpeg(_tile(cover), 80),
     })
-    return {"W": W, "H": H, "segs": segs, "cw": cover.width, "ch": cover.height}, files
+    W = max(g[1] for g in segs)
+    H = sum(g[2] for g in segs)
+    return {"v": IMG_V, "W": W, "H": H, "segs": segs, "cw": cover.width, "ch": cover.height}, files
 
 
 def photos_from_strip(rec: dict, strip_path: Path, out_dir: Path) -> int:

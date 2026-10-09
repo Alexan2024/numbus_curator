@@ -1043,9 +1043,15 @@ async def refresh(bot: Bot | None = None, force: bool = False) -> str | None:
     ups = pending_updates(st)
     if not force and not ups and st.get("version") == ver:
         return None
+    if not force and st.get("version") and st.get("version") != ver and not _calm():
+        return None              # новая вёрстка — это все страницы: не перед самым слотом (повтор через 20 минут)
     async with _lock:
         D = await load()
         notes, skipped, marks = [], [], {}
+        # разово: записи последних недель, чьи фото ещё на диске бота, получают фото в полном размере
+        sharp, sharp_files = (0, [])
+        if not st.get("img_v") or st.get("img_v") < sitebuild.IMG_V:
+            sharp, sharp_files = await _sharpen_recent(D)
         for f in ups:
             try:
                 notes += apply_update(D, json.loads(f.read_text("utf-8")))
@@ -1061,12 +1067,12 @@ async def refresh(bot: Bot | None = None, force: bool = False) -> str | None:
         if not force and len(sent) >= BIG and not _calm():
             log.info("Сайт: выкладка на %s файлов отложена — скоро слот", len(sent))
             return None
-        await asyncio.to_thread(upload, batch, gone)
+        await asyncio.to_thread(upload, sharp_files + batch, gone)
         _save(D, manifest)
         first = "version" not in st
         new_code = st.get("version") != ver
         st.setdefault("updates", {}).update(marks)
-        st.update(version=ver, at=db.now())
+        st.update(version=ver, at=db.now(), img_v=sitebuild.IMG_V)
         _put_state(st)
     lines = ["🌐 <b>Сайт обновлён</b>"]
     if first:
@@ -1079,11 +1085,44 @@ async def refresh(bot: Bot | None = None, force: bool = False) -> str | None:
                      + (f"\n• … и ещё {len(notes) - 12}" if len(notes) > 12 else ""))
     if skipped:
         lines.append("⚠️ Не применены:\n" + "\n".join("• " + html.escape(x) for x in skipped[:5]))
+    if sharp:
+        lines.append(f"Фото в полном размере (до 2000 px вместо 800) получили {sharp} недавних записей — "
+                     "у них оригиналы ещё были на диске. Остальные записи — в следующем обновлении сайта.")
     if sent or gone:
         lines.append(f"Выложено файлов: {len(sent)}" + (f", убрано страниц: {len(gone)}" if gone else "") + ".")
     else:
         lines.append("Файлы на хостинге и так совпадали с новой сборкой.")
     return "\n\n".join(lines)
+
+
+async def _sharpen_recent(D: dict) -> tuple[int, list[tuple[str, bytes]]]:
+    """Записи со старыми картинками (лента по 800 px), у которых пост бота ещё хранит фото на диске
+    (IMAGE_TTL_DAYS), получают отдельные фото до 2000 px — как новые записи. Обложка и квадрат не меняются.
+    Меняет D на месте. → (сколько записей, файлы для выкладки)"""
+    n, files = 0, []
+    for rec in D.get("objects") or []:
+        img = rec.get("img") or {}
+        if rec.get("tmp") or img.get("v", 0) >= sitebuild.IMG_V:
+            continue
+        async with db.connect() as c:
+            cur = await c.execute("SELECT * FROM posts WHERE channel_msg_id=? AND status='published' "
+                                  "ORDER BY id DESC LIMIT 1", (rec["id"],))
+            post = await cur.fetchone()
+        if not post or wants(post) != "object":
+            continue
+        try:
+            photos = await asyncio.to_thread(_photos, post)
+            segs, got = await asyncio.to_thread(sitebuild.photo_files, photos, rec.get("ik") or rec["id"])
+        except Exception as exc:
+            log.info("Сайт: запись %s без полноразмерных фото: %r", rec["id"], exc)
+            continue
+        rec["img"] = {**img, "v": sitebuild.IMG_V, "segs": segs,
+                      "W": max(g[1] for g in segs), "H": sum(g[2] for g in segs)}
+        files += list(got.items())
+        n += 1
+    if n:
+        log.info("Сайт: %s записей получили фото в полном размере", n)
+    return n, files
 
 
 async def refresh_and_tell(bot: Bot) -> None:

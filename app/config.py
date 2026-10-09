@@ -14,7 +14,7 @@ def _hm(raw: str) -> tuple[int, int]:
     return int(h), int(m or 0)
 
 
-VERSION = "6.0"
+VERSION = "6.1"
 
 BOT_TOKEN = _req("BOT_TOKEN")
 ADMIN_ID = int(_req("ADMIN_ID"))
