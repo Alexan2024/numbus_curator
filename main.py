@@ -14,7 +14,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app import (attribution, config, curator, db, growth, instagram, pipeline, repeats, reports, request, screen,
                  sitepub, slots, stats, stories, taste, ui)
-from app import archive, dates, reels
+from app import admin, archive, dates, reels
 from app.bot import router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -133,6 +133,7 @@ async def main():
     dp.include_router(instagram.router)     # кнопки ig:…
     dp.include_router(sitepub.router)       # /site и кнопки site:…
     dp.include_router(archive.router)       # /archive и кнопки ar:…
+    dp.include_router(admin.router)         # /admin и кнопки adm:… (редакция сайта, 7.0)
     dp.include_router(router)
 
     @dp.error()
@@ -181,9 +182,11 @@ async def main():
     dates.schedule(sched, bot, guarded)
     reels.schedule(sched, bot, guarded)
     archive.schedule(sched, bot, guarded)   # чистка старых записей сайта и перенос Instagram (6.2)
+    admin.schedule(sched, bot, guarded)     # заметки редакции по расписанию, копия базы раз в неделю (7.0)
     sched.start()
 
-    await instagram.start_server()   # Instagram забирает фото по публичной ссылке
+    await instagram.start_server()   # Instagram забирает фото по публичной ссылке; там же редакция сайта
+    admin.start(bot)                 # выкладка правок редакции на сайт
     await slots.reschedule()   # посты, чей слот прошёл или исчез из расписания, пока бот не работал
     await bot.set_my_commands([
         BotCommand(command="menu", description="Экран бота"),
@@ -193,6 +196,7 @@ async def main():
         BotCommand(command="date", description="Пост к дате: /date 9.03 о чём"),
         BotCommand(command="site", description="Сайт: публикация и связь"),
         BotCommand(command="archive", description="Архив сайта: чистка и перенос Instagram"),
+        BotCommand(command="admin", description="Редакция сайта: ссылка, входы, копия базы"),
         BotCommand(command="cancel", description="Отменить ввод"),
     ])
     asyncio.create_task(guarded(bot, "запуск", startup, bot)())

@@ -23,7 +23,7 @@
       objForms: ['объект', 'объекта', 'объектов'],
       tagline: 'Визуальный архив искусства, пространства и структуры',
       latest: 'Новое в архиве', rubrics: 'Рубрики', allArchive: 'Весь архив', allNotes: 'Все заметки', allIndex: 'Весь указатель',
-      view: 'Смотреть', read: 'Читать', newest: 'Сегодня в архиве',
+      view: 'Смотреть', read: 'Читать', newest: 'Сегодня в архиве', pick: 'Выбор редакции',
       bandT: 'Новые объекты каждый день', bandP: 'Архив пополняется в Telegram и Instagram. Сайт собирает всё опубликованное в одном месте.',
       all: 'Все', filters: 'Фильтры', country: 'Страна', period: 'Время', order: 'Порядок',
       sNew: 'Сначала новые', sOld: 'Сначала ранние публикации', sYear: 'По году создания',
@@ -50,7 +50,7 @@
       objForms: ['entry', 'entries', 'entries'],
       tagline: 'Visual archive of art, space and structure',
       latest: 'New in the archive', rubrics: 'Sections', allArchive: 'Full archive', allNotes: 'All notes', allIndex: 'Full index',
-      view: 'View', read: 'Read', newest: 'Today in the archive',
+      view: 'View', read: 'Read', newest: 'Today in the archive', pick: 'Editor’s pick',
       bandT: 'New entries every day', bandP: 'The archive grows on Telegram and Instagram. The website keeps everything published in one place.',
       all: 'All', filters: 'Filters', country: 'Country', period: 'Period', order: 'Order',
       sNew: 'Newest first', sOld: 'Earliest posts first', sYear: 'By year made',
@@ -138,6 +138,30 @@
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
+  }
+  // Texts written in the site's editor (notes with fmt 2, the About and Partnerships pages) carry a little
+  // markup: **bold**, *italic*, [text](https://…). A backslash keeps the next *, [, ] or \ as itself.
+  // Everything else is escaped, so the markup can never produce anything but these three tags.
+  function inl(s) {
+    var keep = [];
+    var h = String(s == null ? '' : s).replace(/[\u0001\u0002]/g, '').replace(/\\([\\*\[\]])/g, function (m, c) {
+      keep.push(c); return '\u0001' + (keep.length - 1) + '\u0002';
+    });
+    h = esc(h);
+    h = h.replace(/\[([^\]\n]+?)\]\(((?:https?:\/\/|mailto:|\/(?![\/\\]))[^\s)*]*)\)/g, function (m, txt, url) {
+      var ext = /^https?:/.test(url) && url.indexOf('https://theahmag.com') !== 0;
+      return '<a href="' + url + '"' + (ext ? ' target="_blank" rel="noopener"' : '') + '>' + txt + '</a>';
+    });
+    h = h.replace(/\*\*(?=\S)([^\n]*?\S)\*\*/g, '<b>$1</b>');
+    h = h.replace(/\*(?=\S)([^*\n]*?\S)\*/g, '<i>$1</i>');
+    return h.replace(/\u0001(\d+)\u0002/g, function (m, i) { return esc(keep[+i]); });
+  }
+  // the About and Partnerships texts: the ones set in the editor (data.pages) over the defaults above
+  function pageCopy(D, name, L) {
+    var base = COPY[name][L], o = D.pages && D.pages[name] && D.pages[name][L], c = {}, k;
+    for (k in base) c[k] = base[k];
+    if (o) for (k in o) if (o[k] != null && o[k] !== '' && !(o[k] instanceof Array && !o[k].length)) c[k] = o[k];
+    return c;
   }
 
   // ---------- addresses ----------
@@ -413,10 +437,12 @@
 
     // ---------- views ----------
     function vHome() {
-      var hero = OBJ[0], latest = OBJ.slice(1, 9);
+      // the cover is the newest entry, or the one the editor pinned (data.home.pin)
+      var pin = D.home && BY[D.home.pin] && !BY[D.home.pin].tmp ? BY[D.home.pin] : null;
+      var hero = pin || OBJ[0], latest = OBJ.filter(function (o) { return o !== hero; }).slice(0, 8);
       var h = '<div class="frame" style="padding-top:32px"><section class="split">' +
         '<a class="split-im" href="' + uo(hero.id) + '">' + heroImg(hero, tr(hero.t)) + '</a>' +
-        '<div class="split-pn"><span class="k">' + t('newest') + ' · ' + catLabel(hero.cats[0]) + '</span>' +
+        '<div class="split-pn"><span class="k">' + t(pin ? 'pick' : 'newest') + ' · ' + catLabel(hero.cats[0]) + '</span>' +
         '<h1><a href="' + uo(hero.id) + '">' + nowrapHy(esc(headTitle(hero))) + '</a></h1>' +
         '<span class="by">' + nowrapHy(metaParts(hero, false).join(' · ')) + '</span>' +
         (hero.s ? '<p>' + nowrapHy(esc(tr(hero.s))) + '</p>' : '') +
@@ -565,8 +591,9 @@
     }
     function vObject(id) {
       var o = BY[id], next = OBJ[o.ix + 1], prev = OBJ[o.ix - 1];
-      // записи из Instagram (src: 'ig') — без поста в Telegram и без номера AH-, со ссылкой на пост в Instagram
-      var title = tr(o.t), key = ik(o), tgId = o.tmp || o.src === 'ig' ? null : o.id;
+      // записи из Instagram (src: 'ig') и из редакции сайта (src: 'man') — без номера AH- и ссылки на Telegram,
+      // пока о них не вышел пост в канале (tg — его номер)
+      var title = tr(o.t), key = ik(o), tgId = o.tg || (o.tmp || o.src === 'ig' || o.src === 'man' ? null : o.id);
       var h = '<div class="wrap"><nav class="crumb" aria-label="' + t('crumbs') + '"><a href="' + ua({}) + '">' + t('archive') + '</a><span>/</span><a href="' + ua({ cat: o.cats[0] }) + '">' + catLabel(o.cats[0]) + '</a></nav>';
       h += '<div class="obj"><div class="lead-ph">' + photo(key, o.img, 0, title, tgId, true) + '</div>';
       h += '<aside class="obj-tx" id="otx"><span class="k">' + o.cats.map(catLabel).join(' · ') + '</span><h1>' + esc(title) + '</h1>';
@@ -580,7 +607,7 @@
           return '<dt>' + (t('cr')[c[0]] || t('cr').other) + '</dt><dd>' + v + '</dd>';
         }).join('') + '</dl>';
       }
-      h += '<div class="obj-meta"><span>' + (o.tmp || o.src === 'ig' ? '' : 'AH-' + o.id + ' · ') + t('since') + ' ' + fdate(o.d) + '</span>' +
+      h += '<div class="obj-meta"><span>' + (o.tmp || !tgId ? '' : 'AH-' + tgId + ' · ') + t('since') + ' ' + fdate(o.d) + '</span>' +
         (o.co.length ? '<span>' + o.co.map(function (c) { return '<a href="' + ua({ co: c }) + '" style="border-bottom:1px solid var(--rule)">' + esc(tr(COUNTRIES[c])) + '</a>'; }).join(', ') + (o.per ? ' · <a href="' + ua({ per: o.per }) + '" style="border-bottom:1px solid var(--rule)">' + perLabel(o.per) + '</a>' : '') + '</span>' : '') + '</div>';
       if (tgId) h += '<div class="obj-links"><a href="' + TG + '/' + tgId + '" target="_blank" rel="noopener">' + t('tgPost') + ' ↗</a></div>';
       else if (o.ig && /^https:\/\/(www\.)?instagram\.com\//.test(o.ig)) h += '<div class="obj-links"><a href="' + esc(o.ig) + '" target="_blank" rel="noopener">' + t('igPost') + ' ↗</a></div>';
@@ -599,8 +626,24 @@
     function vNotes() {
       return '<div class="frame"><section class="ph-head"><h1>Notes</h1><p>' + t('notesSub') + '</p></section><div class="notes">' + NOTES.filter(function (n) { return !n.tmp; }).map(noteCard).join('') + '</div></div>';
     }
+    // a photo of a note written in the editor: {k: picture key, i: number, w, h, m: false — no 1000 px file}
+    function refImg(r, alt, sizes) {
+      var f = '/img/f/' + r.k + '-' + r.i + '.jpg', k = Math.min(1, MID / Math.max(r.w, r.h));
+      var ss = r.m === false ? '' : ' srcset="/img/m/' + r.k + '-' + r.i + '.jpg ' + Math.round(r.w * k) + 'w, ' + f + ' ' + r.w + 'w" sizes="' + sizes + '"';
+      return '<img src="' + f + '"' + ss + ' width="' + r.w + '" height="' + r.h + '" alt="' + esc(alt) + '" loading="lazy" decoding="async">';
+    }
+    // a photo block: one photo across the page or in the text column, or a pair side by side
+    function figure(b, alt) {
+      var cap = b.cap && tr(b.cap) ? '<figcaption>' + inl(tr(b.cap)) + '</figcaption>' : '';
+      if (b.ph.length > 1) {
+        return '<figure class="pair"><div class="pr">' + b.ph.map(function (r) {
+          return '<span style="flex:' + (r.w / r.h).toFixed(4) + ' 1 0">' + refImg(r, alt, '(max-width: 1080px) 50vw, 540px') + '</span>';
+        }).join('') + '</div>' + cap + '</figure>';
+      }
+      return '<figure' + (b.sz === 'col' ? ' class="fc"' : '') + '>' + refImg(b.ph[0], alt, b.sz === 'col' ? '(max-width: 700px) 100vw, 660px' : SZ_FIG) + cap + '</figure>';
+    }
     function vNote(id) {
-      var n = NBY[id], title = tr(n.t), key = ik(n);
+      var n = NBY[id], title = tr(n.t), key = ik(n), md = n.fmt === 2, tx = md ? inl : esc;
       var h = '<article><div class="frame" style="padding-top:32px"><section class="split"><div class="split-im">' + heroImg(n, title) + '</div>' +
         '<div class="split-pn"><span class="k">Notes · ' + n.cats.map(catLabel).join(' · ') + '</span><h1>' + esc(title) + '</h1>' +
         (n.sub ? '<p>' + esc(tr(n.sub)) + '</p>' : '') + '<span class="by">' + fdate(n.d) + '</span></div></section></div>';
@@ -610,12 +653,13 @@
       var cols = [], cur = [], first = true;
       function flush() { if (cur.length) { cols.push('<div class="col' + (first ? ' first' : '') + '">' + cur.join('') + '</div>'); first = false; cur = []; } }
       n.bl.forEach(function (b, i) {
-        var txt = esc(tr(b));
+        if (b.type === 'img') { if (b.ph && b.ph.length) { flush(); cols.push(figure(b, title)); } return; }
+        var txt = tx(tr(b));
         if (b.type === 'p') cur.push('<p>' + txt + '</p>');
         else if (b.type === 'h') cur.push('<div class="h">' + (b.kicker ? '<span class="kick">' + esc(b.kicker) + '</span>' : '') + '<h2>' + txt + '</h2></div>');
         else if (b.type === 'example') cur.push('<p class="ex">' + txt + '</p>');
         else if (b.type === 'quote') { flush(); cols.push('<blockquote>' + txt + (b.by ? '<cite>' + esc(tr(b.by)) + '</cite>' : '') + '</blockquote>'); }
-        if (slots[i] != null) {
+        if (!md && slots[i] != null) {
           // a note's photos are separate files (img/f/…): Instant View and search engines need real images
           var g = n.img.segs[slots[i]], alt = title + ', ' + (slots[i] + 1);
           flush(); cols.push('<figure>' + (hi(n.img) ? picture(key, n.img, slots[i], alt, false, SZ_FIG)
@@ -683,20 +727,20 @@
       return '<div class="contact"><span>' + text + '</span><a class="handle" href="' + CONTACT_URL + '" target="_blank" rel="noopener">' + CONTACT + '</a><button class="copy" data-act="copy" data-v="' + CONTACT + '">' + t('copy') + '</button></div>';
     }
     function vAbout() {
-      var c = COPY.about[L];
+      var c = pageCopy(D, 'about', L);
       var people = Object.keys(PEOPLE).length, countries = Object.keys(COUNTRIES).length, n = OBJ.filter(function (o) { return !o.tmp; }).length;
-      return '<div class="frame"><section class="ph-head"><h1>' + c.title + '</h1></section><div class="prose">' +
-        '<p class="lead">' + c.lead + '</p>' + c.p.map(function (x) { return '<p>' + x + '</p>'; }).join('') +
+      return '<div class="frame"><section class="ph-head"><h1>' + esc(c.title) + '</h1></section><div class="prose">' +
+        '<p class="lead">' + inl(c.lead) + '</p>' + c.p.map(function (x) { return '<p>' + inl(x) + '</p>'; }).join('') +
         '<div class="stats"><div><b>' + n + '</b><span>' + plural(n, t('objForms')) + ' ' + c.stats[0] + '</span></div><div><b>' + countries + '</b><span>' + c.stats[1] + '</span></div><div><b>' + people + '</b><span>' + c.stats[2] + '</span></div></div>' +
-        '<h2>' + c.contactH + '</h2>' + contactBlock(c.contact) +
+        '<h2>' + esc(c.contactH) + '</h2>' + contactBlock(inl(c.contact)) +
         '<div class="obj-links" style="padding-top:8px"><a href="' + TG + '" target="_blank" rel="noopener">Telegram ↗</a><a href="' + IG + '" target="_blank" rel="noopener">Instagram ↗</a></div></div></div>';
     }
     function vPartners() {
-      var c = COPY.partners[L];
-      return '<div class="frame"><section class="ph-head"><h1>' + c.title + '</h1></section><div class="prose">' +
-        '<p class="lead">' + c.lead + '</p><h2>' + c.fmtH + '</h2><div class="fmt">' + c.fmt.map(function (f) { return '<div><b>' + f[0] + '</b><span>' + f[1] + '</span></div>'; }).join('') + '</div>' +
-        '<h2>' + c.howH + '</h2><p>' + c.how + '</p>' + (c.aud ? '<h2>' + c.audH + '</h2><p>' + c.aud + '</p>' : '') +
-        '<h2>' + c.contactH + '</h2>' + contactBlock(c.contact) + '</div></div>';
+      var c = pageCopy(D, 'partners', L);
+      return '<div class="frame"><section class="ph-head"><h1>' + esc(c.title) + '</h1></section><div class="prose">' +
+        '<p class="lead">' + inl(c.lead) + '</p><h2>' + esc(c.fmtH) + '</h2><div class="fmt">' + c.fmt.map(function (f) { return '<div><b>' + esc(f[0]) + '</b><span>' + inl(f[1]) + '</span></div>'; }).join('') + '</div>' +
+        '<h2>' + esc(c.howH) + '</h2><p>' + inl(c.how) + '</p>' + (c.aud ? '<h2>' + esc(c.audH) + '</h2><p>' + inl(c.aud) + '</p>' : '') +
+        '<h2>' + esc(c.contactH) + '</h2>' + contactBlock(inl(c.contact)) + '</div></div>';
     }
     function vNotFound() {
       return '<div class="frame nf"><h1>' + t('nfT') + '</h1><p>' + t('nfP') + '</p><div class="row" style="display:flex;flex-wrap:wrap;gap:12px;justify-content:center"><a class="btn" href="' + u({ name: 'home' }) + '">' + t('home') + arrow() + '</a><a class="btn" href="' + ua({}) + '">' + t('archive') + arrow() + '</a></div></div>';
@@ -725,7 +769,7 @@
       var main = ix.filter(function (x) { return hit(x.s); }).map(function (x) { return x.o; });
       var extra = ix.filter(function (x) { return !hit(x.s) && hit(x.s + ' ' + x.b); }).map(function (x) { return x.o; });
       var ppl = Object.keys(PEOPLE).filter(function (k) { return hit(norm(PEOPLE[k].ru + ' ' + PEOPLE[k].en)); }).slice(0, 14);
-      var nts = NOTES.filter(function (n) { return !n.tmp && hit(norm(n.t.ru + ' ' + n.t.en + ' ' + n.bl.map(function (b) { return b.ru + ' ' + b.en; }).join(' '))); });
+      var nts = NOTES.filter(function (n) { return !n.tmp && hit(norm(n.t.ru + ' ' + n.t.en + ' ' + n.bl.map(function (b) { return (b.ru || '') + ' ' + (b.en || ''); }).join(' '))); });
       return { objs: main.concat(extra).slice(0, 40), ppl: ppl, nts: nts };
     }
     function searchShell() {
@@ -795,7 +839,7 @@
     };
   }
 
-  var api = { createSite: createSite, urlOf: urlOf, legacyRoute: legacyRoute, langOfPath: langOfPath, T: T, CATS: CATS, PER_ORDER: PER_ORDER, esc: esc };
+  var api = { createSite: createSite, urlOf: urlOf, legacyRoute: legacyRoute, langOfPath: langOfPath, T: T, CATS: CATS, PER_ORDER: PER_ORDER, esc: esc, inl: inl, COPY: COPY };
   if (typeof module === 'object' && module.exports) module.exports = api;
   else root.AH = api;
   if (typeof document === 'undefined') return;

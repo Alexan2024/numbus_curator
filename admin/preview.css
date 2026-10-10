@@ -1,0 +1,7 @@
+/* Полоска предпросмотра поверх страницы сайта */
+.pv-bar{position:sticky;top:0;z-index:60;display:flex;justify-content:space-between;align-items:center;gap:16px;padding:9px var(--gut);background:var(--ink);color:#fff;font:400 12px/1.4 var(--sans);letter-spacing:.04em}
+.pv-lang{display:flex;gap:2px}
+.pv-lang button{color:#9a9a96;padding:4px 8px;font:inherit}
+.pv-lang button.on{color:#fff}
+.pv-wait{padding:120px var(--gut);text-align:center;color:var(--muted)}
+#pv .hd{top:37px}

@@ -364,7 +364,7 @@ def _store_files(rid: int | str, files: dict[str, bytes]) -> list[str]:
 
 def _old(rec: dict) -> bool:
     return (not rec.get("tmp") and rec.get("src") != "ig" and (rec.get("img") or {}).get("v", 0) < 2
-            and rec.get("id", 0) < IG_BASE)
+            and rec.get("id", 0) < IG_BASE and not rec.get("man_img"))   # фото выбраны в редакции — не трогаем
 
 
 def _cut_strip(raw: bytes, segs: list, folder: Path) -> list[Path]:
@@ -860,9 +860,10 @@ async def _covers_ready(client: httpx.AsyncClient, D: dict) -> None:
 
 async def _next_ig_id(st: dict, D: dict) -> int:
     """Номер новой записи из Instagram: больше всех уже занятых (на сайте, среди скрытых, ждущих и в базе)."""
-    taken = [o["id"] for o in D["objects"] if o["id"] >= IG_BASE]
-    taken += [int(k) for k in _load_hidden() if k.isdigit() and int(k) >= IG_BASE]
-    taken += [int(k) for k in st["pending"]["put"] if k.isdigit() and int(k) >= IG_BASE]
+    top = sitepub.MAN_BASE                     # от 200000 — записи редакции сайта
+    taken = [o["id"] for o in D["objects"] if IG_BASE <= o["id"] < top]
+    taken += [int(k) for k in _load_hidden() if k.isdigit() and IG_BASE <= int(k) < top]
+    taken += [int(k) for k in st["pending"]["put"] if k.isdigit() and IG_BASE <= int(k) < top]
     async with db.connect() as c:
         cur = await c.execute("SELECT MAX(rec_id) m FROM archive_ig")
         row = await cur.fetchone()
@@ -1010,6 +1011,8 @@ async def commit(st: dict, force: bool = False) -> int:
             if x.get("replace"):
                 if idx is None:
                     continue                          # запись убрали с сайта, пока мы искали
+                if D["objects"][idx].get("man_img"):
+                    continue                          # пока искали, фото записи поменяли в редакции — их не трогаем
                 D["objects"][idx]["img"] = x["img"]
                 D["objects"][idx]["ik"] = x["ik"]
             else:
@@ -1030,8 +1033,8 @@ async def commit(st: dict, force: bool = False) -> int:
         hidden = _load_hidden()
         for sid, reason in hide.items():
             idx = next((i for i, o in enumerate(D["objects"]) if str(o["id"]) == sid), None)
-            if idx is None:
-                continue
+            if idx is None or D["objects"][idx].get("man"):
+                continue                              # правленную в редакции запись чистка не скрывает
             rec = D["objects"].pop(idx)
             hidden[sid] = {"rec": rec, "reason": reason, "at": db.now(),
                            "people": {p["id"]: D["people"][p["id"]] for p in rec.get("p") or [] if p["id"] in D["people"]},

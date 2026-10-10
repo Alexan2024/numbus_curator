@@ -268,6 +268,15 @@ h1,h2,h3{font-weight:400;text-wrap:balance}
 .art blockquote{padding:96px 0 70px;max-width:860px;text-align:center;font-style:italic;font-size:clamp(28px,3.2vw,42px);line-height:1.25;color:var(--ink)}
 .art blockquote cite{display:block;margin-top:22px;font:400 13px/1.4 var(--sans);font-style:normal;color:var(--muted)}
 .art .tags{font:400 13px/1.5 var(--sans);color:var(--muted);padding-top:24px}
+/* notes written in the site's editor: links and emphasis in the text, a photo in the text column, a pair */
+.art p a,.art blockquote a,.art figcaption a,.prose p a,.fmt span a{border-bottom:1px solid var(--rule);transition:border-color .2s ease}
+.art p a:hover,.art blockquote a:hover,.art figcaption a:hover,.prose p a:hover,.fmt span a:hover{color:var(--ink);border-color:var(--ink)}
+.art b,.prose b{font-weight:500;color:var(--ink)}
+.art figure.fc>img{max-width:660px}
+.art figure.pair .pr{display:flex;gap:12px;width:100%;max-width:1080px}
+.art figure.pair .pr span{min-width:0}
+.art figure.pair img{display:block;width:100%;height:auto;background:var(--panel)}
+.art figcaption{max-width:660px;text-align:center}
 @media (max-width:620px){.art{font-size:19px}.art .col.first{padding-top:72px}.art .col.first p:first-child{font-size:22px}.art .h h2{font-size:30px}}
 
 /* index */

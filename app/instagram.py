@@ -109,13 +109,23 @@ async def _ping(request: web.Request) -> web.Response:
     return web.Response(text="ok")
 
 
+async def _root(request: web.Request) -> web.Response:
+    """Корень: проверка, что сервер жив; на адресе редакции (admin.…) — сразу в редакцию сайта."""
+    if request.host.split(":")[0].startswith("admin."):
+        raise web.HTTPFound("/admin/")
+    return web.Response(text="ok")
+
+
 async def start_server() -> None:
-    """Маленький веб-сервер: Instagram забирает фото по ссылке, загрузить файл напрямую API не даёт."""
+    """Маленький веб-сервер: Instagram забирает фото по ссылке, загрузить файл напрямую API не даёт.
+    На нём же работает редакция сайта (app/admin.py, /admin/)."""
     global _runner
-    app = web.Application()
+    app = web.Application()          # фото редакции идут потоком (multipart) и в этот предел не упираются
     app.router.add_get("/ig/{token}/{name}", _serve)
     app.router.add_get("/ig/ping", _ping)
-    app.router.add_get("/", _ping)
+    app.router.add_get("/", _root)
+    from app import admin         # редакция сайта (7.0) — на этом же сервере
+    admin.setup(app)
     _runner = web.AppRunner(app, access_log=None)
     await _runner.setup()
     await web.TCPSite(_runner, "0.0.0.0", PORT).start()

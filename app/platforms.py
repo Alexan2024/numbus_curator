@@ -378,5 +378,8 @@ async def _web(ig: bool):
     if q:
         extra.append([screen.btn(f"🔁 Повторить · {len(q)}", "site:retry")])
     extra.append([screen.btn("🗄 Архив", "ar:show"), screen.btn("⚙️ Настройки сайта", "site:home")])
-    extra.append([InlineKeyboardButton(text=f"🔗 {host}", url=sitepub.SITE_URL)])
+    from app import admin
+    aurl = admin.admin_url()
+    extra.append([InlineKeyboardButton(text=f"🔗 {host}", url=sitepub.SITE_URL)]
+                 + ([InlineKeyboardButton(text="🛠 Редакция", url=aurl)] if aurl and aurl.startswith("https://") else []))
     return head, foot, extra

@@ -91,6 +91,8 @@ DATA = ROOT / "data.json"
 MANIFEST = ROOT / "manifest.json"
 PENDING = ROOT / "pending"            # записи больших постов, которые ждут номера из канала
 TEMP_BASE = 9_000_000                 # временный номер записи до выхода поста: TEMP_BASE + номер поста в боте
+MAN_BASE = 200_000                    # записи, заведённые в редакции сайта (app/admin.py): номера от 200001
+_note_ids: set[int] = set()           # номера заметок, которые бот уже взял, но ещё не выложил
 CATS = ("architecture", "art", "photography", "cinema", "archive")
 ROLES = ("architect", "studio", "artist", "photographer", "director", "designer", "writer")
 
@@ -716,6 +718,9 @@ async def prepare(post) -> str | None:
     """Большой пост перед отправкой: запись и временная страница на сайте. → ссылка для подписи."""
     if wants(post) != "object" or post["format"] != "std" or not await enabled():
         return None
+    rec_id = json.loads(post["data"]).get("_site_rec")
+    if rec_id:                                  # пост по записи из редакции сайта: страница уже есть
+        return f"{SITE_URL}/o/{rec_id}/"
     pid = post["id"]
     akey = f"{pid}-{secrets.token_hex(2)}"     # адрес /a/<akey>/ не повторится, даже если базу бота начнут заново
     async with _lock:
@@ -761,6 +766,9 @@ async def finalize(pid: int, msg_id: int) -> str:
     post = await db.get_post(pid)
     if wants(post) != "object":
         return ""
+    rec_id = json.loads(post["data"]).get("_site_rec")
+    if rec_id:
+        return await _link_record(pid, int(rec_id), msg_id)
     async with _lock:
         D = await load()
         if any(o["id"] == msg_id and not o.get("tmp") for o in D["objects"]):
@@ -790,6 +798,26 @@ async def finalize(pid: int, msg_id: int) -> str:
     return url
 
 
+async def _link_record(pid: int, rec_id: int, msg_id: int) -> str:
+    """Пост по записи из редакции вышел в канале: у записи появляется ссылка на пост (новой записи не нужно)."""
+    url = f"{SITE_URL}/o/{rec_id}/"
+    async with _lock:
+        D = await load()
+        rec = next((o for o in D["objects"] if o["id"] == rec_id), None)
+        # ссылка на пост — только записям без своего поста (из Instagram и из редакции); у записи из канала
+        # номер AH- и ссылка остаются прежними
+        if rec and rec.get("tg") != msg_id and (rec.get("src") in ("ig", "man") or rec_id >= MAN_BASE):
+            rec["tg"] = msg_id
+            batch, manifest = await asyncio.to_thread(build_diff, D)
+            await asyncio.to_thread(upload, batch)
+            _save(D, manifest)
+    post = await db.get_post(pid)
+    data = json.loads(post["data"])
+    data["_site_url"] = url
+    await db.update_post(pid, data=data)
+    return url
+
+
 async def finalize_safe(bot: Bot, pid: int, msg_id: int) -> None:
     # сначала в очередь: если бот перезапустится посреди сборки, повтор по расписанию доведёт пост до сайта
     await _enqueue(pid, msg_id, SiteError("выкладывается"), quiet=True)
@@ -813,8 +841,18 @@ async def publish_note(post) -> str | None:
         return data["_site_url"]
     async with _lock:
         D = await load()
-        nid = max([n["id"] for n in D["notes"]] + [1000]) + 1
-        rec, files = await note_record(post, D, nid)
+        try:
+            from app import admin       # номера заметок и черновиков редакции сайта — заняты
+            taken = admin.reserved_note_ids()
+        except Exception:
+            taken = []
+        nid = max([n["id"] for n in D["notes"]] + taken + [1000]) + 1
+        _note_ids.add(nid)
+        try:
+            rec, files = await note_record(post, D, nid)
+        except Exception:
+            _note_ids.discard(nid)
+            raise
         D2 = json.loads(json.dumps(D))
         D2["notes"].insert(0, rec)
         batch, manifest = await asyncio.to_thread(build_diff, D2)
@@ -822,6 +860,7 @@ async def publish_note(post) -> str | None:
         if not await _live(f"/n/{nid}/"):
             raise SiteError(f"заметка залита, но {SITE_URL}/n/{nid}/ не открывается — проверь SITE_FTP_DIR")
         _save(D2, manifest)
+        _note_ids.discard(nid)
     url = f"{SITE_URL}/n/{nid}/"
     data["_site_url"] = url
     data["_site_url_en"] = f"{SITE_URL}/en/n/{nid}/"
