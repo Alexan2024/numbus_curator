@@ -86,6 +86,31 @@ def build_caption(data: dict, fmt: str = "std") -> str:
     return "\n\n".join(b for b in blocks if b)
 
 
+def signature() -> str:
+    """Подпись канала: «AH Magazine» со ссылкой на канал (config.CHANNEL_SIGNATURE / CHANNEL_URL)."""
+    from app import config
+    text, url = config.CHANNEL_SIGNATURE, config.CHANNEL_URL
+    if not text:
+        return ""
+    if not url.startswith("http"):
+        return html.escape(text, quote=False)
+    return f'<a href="{html.escape(url)}">{html.escape(text, quote=False)}</a>'
+
+
+def signature_len() -> int:
+    """Сколько видимых знаков добавит подпись вместе с отступом."""
+    sig = signature()
+    return visible_len("\n\n" + sig) if sig else 0
+
+
+def with_signature(caption: str) -> str:
+    """Подпись канала последней строкой поста."""
+    sig = signature()
+    if not sig or not caption:
+        return caption
+    return f"{caption.rstrip()}\n\n{sig}"
+
+
 def visible_len(caption: str) -> int:
     """Длина подписи без HTML-разметки — так её считает Telegram."""
     return len(html.unescape(re.sub(r"<[^>]+>", "", caption or "")))

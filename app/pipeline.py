@@ -519,7 +519,7 @@ async def ensure_text(pid: int, comment: str = "") -> object:
     elif config.WRITER_RESEARCH and found.get("verdict") != "strong" and not data.get("angle"):
         data["flags"].append("истории не нашлось — может, лучше в Instagram")
     caption = formatter.build_caption(data, "std")
-    if formatter.visible_len(caption) > config.CAPTION_LIMIT:
+    if formatter.visible_len(caption) + formatter.signature_len() > config.CAPTION_LIMIT:
         data["flags"].append("длинная подпись — уйдёт отдельным сообщением")
     await db.update_post(pid, data=data, caption=caption)
     return await db.get_post(pid)

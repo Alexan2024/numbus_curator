@@ -176,15 +176,18 @@ async def _publish(bot: Bot, pid: int, how: str, slot_key: str | None) -> bool:
     from app import sitepub
     preview = None
     site_kind = sitepub.wants(post)
+    sig_len = formatter.signature_len()   # подпись канала «AH Magazine» встаёт последней — место под неё держим
     if site_kind == "object" and post["format"] == "std":
         url = await sitepub.prepare_safe(post)
         if url and await sitepub.links_on():
             caption = sitepub.with_archive_link(
-                caption, url, formatter.visible_len(caption) <= config.CAPTION_LIMIT and bool(files))
+                caption, url, formatter.visible_len(caption) + sig_len <= config.CAPTION_LIMIT and bool(files),
+                reserve=sig_len)
     elif site_kind == "note":
         url = await sitepub.publish_note_safe(post)
         if url and await sitepub.links_on():   # без ссылок заметка выходит в канале целиком
             caption, preview = sitepub.note_announcement(post, url)
+    caption = formatter.with_signature(caption)   # только для канала: в базе, Instagram и на сайте подписи нет
 
     if preview:
         m = await bot.send_message(config.CHANNEL_ID, caption, link_preview_options=LinkPreviewOptions(

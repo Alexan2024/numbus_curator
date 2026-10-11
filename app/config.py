@@ -14,11 +14,14 @@ def _hm(raw: str) -> tuple[int, int]:
     return int(h), int(m or 0)
 
 
-VERSION = "7.0"
+VERSION = "7.1"
 
 BOT_TOKEN = _req("BOT_TOKEN")
 ADMIN_ID = int(_req("ADMIN_ID"))
 CHANNEL_ID = _req("CHANNEL_ID")  # @username или -100...
+# Подпись в конце каждого поста в канале: текст со вшитой ссылкой на канал. Пустой текст — подписи нет.
+CHANNEL_SIGNATURE = os.getenv("CHANNEL_SIGNATURE", "AH Magazine").strip()
+CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/ahmagazine").strip()
 ANTHROPIC_API_KEY = _req("ANTHROPIC_API_KEY")
 
 # ---------- модели ----------

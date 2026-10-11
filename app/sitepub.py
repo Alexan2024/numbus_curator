@@ -897,12 +897,13 @@ def iv_link(url: str) -> str:
     return f"https://t.me/iv?url={quote(url, safe='')}&rhash={IV_RHASH}"
 
 
-def with_archive_link(caption: str, url: str, inline: bool) -> str:
+def with_archive_link(caption: str, url: str, inline: bool, reserve: int = 0) -> str:
     """Тихая строчка «в архиве →» в конце подписи. Если с ней подпись перестанет влезать под фото,
-    строчку не ставим: пост не должен разваливаться на фото и отдельный текст."""
+    строчку не ставим: пост не должен разваливаться на фото и отдельный текст.
+    reserve — сколько знаков ещё добавится после (подпись канала)."""
     line = f'<a href="{html.escape(url)}">{html.escape(LINK_STD)}</a>'
     out = f"{caption.rstrip()}\n\n{line}"
-    if inline and formatter.visible_len(out) > config.CAPTION_LIMIT:
+    if inline and formatter.visible_len(out) + reserve > config.CAPTION_LIMIT:
         return caption
     return out
 
