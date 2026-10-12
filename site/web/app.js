@@ -1049,11 +1049,17 @@
       if (t0 !== null) an.startTime = t0;
     }
   }
+  // The text column beside the photos always stays put while the photos scroll. When it fits on the
+  // screen it holds at the top under the header. When it is taller than the screen, it scrolls up with
+  // the page only until its last line is in view, then holds there — nothing is ever cut off.
   function stickyCheck() {
     var el = document.getElementById('otx');
     if (!el) return;
     el.classList.remove('flow');
-    if (el.offsetHeight > window.innerHeight - 130) el.classList.add('flow');
+    el.style.top = '';
+    var topPx = parseFloat(getComputedStyle(el).top) || 0;
+    var room = window.innerHeight - 32;
+    if (topPx + el.offsetHeight > room) el.style.top = Math.round(room - el.offsetHeight) + 'px';
   }
   window.addEventListener('resize', stickyCheck);
 
