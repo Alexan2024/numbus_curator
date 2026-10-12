@@ -39,15 +39,18 @@ import ftplib
 import hashlib
 import html
 import io
+import itertools
 import json
 import logging
 import os
 import posixpath
+import queue
 import re
 import secrets
 import shutil
 import ssl
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -593,60 +596,159 @@ def _open_ftp() -> tuple[ftplib.FTP, str]:
 _NET_ERRORS = (OSError, EOFError, ftplib.error_temp, ftplib.error_reply, ftplib.error_proto)
 
 
+WORKERS = max(1, int(os.getenv("SITE_FTP_WORKERS", "5") or 5))   # соединений с хостингом сразу (7.3.1)
+
+
+def _put(ftp: ftplib.FTP, rel: str, data: bytes, made: set, lock: threading.Lock) -> None:
+    """Один файл: пишется рядом под временным именем и подменяет старый — посетитель не застанет половину файла."""
+    d = posixpath.dirname(rel)
+    if d and d not in made:
+        path = ""
+        for part in d.split("/"):
+            path = f"{path}/{part}" if path else part
+            with lock:
+                if path in made:
+                    continue
+            try:
+                ftp.mkd(path)
+            except ftplib.error_perm:
+                pass       # уже есть (или её только что сделало соседнее соединение)
+            with lock:
+                made.add(path)
+    tmp = rel + ".part"
+    ftp.storbinary("STOR " + tmp, io.BytesIO(data))
+    try:
+        ftp.rename(tmp, rel)
+    except ftplib.error_perm:
+        # сервер не переименовывает поверх файла: пишем прямо на место, живой файл не удаляем
+        ftp.storbinary("STOR " + rel, io.BytesIO(data))
+        try:
+            ftp.delete(tmp)
+        except ftplib.error_perm:
+            pass
+
+
+def _close(ftp: ftplib.FTP | None) -> None:
+    if ftp is None:
+        return
+    try:
+        ftp.quit()
+    except Exception:
+        try:
+            ftp.close()
+        except Exception:
+            pass
+
+
+def _drain(q: "queue.Queue", mode: str, made: set, lock: threading.Lock, fails: list, stop: threading.Event) -> None:
+    """Поток выкладки: своё соединение, берёт файлы из общей очереди, пока они есть. Не вышло даже войти
+    (хостинг не даёт столько соединений) — файл возвращается в очередь, поток тихо выходит: его работу доделают
+    остальные. Связь оборвалась посреди — вход заново, до четырёх раз."""
+    ftp, reconnects, first = None, 0, True
+    try:
+        while not stop.is_set():
+            try:
+                item = q.get_nowait()
+            except queue.Empty:
+                return
+            while True:
+                try:
+                    if ftp is None:
+                        ftp = _connect(mode)
+                        first = False
+                    _put(ftp, item[0], item[1], made, lock)
+                    break
+                except _NET_ERRORS + (ftplib.error_perm,) as exc:
+                    if first:                      # лишнее соединение хостинг не пустил — не беда
+                        q.put(item)
+                        log.info("FTP: дополнительное соединение не открылось (%r)", exc)
+                        return
+                    if isinstance(exc, ftplib.error_perm):
+                        raise
+                    reconnects += 1
+                    if reconnects > 4:
+                        raise
+                    log.warning("FTP: связь оборвалась на %s (%r) — вхожу заново", item[0], exc)
+                    _close(ftp)
+                    ftp = None
+                    time.sleep(3 * reconnects)
+    except Exception as exc:
+        fails.append(exc)
+        stop.set()
+    finally:
+        _close(ftp)
+
+
+def _alive(ftp: ftplib.FTP) -> tuple[ftplib.FTP, str | None]:
+    """Главное соединение после долгой параллельной выкладки могло уснуть — проверить и, если что, войти заново."""
+    try:
+        ftp.voidcmd("NOOP")
+        return ftp, None
+    except Exception:
+        _close(ftp)
+        return _open_ftp()
+
+
 def upload(files: list[tuple[str, bytes]], remove: list[str] | tuple = ()) -> str:
-    """Файлы на хостинг. Каждый пишется рядом под временным именем и подменяет старый, чтобы посетитель
-    не застал половину файла. Если связь оборвётся посреди большой выкладки, бот входит заново и продолжает
-    с того же файла. remove — страницы, которых в новой сборке нет (убранные записи): они удаляются после
-    выкладки. → режим соединения (tls / tls-noverify / plain)."""
+    """Файлы на хостинг. Порядок по группам (_order): фото, код, данные, страницы, в самом конце список файлов
+    (manifest) — следующая группа начинается, когда целиком легла предыдущая, так страницы не ссылаются на код,
+    которого ещё нет. Внутри группы файлы уходят сразу по WORKERS соединениям (7.3.1): по одному на каждый файл
+    уходило 2–3 секунды ожидания сервера, полная пересборка сайта шла минут 45. Если хостинг столько соединений
+    не даёт, выкладка идёт по тем, что открылись, в крайнем случае по одному, как раньше. Если связь оборвётся,
+    бот входит заново и продолжает. remove — страницы, которых в новой сборке нет (убранные записи): они
+    удаляются после выкладки. → режим соединения (tls / tls-noverify / plain)."""
     remove = [r for r in remove if r.endswith("/index.html")]     # удаляем только страницы, и никогда — главную
     if not files and not remove:
         return "—"
     ftp, mode = _open_ftp()
     made: set[str] = set()
+    lock = threading.Lock()
 
-    def put(rel: str, data: bytes) -> None:
-        d = posixpath.dirname(rel)
-        if d and d not in made:
-            path = ""
-            for part in d.split("/"):
-                path = f"{path}/{part}" if path else part
-                if path in made:
-                    continue
-                try:
-                    ftp.mkd(path)
-                except ftplib.error_perm:
-                    pass       # уже есть
-                made.add(path)
-        tmp = rel + ".part"
-        ftp.storbinary("STOR " + tmp, io.BytesIO(data))
-        try:
-            ftp.rename(tmp, rel)
-        except ftplib.error_perm:
-            # сервер не переименовывает поверх файла: пишем прямо на место, живой файл не удаляем
-            ftp.storbinary("STOR " + rel, io.BytesIO(data))
-            try:
-                ftp.delete(tmp)
-            except ftplib.error_perm:
-                pass
-
-    try:
+    def one_by_one(items: list) -> None:
+        nonlocal ftp, mode
         i, reconnects = 0, 0
-        while i < len(files):
-            rel, data = files[i]
+        while i < len(items):
+            rel, data = items[i]
             try:
-                put(rel, data)
+                _put(ftp, rel, data, made, lock)
                 i += 1
             except _NET_ERRORS as exc:
                 reconnects += 1
                 if reconnects > 3:
                     raise
                 log.warning("FTP: связь оборвалась на %s (%r) — вхожу заново", rel, exc)
-                try:
-                    ftp.close()
-                except Exception:
-                    pass
+                _close(ftp)
                 time.sleep(3 * reconnects)
                 ftp, mode = _open_ftp()
+
+    try:
+        ordered = sorted(files, key=lambda f: _order(f[0]))        # sorted устойчив: внутри группы порядок тот же
+        for _, grp in itertools.groupby(ordered, key=lambda f: _order(f[0])):
+            items = list(grp)
+            if WORKERS > 1 and len(items) >= 6:
+                q: queue.Queue = queue.Queue()
+                for it in items:
+                    q.put(it)
+                fails: list = []
+                stop = threading.Event()
+                threads = [threading.Thread(target=_drain, args=(q, mode, made, lock, fails, stop), daemon=True)
+                           for _ in range(min(WORKERS, len(items) // 3 + 1))]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+                if fails:
+                    raise fails[0]
+                rest = []
+                while not q.empty():
+                    rest.append(q.get_nowait())
+                ftp, _m = _alive(ftp)
+                mode = _m or mode
+                if rest:                     # ни одно дополнительное соединение не открылось — по одному
+                    log.info("FTP: %s файлов доливаю по одному соединению", len(rest))
+                    one_by_one(rest)
+            else:
+                one_by_one(items)
         if remove:
             try:
                 dirs = set()
@@ -664,10 +766,7 @@ def upload(files: list[tuple[str, bytes]], remove: list[str] | tuple = ()) -> st
             except _NET_ERRORS as exc:
                 log.warning("FTP: старые страницы не удалились (%r) — сайт от этого не ломается", exc)
     finally:
-        try:
-            ftp.quit()
-        except Exception:
-            ftp.close()
+        _close(ftp)
     return mode
 
 
