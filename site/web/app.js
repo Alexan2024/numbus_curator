@@ -420,7 +420,7 @@
         '<p>' + t('tagline') + '</p>' +
         '<nav aria-label="' + t('links') + '"><a href="' + u({ name: 'archive' }) + '">' + t('archive') + '</a><a href="' + u({ name: 'notes' }) + '">' + t('notes') + '</a><a href="' + u({ name: 'index' }) + '">' + t('index') + '</a><a href="' + u({ name: 'about' }) + '">' + t('about') + '</a><a href="' + u({ name: 'partners' }) + '">' + t('partners') + '</a>' +
         '<a href="' + TG + '" target="_blank" rel="noopener">Telegram</a><a href="' + IG + '" target="_blank" rel="noopener">Instagram</a></nav>' +
-        '<small>© AH Magazine, 2025–' + YEAR + '</small></footer>';
+        '<small>© AH Magazine, 2025–' + YEAR + ' · Developed by <a href="https://numbstudios.com/" target="_blank" rel="noopener">NUMB</a></small></footer>';
     }
     function menu(r) {
       var other = L === 'ru' ? 'en' : 'ru';
