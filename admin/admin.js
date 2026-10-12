@@ -231,7 +231,8 @@
     [/^#\/n\/(\d+)$/, (m) => viewNote(+m[1])],
     [/^#\/home$/, () => viewHome()],
     [/^#\/pages$/, () => viewPages()],
-    [/^#\/index$/, () => viewIndex()]
+    [/^#\/index$/, () => viewIndex()],
+    [/^#\/bios$/, () => viewBios()]
   ];
   function route() {
     if (!S.D) return;
@@ -874,8 +875,9 @@
   function viewIndex() {
     setNav('index');
     const D = S.D;
-    main().innerHTML = '<section class="pg narrow"><div class="pg-h"><div><h1>Указатель</h1><p class="sub">Имена и страны, как они написаны на сайте. Правка меняет написание во всех записях сразу.</p></div></div>' +
-      '<div class="tools"><div class="seg" id="ix-tab"><button data-v="people"' + (IX.tab === 'people' ? ' class="on"' : '') + '>Имена · ' + Object.keys(D.people).length + '</button><button data-v="countries"' + (IX.tab === 'countries' ? ' class="on"' : '') + '>Страны · ' + Object.keys(D.countries).length + '</button></div>' +
+    main().innerHTML = '<section class="pg narrow"><div class="pg-h"><div><h1>Указатель</h1><p class="sub">Имена и страны, как они написаны на сайте. Правка меняет написание во всех записях сразу. Кто есть кто — во вкладке «Плашки».</p></div></div>' +
+      '<div class="tools"><div class="seg" id="ix-tab"><button data-v="people"' + (IX.tab === 'people' ? ' class="on"' : '') + '>Имена · ' + Object.keys(D.people).length + '</button><button data-v="countries"' + (IX.tab === 'countries' ? ' class="on"' : '') + '>Страны · ' + Object.keys(D.countries).length + '</button>' +
+      '<button data-v="bios">Плашки · ' + Object.keys(D.people).filter((k) => D.people[k].bio).length + ' на сайте</button></div>' +
       '<input class="inp search" id="ix-q" type="search" placeholder="Найти" value="' + esc(IX.q) + '" autocomplete="off"></div><div class="ix" id="ix-list"></div></section>';
     const draw = () => {
       const q = norm(IX.q);
@@ -891,7 +893,12 @@
           '<span class="mu sm">' + n + '</span><button class="btn sm" data-save hidden>Сохранить</button></div>';
       }).join('') || '<p class="empty">Ничего не нашлось.</p>';
     };
-    $('#ix-tab').onclick = (e) => { const b = e.target.closest('button'); if (!b) return; IX.tab = b.dataset.v; viewIndex(); };
+    $('#ix-tab').onclick = (e) => {
+      const b = e.target.closest('button');
+      if (!b) return;
+      if (b.dataset.v === 'bios') { location.hash = '#/bios'; return; }
+      IX.tab = b.dataset.v; viewIndex();
+    };
     $('#ix-q').addEventListener('input', debounce((e) => { IX.q = e.target.value; draw(); }, 150));
     $('#ix-list').addEventListener('input', (e) => { const row = e.target.closest('.ix-row'); if (row) $('[data-save]', row).hidden = false; });
     $('#ix-list').addEventListener('change', (e) => { const row = e.target.closest('.ix-row'); if (row) $('[data-save]', row).hidden = false; });
@@ -912,6 +919,242 @@
       b.disabled = false;
     });
     draw();
+  }
+
+  // ======================= плашки указателя (7.3) =======================
+  // Кто это — у каждого имени. Черновики собирает бот (app/bios.py), на сайт идёт только одобренное.
+
+  const BIO = { tab: 'draft', q: '', n: 40, st: {}, job: {}, todo: 0, est: 0.035, cap: 12 };
+  const BIO_TABS = [['draft', 'Ждут решения'], ['live', 'На сайте'], ['none', 'Не нашлось'], ['skip', 'Отклонены'], ['empty', 'Без плашки']];
+
+  function bioKind(k) {
+    const p = S.D.people[k], x = BIO.st[k] || {};
+    if (x.st === 'draft') return 'draft';
+    if (p.bio) return 'live';
+    if (x.st === 'none' || x.st === 'err') return 'none';
+    if (x.st === 'skip') return 'skip';
+    return 'empty';
+  }
+  function bioUsd(v) { return '$' + (v < 10 ? v.toFixed(2) : Math.round(v)); }
+
+  async function viewBios() {
+    setNav('index');
+    main().innerHTML = '<section class="pg narrow"><div class="pg-h"><div><p class="crumbs"><a href="#/index">Указатель</a></p><h1>Плашки</h1>' +
+      '<p class="sub">Кто это — одно-два предложения у каждого имени: на его странице и под записью архива. Черновики бот собирает по Википедии и сайтам авторов, на сайт они попадают только после «Одобрить». Если надёжного источника нет, плашка остаётся пустой.</p></div></div>' +
+      '<div class="bio-job" id="bio-job"></div><div class="tools"><div class="seg" id="bio-tab"></div>' +
+      '<input class="inp search" id="bio-q" type="search" placeholder="Найти имя" value="' + esc(BIO.q) + '" autocomplete="off"></div>' +
+      '<div class="bios" id="bio-list"><p class="empty">Загружаю…</p></div></section>';
+    let dirty = new Set(), timer = null, fresh = false;
+    guard(() => dirty.size > 0);
+    S.cleanup = () => clearTimeout(timer);
+
+    async function fetchState() {
+      const r = await api('bio/list');
+      BIO.st = r.st || {}; BIO.job = r.job || {}; BIO.todo = r.todo || 0; BIO.est = r.est || BIO.est; BIO.cap = r.cap || BIO.cap;
+    }
+    function counts() {
+      const c = {};
+      Object.keys(S.D.people).forEach((k) => { const t = bioKind(k); c[t] = (c[t] || 0) + 1; });
+      return c;
+    }
+    function drawJob() {
+      const j = BIO.job, el = $('#bio-job');
+      if (!el) return;
+      if (j.running) {
+        el.innerHTML = '<div class="note-bar bio-run"><span><b>Собираю черновики</b> · ' + (j.done || 0) + ' из ' + (j.total || 0) +
+          ' · готово ' + (j.made || 0) + (j.none ? ' · не нашлось ' + j.none : '') + (j.err ? ' · сбоев ' + j.err : '') +
+          (j.label !== 'auto' ? ' · ' + bioUsd(j.cost || 0) + ' из ' + bioUsd(j.cap || BIO.cap) : '') + '</span>' +
+          (j.label !== 'auto' ? '<button class="btn sm" data-b="stop">Остановить</button>' : '') + '</div>';
+        return;
+      }
+      let last = '';
+      if (j.finished && j.label && j.label !== 'auto') {
+        last = '<p class="mu sm">Прошлый сбор ' + esc(ftime(j.finished)) + ': черновиков ' + (j.made || 0) + ', не нашлось ' + (j.none || 0) +
+          ', потрачено ' + bioUsd(j.cost || 0) + (j.stopped ? ' (' + esc(j.stopped) + ')' : '') + (j.error ? ' · <span class="err-t">' + esc(j.error) + '</span>' : '') + '</p>';
+      }
+      const est = BIO.todo * BIO.est;
+      el.innerHTML = (BIO.todo ? '<div class="note-bar bio-run"><span>Без плашки и без черновика: <b>' + BIO.todo + '</b> ' + plural(BIO.todo, ['имя', 'имени', 'имён']) +
+        ' · примерно ' + bioUsd(est) + '</span><button class="btn sm pri" data-b="all">Собрать черновики</button></div>' : '') + last;
+    }
+    function drawTabs() {
+      const c = counts();
+      $('#bio-tab').innerHTML = BIO_TABS.map((t) => '<button data-v="' + t[0] + '"' + (BIO.tab === t[0] ? ' class="on"' : '') + '>' + t[1] + ' · ' + (c[t[0]] || 0) + '</button>').join('');
+    }
+    function cardVals(k) {
+      const p = S.D.people[k], x = BIO.st[k] || {};
+      const d = x.st === 'draft' && x.d ? x.d : p;
+      return { bio: d.bio || { ru: '', en: '' }, city: d.city || { ru: '', en: '' }, fd: d.fd || '', web: d.web || '', life: (x.st === 'draft' && x.d && x.d.life) || '' };
+    }
+    function card(k) {
+      const p = S.D.people[k], x = BIO.st[k] || {}, kind = bioKind(k), v = cardVals(k);
+      const roles = (p.roles || []).map((r) => ROLE[r] || r).join(', ');
+      const n = (p.objs || []).length;
+      const studio = (p.roles || []).indexOf('studio') >= 0 || v.fd;
+      const edit = kind === 'draft' || kind === 'live' || x.open;
+      let h = '<article class="bio" data-k="' + esc(k) + '"><header class="bio-h"><div><a class="bio-n" href="' + esc(siteUrl('/p/' + k + '/')) + '" target="_blank" rel="noopener">' + esc(p.ru) + '</a>' +
+        (p.en && p.en !== p.ru ? ' <span class="mu">' + esc(p.en) + '</span>' : '') + '<p class="mu sm">' + esc([roles, p.life || '', n + ' ' + plural(n, ['запись', 'записи', 'записей'])].filter(Boolean).join(' · ')) + '</p></div>' +
+        '<span class="bd">' + { draft: 'черновик', live: 'на сайте', none: x.st === 'err' ? 'сбой' : 'не нашлось', skip: 'отклонён', empty: 'нет плашки' }[kind] + '</span></header>';
+      if (edit) {
+        h += '<div class="fl"><span class="fl-l">Плашка <em>одно-два предложения: кто это и одна точная деталь</em></span>' +
+          '<div class="pair"><textarea class="inp" rows="4" data-f="bio-ru" placeholder="По-русски">' + esc(v.bio.ru || '') + '</textarea>' +
+          '<textarea class="inp" rows="4" data-f="bio-en" placeholder="In English">' + esc(v.bio.en || '') + '</textarea></div></div>' +
+          '<div class="bio-f"><div class="fl"><span class="fl-l">Где работает</span><div class="pair"><input class="inp" data-f="city-ru" value="' + esc(v.city.ru || '') + '" placeholder="Город, Страна">' +
+          '<input class="inp" data-f="city-en" value="' + esc(v.city.en || '') + '" placeholder="City, Country"></div></div>' +
+          '<div class="fl"><span class="fl-l">Сайт</span><input class="inp" data-f="web" value="' + esc(v.web) + '" placeholder="https://"></div>' +
+          (studio ? '<div class="fl"><span class="fl-l">Основано</span><input class="inp" data-f="fd" value="' + esc(v.fd) + '" placeholder="2009" inputmode="numeric"></div>' : '') +
+          (v.life ? '<div class="fl"><span class="fl-l">Годы жизни</span><input class="inp" data-f="life" value="' + esc(v.life) + '"></div>' : '') + '</div>';
+      }
+      if (x.note && kind !== 'live') h += '<p class="bio-note">' + esc(x.note) + '</p>';
+      if ((x.src || []).length && kind !== 'empty') {
+        h += '<p class="bio-src mu sm">Источники: ' + x.src.map((u) => '<a href="' + esc(u) + '" target="_blank" rel="noopener">' + esc(u.replace(/^https?:\/\/(www\.)?/, '').replace(/\/$/, '').slice(0, 60)) + '</a>').join(' · ') + '</p>';
+      }
+      const busy = BIO.job.running;
+      const b = [];
+      if (kind === 'draft') b.push('<button class="btn sm pri" data-b="ok">Одобрить</button>', '<button class="btn sm" data-b="tr">Перевести на английский</button>', '<button class="btn sm ghost" data-b="again"' + (busy ? ' disabled' : '') + '>Собрать заново</button>', '<button class="btn sm ghost" data-b="skip">Отклонить</button>');
+      else if (kind === 'live') b.push('<button class="btn sm pri" data-b="ok" hidden>Сохранить</button>', '<button class="btn sm" data-b="tr">Перевести на английский</button>', '<button class="btn sm ghost" data-b="off">Убрать с сайта</button>');
+      else if (edit) b.push('<button class="btn sm pri" data-b="ok">Опубликовать</button>', '<button class="btn sm" data-b="tr">Перевести на английский</button>', '<button class="btn sm ghost" data-b="close">Отмена</button>');
+      else {
+        b.push('<button class="btn sm" data-b="again"' + (busy ? ' disabled' : '') + '>' + (kind === 'empty' ? 'Собрать черновик' : 'Попробовать ещё') + '</button>', '<button class="btn sm ghost" data-b="write">Написать самому</button>');
+        if (kind === 'skip') b.push('<button class="btn sm ghost" data-b="unskip">Вернуть</button>');
+        else b.push('<button class="btn sm ghost" data-b="skip">Не нужна</button>');
+      }
+      return h + '<div class="acts">' + b.join('') + '</div></article>';
+    }
+    function drawList() {
+      const q = norm(BIO.q);
+      const keys = Object.keys(S.D.people).filter((k) => bioKind(k) === BIO.tab && (!q || norm(S.D.people[k].ru + ' ' + S.D.people[k].en + ' ' + k).indexOf(q) >= 0))
+        .sort((a, b) => BIO.tab === 'draft' ? String((BIO.st[b] || {}).at || '').localeCompare(String((BIO.st[a] || {}).at || '')) || a.localeCompare(b)
+          : ((S.D.people[b].objs || []).length - (S.D.people[a].objs || []).length) || (S.D.people[a].ru || '').localeCompare(S.D.people[b].ru || '', 'ru'));
+      const shown = keys.slice(0, BIO.n);
+      $('#bio-list').innerHTML = shown.map(card).join('') +
+        (keys.length > shown.length ? '<div class="more-w"><button class="btn" data-b="more">Показать ещё · ' + (keys.length - shown.length) + '</button></div>' : '') ||
+        '<p class="empty">' + ({ draft: 'Черновиков нет.' + (BIO.todo ? ' Собери их кнопкой выше.' : ''), live: 'На сайте пока нет ни одной плашки.', none: 'Таких нет.', skip: 'Отклонённых нет.', empty: 'У всех имён есть плашка или черновик.' }[BIO.tab]) + '</p>';
+      dirty = new Set();
+      fresh = false;
+    }
+    function drawAll() { drawJob(); drawTabs(); drawList(); }
+    async function refresh(keepScroll) {
+      const y = window.scrollY;
+      await Promise.all([load(), fetchState()]);
+      drawAll();
+      if (keepScroll) window.scrollTo(0, y);
+    }
+    async function tick() {
+      clearTimeout(timer);
+      try {
+        const was = BIO.job.running;
+        await fetchState();
+        drawJob(); drawTabs();
+        if (!dirty.size) drawList(); else if (!fresh) { fresh = true; toast('Пришли новые черновики — сохрани правки, и список обновится'); }
+        if (was && !BIO.job.running) {
+          if (BIO.follow && bioKind(BIO.follow) === 'draft' && !dirty.size) BIO.tab = 'draft';
+          BIO.follow = null;
+          toast('Сбор черновиков закончен', 'ok');
+          if (!dirty.size) await refresh(true);
+        }
+      } catch (e) { /* сеть моргнула */ }
+      if (BIO.job.running) timer = setTimeout(tick, 3000);
+    }
+    function vals(el) {
+      const f = (n) => { const i = $('[data-f="' + n + '"]', el); return i ? i.value.trim() : undefined; };
+      const out = { bio: { ru: f('bio-ru') || '', en: f('bio-en') || '' }, city: { ru: f('city-ru') || '', en: f('city-en') || '' }, web: f('web') || '' };
+      if (f('fd') !== undefined) out.fd = f('fd');
+      if (f('life') !== undefined) out.life = f('life');
+      if (!out.city.ru && !out.city.en) out.city = null;
+      return out;
+    }
+
+    $('#bio-q').addEventListener('input', debounce((e) => { BIO.q = e.target.value; BIO.n = 40; drawList(); }, 150));
+    $('#bio-tab').onclick = (e) => {
+      const b = e.target.closest('button');
+      if (!b || b.dataset.v === BIO.tab) return;
+      if (dirty.size && !confirm('Есть несохранённые правки. Переключиться без сохранения?')) return;
+      BIO.tab = b.dataset.v; BIO.n = 40; drawTabs(); drawList();
+    };
+    $('#bio-list').addEventListener('input', (e) => {
+      const el = e.target.closest('.bio');
+      if (!el) return;
+      dirty.add(el.dataset.k);
+      el.classList.add('dirty');
+      const save = $('[data-b="ok"][hidden]', el);
+      if (save) save.hidden = false;
+    });
+    $('.pg', main()).addEventListener('click', async (e) => {
+      const btn = e.target.closest('[data-b]');
+      if (!btn) return;
+      const act = btn.dataset.b, el = btn.closest('.bio'), k = el && el.dataset.k;
+      if (act === 'more') { BIO.n += 40; drawList(); return; }
+      if (act === 'stop') { try { await api('bio/stop', { body: {} }); toast('Остановлю после текущих имён'); } catch (err) { fail(err); } return; }
+      if (act === 'all') {
+        const est = BIO.todo * BIO.est;
+        if (!(await confirmBox('Собрать черновики?', 'Имён без плашки: <b>' + BIO.todo + '</b>. Бот поищет каждого в Википедии, а кого там нет — в сети, и напишет черновики. Примерно <b>' + bioUsd(est) + '</b>, потолок — <b>' + bioUsd(BIO.cap) + '</b>: дойдёт до него — остановится. Займёт около ' + Math.max(5, Math.round(BIO.todo * 12 / 3 / 60)) + ' мин; можно закрыть страницу, бот напишет в Telegram, когда закончит.', 'Собрать'))) return;
+        try { await api('bio/run', { body: { all: true } }); BIO.tab = 'draft'; await fetchState(); drawAll(); tick(); } catch (err) { fail(err); }
+        return;
+      }
+      if (!k) return;
+      const p = S.D.people[k];
+      btn.disabled = true;
+      try {
+        if (act === 'ok') {
+          const v = vals(el);
+          if (!v.bio.ru) throw new Error('Плашка пустая');
+          if (!v.bio.en) throw new Error('Нужен английский текст — нажми «Перевести на английский»');
+          await api('bio/approve', { body: Object.assign({ id: k }, v) });
+          dirty.delete(k);
+          kick(); await refresh(true);
+          toast('Плашка «' + p.ru + '» на сайте через минуту-две', 'ok');
+        } else if (act === 'tr') {
+          const ru = $('[data-f="bio-ru"]', el).value.trim(), city = $('[data-f="city-ru"]', el).value.trim();
+          if (!ru) throw new Error('Сначала русский текст');
+          toast('Перевожу…');
+          const out = (await api('translate', { body: { items: [ru, city], ctx: 'bio' } })).items;
+          $('[data-f="bio-en"]', el).value = out[0] || '';
+          if (city) $('[data-f="city-en"]', el).value = out[1] || '';
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          toast('Готово — проверь английский', 'ok');
+        } else if (act === 'again') {
+          if (dirty.has(k) && !confirm('Правки этой плашки пропадут. Собрать заново?')) { btn.disabled = false; return; }
+          await api('bio/run', { body: { ids: [k] } });
+          BIO.follow = k;
+          toast('Собираю черновик «' + p.ru + '» — меньше минуты');
+          dirty.delete(k);
+          await fetchState(); drawJob(); tick();
+        } else if (act === 'skip' || act === 'unskip') {
+          await api('bio/skip', { body: { id: k, undo: act === 'unskip' } });
+          dirty.delete(k);
+          await fetchState(); drawTabs(); el.remove();
+          toast(act === 'skip' ? 'Отклонено: сам бот это имя больше не тронет' : 'Вернул');
+        } else if (act === 'off') {
+          if (!(await confirmBox('Убрать плашку?', 'Текст пропадёт со страницы «' + esc(p.ru) + '» и из записей архива. Бот сам её заново не соберёт.', 'Убрать', true))) { btn.disabled = false; return; }
+          await api('person', { body: { id: k, ru: p.ru, en: p.en, roles: p.roles, bio: null, city: null, fd: '', web: '' } });
+          dirty.delete(k);
+          kick(); await refresh(true);
+          toast('Плашка убрана — на сайте через минуту-две', 'ok');
+        } else if (act === 'write') {
+          (BIO.st[k] = BIO.st[k] || {}).open = true;
+          el.outerHTML = card(k);
+          const ta = $('.bio[data-k="' + k + '"] [data-f="bio-ru"]');
+          if (ta) ta.focus();
+          return;
+        } else if (act === 'close') {
+          if (BIO.st[k]) delete BIO.st[k].open;
+          dirty.delete(k);
+          el.outerHTML = card(k);
+          return;
+        }
+      } catch (err) { fail(err); }
+      btn.disabled = false;
+    });
+
+    try { await fetchState(); } catch (err) { fail(err); }
+    if (S.lastHash !== '#/bios') return;
+    if (BIO.tab === 'draft' && !Object.keys(S.D.people).some((k) => bioKind(k) === 'draft')) BIO.tab = BIO.todo ? 'empty' : 'live';
+    drawAll();
+    if (BIO.job.running) tick();
+  }
+  function plural(n, f) {
+    const a = Math.abs(n) % 100, b = a % 10;
+    return f[a > 10 && a < 20 ? 2 : b > 1 && b < 5 ? 1 : b === 1 ? 0 : 2];
   }
 
   // ======================= старт =======================

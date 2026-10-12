@@ -156,6 +156,9 @@ h1,h2,h3{font-weight:400;text-wrap:balance}
 .ph-head{padding:96px 0 64px;display:flex;flex-direction:column;align-items:center;gap:16px;text-align:center}
 .ph-head h1{font:400 clamp(44px,5vw,64px)/1 var(--serif)}
 .ph-head p{font-size:14px;color:var(--muted);max-width:560px}
+.ph-head .ph-bio{max-width:640px;margin-top:6px;font:400 clamp(19px,1.7vw,22px)/1.5 var(--serif);color:#2E2E2C;text-wrap:pretty}
+.ph-web{font-size:13px;color:var(--muted);border-bottom:1px solid var(--rule);padding:6px 0 1px;overflow-wrap:anywhere}
+.ph-web:hover{color:var(--ink);border-color:var(--ink)}
 @media (max-width:620px){.ph-head{padding:64px 0 44px}}
 
 /* archive */
@@ -234,6 +237,14 @@ h1,h2,h3{font-weight:400;text-wrap:balance}
 .cr dt{color:var(--muted)}
 .cr dd{overflow-wrap:anywhere}
 .cr a{border-bottom:1px solid var(--rule)}
+.whos{display:flex;flex-direction:column;gap:20px}
+.who{display:flex;flex-direction:column;align-items:flex-start;gap:7px;border-top:1px solid var(--rule);padding-top:18px}
+.who .k{color:var(--muted)}
+.who .nm{font:400 22px/1.2 var(--serif)}
+.who .nm:hover{color:var(--muted)}
+.who p{font-size:14px;line-height:1.55;color:#474745;max-width:460px;text-wrap:pretty}
+.who .more{display:inline-flex;align-items:center;gap:12px;padding:6px 0;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+.who .more:hover{color:var(--ink)}
 .obj-meta{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--muted)}
 .obj-links{display:flex;flex-wrap:wrap;gap:0 22px;font-size:13px}
 .obj-links a{padding:10px 0;border-bottom:1px solid var(--ink)}

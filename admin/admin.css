@@ -363,3 +363,22 @@ button.choice:hover{border-color:var(--ink)}
 .ix-row .mu{text-align:right}
 .ix-row:has(> :nth-child(4):last-child){grid-template-columns:minmax(0,1fr) minmax(0,1fr) 34px auto}
 @media (max-width:760px){.ix-row{grid-template-columns:1fr 1fr}.ix-row .mu{text-align:left}}
+
+/* ---------- плашки указателя (7.3) ---------- */
+.bio-job{margin-bottom:18px}
+.bio-job .mu{margin:10px 0 0}
+.bio-run{display:flex;justify-content:space-between;align-items:center;gap:10px 18px;flex-wrap:wrap}
+.bios{display:flex;flex-direction:column;border-top:1px solid var(--line)}
+.bio{display:flex;flex-direction:column;gap:14px;padding:22px 0 24px;border-bottom:1px solid var(--line)}
+.bio.dirty{box-shadow:inset 3px 0 0 var(--work);padding-left:14px}
+.bio-h{display:flex;justify-content:space-between;align-items:flex-start;gap:14px}
+.bio-n{font:400 22px/1.2 var(--serif)}
+.bio-n:hover{color:var(--muted)}
+.bio-h p{margin-top:3px}
+.bio-f{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr);gap:12px}
+.bio-f .fl:first-child{grid-column:1/-1}
+.bio-note{font-size:13px;line-height:1.5;color:var(--muted);max-width:720px}
+.bio-src{overflow-wrap:anywhere}
+.bio-src a{border-bottom:1px solid var(--rule)}
+.bio-src a:hover{color:var(--ink)}
+@media (max-width:760px){.bio-f{grid-template-columns:1fr}.bio .pair{grid-template-columns:1fr}}

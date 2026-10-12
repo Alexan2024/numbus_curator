@@ -37,7 +37,8 @@
       nfT: 'Такой страницы нет', nfP: 'Возможно, ссылка устарела или объект ещё не добавлен.',
       sPh: 'Название, имя, город, год', sTry: 'Например', sObjs: 'Объекты', sPeople: 'Имена', sNotes: 'Notes',
       sNone: 'Ничего не найдено по запросу', sWait: 'Загружаю архив…', person: 'Имя в указателе', mentioned: 'Упоминается в Notes',
-      tgShort: 'Telegram', igShort: 'Instagram', sections: 'Разделы', links: 'Ссылки', crumbs: 'Навигация'
+      tgShort: 'Telegram', igShort: 'Instagram', sections: 'Разделы', links: 'Ссылки', crumbs: 'Навигация',
+      est: 'осн.', allBy: 'Все объекты', author: 'Автор', authors: 'Авторы'
     },
     en: {
       archive: 'Archive', notes: 'Notes', index: 'Index', about: 'About', partners: 'Partnerships',
@@ -64,7 +65,8 @@
       nfT: 'Page not found', nfP: 'The link may be out of date, or the entry has not been added yet.',
       sPh: 'Title, name, city, year', sTry: 'Try', sObjs: 'Entries', sPeople: 'Names', sNotes: 'Notes',
       sNone: 'Nothing found for', sWait: 'Loading the archive…', person: 'Name in the index', mentioned: 'Mentioned in Notes',
-      tgShort: 'Telegram', igShort: 'Instagram', sections: 'Sections', links: 'Links', crumbs: 'Breadcrumbs'
+      tgShort: 'Telegram', igShort: 'Instagram', sections: 'Sections', links: 'Links', crumbs: 'Breadcrumbs',
+      est: 'est.', allBy: 'All entries', author: 'Author', authors: 'Authors'
     }
   };
 
@@ -347,6 +349,23 @@
     }
     // a credit is [role, name, url] or [role, name, url, English name]
     function creditName(c) { return L === 'en' && c[3] ? c[3] : c[1]; }
+    // the short note on who a name is (7.3): roles, years or founding year, city
+    function personFacts(p) {
+      var roles = p.roles.map(function (r) { return t('role')[r]; }).filter(Boolean).join(', ');
+      return [roles, p.life || (p.fd ? t('est') + ' ' + p.fd : ''), p.city ? tr(p.city) : ''].filter(Boolean);
+    }
+    function webHost(url) { return String(url).replace(/^https?:\/\/(www\.)?/i, '').replace(/\/$/, ''); }
+    function safeUrl(url) { return /^https?:\/\/[^\s"<>]+$/i.test(url || '') ? url : ''; }
+    function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
+    // under an entry: who made it, with a link to the name's page
+    function whoCard(id) {
+      var p = PEOPLE[id], n = p.objs.filter(function (x) { return BY[x] && !BY[x].tmp; }).length;
+      var facts = personFacts(p);
+      return '<div class="who"><span class="k">' + esc(cap(facts.join(' · '))) + '</span>' +
+        '<a class="nm" href="' + up(id) + '">' + esc(tr(p)) + '</a>' +
+        '<p>' + esc(tr(p.bio)) + '</p>' +
+        (n > 1 ? '<a class="more" href="' + up(id) + '">' + t('allBy') + ' · ' + n + arrow() + '</a>' : '') + '</div>';
+    }
 
     // ---------- routing ----------
     function parseQuery(search) {
@@ -607,6 +626,8 @@
           return '<dt>' + (t('cr')[c[0]] || t('cr').other) + '</dt><dd>' + v + '</dd>';
         }).join('') + '</dl>';
       }
+      var who = o.p.filter(function (x) { return PEOPLE[x.id] && PEOPLE[x.id].bio; }).slice(0, 3);
+      if (who.length) h += '<section class="whos" aria-label="' + t(who.length > 1 ? 'authors' : 'author') + '">' + who.map(function (x) { return whoCard(x.id); }).join('') + '</section>';
       h += '<div class="obj-meta"><span>' + (o.tmp || !tgId ? '' : 'AH-' + tgId + ' · ') + t('since') + ' ' + fdate(o.d) + '</span>' +
         (o.co.length ? '<span>' + o.co.map(function (c) { return '<a href="' + ua({ co: c }) + '" style="border-bottom:1px solid var(--rule)">' + esc(tr(COUNTRIES[c])) + '</a>'; }).join(', ') + (o.per ? ' · <a href="' + ua({ per: o.per }) + '" style="border-bottom:1px solid var(--rule)">' + perLabel(o.per) + '</a>' : '') + '</span>' : '') + '</div>';
       if (tgId) h += '<div class="obj-links"><a href="' + TG + '/' + tgId + '" target="_blank" rel="noopener">' + t('tgPost') + ' ↗</a></div>';
@@ -714,9 +735,11 @@
 
     function vPerson(id) {
       var p = PEOPLE[id], items = p.objs.map(function (x) { return BY[x]; }).filter(function (o) { return o && !o.tmp; });
-      var roles = p.roles.map(function (r) { return t('role')[r]; }).filter(Boolean).join(', ');
-      var sub = [roles, p.life || '', count(items.length)].filter(Boolean).join(' · ');
-      var h = '<div class="frame"><section class="ph-head"><span class="k">' + t('person') + '</span><h1>' + esc(tr(p)) + '</h1><p>' + esc(sub) + '</p></section>';
+      var sub = personFacts(p).concat([count(items.length)]).join(' · ');
+      var web = safeUrl(p.web);
+      var h = '<div class="frame"><section class="ph-head"><span class="k">' + t('person') + '</span><h1>' + esc(tr(p)) + '</h1><p>' + esc(sub) + '</p>' +
+        (p.bio ? '<p class="ph-bio">' + nowrapHy(esc(tr(p.bio))) + '</p>' : '') +
+        (web ? '<a class="ph-web" href="' + esc(web) + '" target="_blank" rel="noopener">' + esc(webHost(web)) + ' ↗</a>' : '') + '</section>';
       h += feed(items);
       var inNotes = NOTES.filter(function (n) { return !n.tmp && n.ppl.some(function (q) { return q.id === id; }); });
       if (inNotes.length) h += '<section class="sec"><h2 class="lbl">' + t('mentioned') + '</h2><div class="notes">' + inNotes.map(noteCard).join('') + '</div></section>';
@@ -835,7 +858,7 @@
       searchShell: searchShell, searchResults: searchResults,
       filtered: filtered, byline: byline, count: count, tr: tr, t: t,
       lim: lim, toggleFilters: function () { filtersOpen = !filtersOpen; },
-      catLabel: catLabel, perLabel: perLabel, fdate: fdate
+      catLabel: catLabel, perLabel: perLabel, fdate: fdate, personFacts: personFacts
     };
   }
 

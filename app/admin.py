@@ -16,6 +16,7 @@
   парой; жирный, курсив, ссылки. Перевод на английский (Claude), черновики, предпросмотр по закрытой ссылке,
   публикация сразу или по расписанию, «Снять с сайта». Старые заметки открываются в том же редакторе.
 • Главная (закреплённая обложка), «О журнале», «Партнёрство», имена и страны указателя.
+• Плашки указателя (7.3, app/bios.py): кто это — у каждого имени; черновики собирает бот, решает редакция.
 • «Отправить в бот». Запись → пост для канала или Instagram во входящих: текст пишет бот, как для поста по
   ссылке. Заметка → анонс #ahmagnotes во входящих.
 • История: у каждой правки сохраняется прежняя версия, любую можно вернуть.
@@ -386,6 +387,18 @@ def _hidden_entry(D: dict, rec: dict, reason: str) -> dict:
             "countries": {c: D["countries"][c] for c in rec.get("co") or [] if c in D["countries"]}}
 
 
+# Имя в указателе: написание, роли, годы жизни и плашка (7.3) — bio {ru,en} (кто это, 1–2 предложения),
+# city {ru,en} (где работает), fd (год основания бюро), web (сайт). Пустое поле из имени убирается.
+PERSON_KEYS = ("ru", "en", "roles", "life", "bio", "city", "fd", "web")
+
+
+def _person_patch(p: dict, patch: dict) -> None:
+    p.update(_deep(patch))
+    for k in ("life", "bio", "city", "fd", "web"):
+        if not p.get(k):
+            p.pop(k, None)
+
+
 def apply_changes(D: dict, H: dict, changes: list) -> tuple[dict, dict, list[str], list[str]]:
     """Правки редакции поверх данных сайта. Меняет и возвращает D и H (скрытые). → (D, H, файлы для выкладки, отчёт)"""
     files: list[str] = []
@@ -467,15 +480,14 @@ def apply_changes(D: dict, H: dict, changes: list) -> tuple[dict, dict, list[str
                     D.pop("home", None)
                 report.append("главная")
             elif t == "person":
+                patch = {k: v for k, v in ch["rec"].items() if k in PERSON_KEYS}
                 cur = D["people"].get(ch["id"])
                 if cur:
-                    cur.update({k: v for k, v in ch["rec"].items() if k in ("ru", "en", "roles", "life")})
-                    if not cur.get("life"):
-                        cur.pop("life", None)
+                    _person_patch(cur, patch)
                 for x in H.values():          # и в копиях скрытых записей
                     p = (x.get("people") or {}).get(ch["id"])
                     if p:
-                        p.update({k: v for k, v in ch["rec"].items() if k in ("ru", "en", "roles", "life")})
+                        _person_patch(p, patch)
                 report.append(f"имя {ch['id']}")
             elif t == "country":
                 cur = D["countries"].get(ch["id"])
@@ -1637,8 +1649,40 @@ async def api_person(request: web.Request) -> web.Response:
     if not ru or not en:
         raise AdminError("Нужны оба написания, RU и EN")
     roles = [r for r in (b.get("roles") or []) if r in ROLES] or D["people"][pid].get("roles") or ["architect"]
-    await enqueue({"t": "person", "id": pid, "rec": {"ru": ru, "en": en, "roles": roles, "life": _s(b.get("life"), 60)}})
+    rec = {"ru": ru, "en": en, "roles": roles}
+    if "life" in b:
+        rec["life"] = _s(b.get("life"), 60)
+    rec.update(clean_card(b))
+    await enqueue({"t": "person", "id": pid, "rec": rec})
+    if "bio" in b:
+        from app import bios
+        bios.mark(pid, "ok" if rec.get("bio") else "skip")      # убрал плашку сам — заново не собирать
     return _ok()
+
+
+def clean_card(b: dict) -> dict:
+    """Поля плашки из запроса редакции — только те, что пришли. Пустое значение — «убрать с сайта»."""
+    out = {}
+    if "bio" in b:
+        bio = _bi(b.get("bio"), 600)
+        if bio and not bio["en"]:
+            raise AdminError("У плашки нужен и английский текст — нажми «Перевести»")
+        out["bio"] = bio
+    if "city" in b:
+        out["city"] = _bi(b.get("city"), 120)
+    if "fd" in b:
+        fd = _s(b.get("fd"), 12)
+        if fd and not re.fullmatch(r"1[5-9]\d\d|20\d\d", fd):
+            raise AdminError("Год основания — четыре цифры, например 2004")
+        out["fd"] = fd
+    if "web" in b:
+        web = _s(b.get("web"), 300)
+        if web and not re.match(r"^https?://[^\s/]+\.[^\s]+$", web):
+            web = "https://" + web if re.match(r"^[^\s/:]+\.[a-z]{2,}(/\S*)?$", web, re.I) else None
+            if not web:
+                raise AdminError("Сайт — адрес вида https://studio.com")
+        out["web"] = web
+    return out
 
 
 async def api_country(request: web.Request) -> web.Response:
@@ -1698,7 +1742,9 @@ async def api_translate(request: web.Request) -> web.Response:
         raise AdminError("Переводить нечего")
     ctx = {"note": "An essay from the Notes column (#ahmagnotes).",
            "obj": "An archive entry: title, place, year, text paragraphs, lead sentence.",
-           "pages": "Texts of the site's About and Partnerships pages."}.get(str(b.get("ctx")), "Texts for the site.")
+           "pages": "Texts of the site's About and Partnerships pages.",
+           "bio": "A short note in the site's index of names: who this architect, studio, artist, photographer or "
+                  "director is, then one place (City, Country)."}.get(str(b.get("ctx")), "Texts for the site.")
     return _ok(items=await translate(items, ctx))
 
 
@@ -1932,7 +1978,7 @@ async def backup(bot: Bot, manual: bool = False) -> None:
         def pack(with_db: bool) -> None:
             with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
                 for p, arc in ((sitepub.DATA, "site/data.json"), (sitepub.ROOT / "hidden.json", "site/hidden.json"),
-                               (QUEUE, "admin/queue.json")):
+                               (QUEUE, "admin/queue.json"), (ROOT / "bios.json", "admin/bios.json")):
                     if p.exists():
                         z.write(p, arc)
                 for folder, arc in ((NOTES, "admin/notes"), (HIST, "admin/history")):
@@ -2029,6 +2075,8 @@ def schedule(sched, bot: Bot, guarded) -> None:
                   id="admin_sched", max_instances=1)
     sched.add_job(guarded(bot, "копия базы", backup, bot), "cron", day_of_week="sun", hour=5, minute=20,
                   id="admin_backup", max_instances=1)
+    from app import bios
+    bios.schedule(sched, bot, guarded)
 
 
 # ======================= веб: страницы и файлы =======================
@@ -2129,3 +2177,5 @@ def setup(app: web.Application) -> None:
             ("POST", "pages", api_pages), ("POST", "home", api_home),
             ("POST", "person", api_person), ("POST", "country", api_country)):
         r.add_route(method, f"/admin/api/{path}", auth(fn))
+    from app import bios
+    bios.setup(r)                     # плашки указателя (7.3)

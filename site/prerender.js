@@ -76,7 +76,8 @@ function meta(site, r, L) {
     const p = D.people[r.id];
     const items = p.objs.map((x) => site.BY[x]).filter((o) => o && !o.tmp);
     const roles = p.roles.map((x) => site.t('role')[x]).filter(Boolean).join(', ');
-    m.description = clip(c.person(tr(p), [roles, site.count(items.length)].filter(Boolean).join(' · ')), 200);
+    m.description = p.bio && tr(p.bio) ? clip(tr(p) + '. ' + tr(p.bio), 200)
+      : clip(c.person(tr(p), [roles, site.count(items.length)].filter(Boolean).join(' · ')), 200);
     if (items[0]) img(items[0]);
   } else if (r.name === 'archive') {
     m.description = c.archive(site.count(D.objects.filter((o) => !o.tmp).length));
@@ -110,6 +111,15 @@ function ld(site, r, L, m, canon, title) {
         { '@type': 'ListItem', position: 1, name: site.t('archive'), item: SITE + site.url({ name: 'archive' }) },
         { '@type': 'ListItem', position: 2, name: site.catLabel(x.cats[0]), item: SITE + site.url({ name: 'archive', st: { cat: x.cats[0] } }) },
         { '@type': 'ListItem', position: 3, name: title }] });
+    }
+  } else if (r.name === 'person') {
+    // a name with its note (7.3): who it is, for search engines
+    const p = site.D.people[r.id], tr = site.tr;
+    if (p.bio && tr(p.bio)) {
+      const who = { '@type': p.roles.indexOf('studio') >= 0 ? 'Organization' : 'Person', name: tr(p), description: tr(p.bio) };
+      if (/^https?:\/\//.test(p.web || '')) who.sameAs = [p.web];
+      if (p.fd && who['@type'] === 'Organization') who.foundingDate = String(p.fd);
+      out.push({ '@context': 'https://schema.org', '@type': 'ProfilePage', url: canon, inLanguage: L, mainEntity: who });
     }
   }
   return out.map((o) => '<script type="application/ld+json">' + JSON.stringify(o).replace(/</g, '\\u003c') + '</script>');
