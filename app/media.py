@@ -168,7 +168,11 @@ async def extract_article(client: httpx.AsyncClient, url: str, feed_html: str = 
         log.info("Страница недоступна (%s), работаем по RSS: %s", exc, url)
     if not parts:
         raise RuntimeError("нет ни RSS-текста, ни страницы")
-    text = max((p["text"] for p in parts), key=len)
+    text = fix_text(url, raw)
+    if text is None:
+        text = max((p["text"] for p in parts), key=len)
+    elif not text and feed_html:          # у сайта своё правило, но описания на странице нет — берём текст из ленты
+        text = parts[0]["text"]
     title = next((p["title"] for p in reversed(parts) if p["title"]), "")
     urls = _dedupe([u for p in parts for u in p["image_urls"]])
     urls = fix_images(url, urls, raw) or urls   # у некоторых сайтов свои правила, где лежат крупные фото
@@ -186,8 +190,37 @@ def _stem(u: str) -> str:
     return re.sub(r"(-\d{1,3})?\.(jpe?g|png|webp)$", "", name, flags=re.I).lower()
 
 
+def fix_text(url: str, raw_html: str) -> str | None:
+    """Текст статьи там, где общий разбор хватает не то (у Divisare — меню тегов вместо описания).
+    None — у сайта нет своего правила; пустая строка — правило есть, а текста нет (меню тегов не берём)."""
+    if raw_html and "divisare.com" in urlparse_mod.urlparse(url).netloc:
+        soup = BeautifulSoup(raw_html, "lxml")
+        box = soup.select_one("div.project div.description") or soup.select_one("div.description")
+        if not box:
+            return ""
+        lines = [ln.strip() for ln in box.get_text("\n", strip=True).split("\n") if ln.strip()]
+        if "Add to collection" in lines:     # перед кнопкой — имя фотографа, оно уже есть в заголовке
+            lines = lines[lines.index("Add to collection") + 1:]
+        return "\n".join(ln for ln in lines if len(ln) > 30)[:9000]
+    return None
+
+
+# свежие проекты: …/v123/<uuid>/<имя>.jpg; старые: …/v123/<id из 20 знаков>/<имя>.jpg; превью: image/upload/…/v123/<id>.jpg
+DIVISARE_IMG = re.compile(
+    r"images\.divisare\.com/+images?/(?:upload/)?[^/]+/(v\d+)/([0-9a-z-]{16,40})(?:\.jpe?g|/([^/?\s\"']+))", re.I)
+
+
 def fix_images(url: str, urls: list[str], raw_html: str = "") -> list[str]:
     dom = urlparse_mod.urlparse(url).netloc
+    if "divisare.com" in dom:
+        # у каждого фото три адреса (превью, f_auto, c_limit 3000) — берём одно, в JPEG и в полном размере
+        out = {}
+        for u in urls:
+            m = DIVISARE_IMG.search(u)
+            if m and m.group(2) not in out:
+                ver, uid, name = m.group(1), m.group(2), m.group(3) or "image.jpg"
+                out[uid] = f"https://images.divisare.com/images/c_limit,f_jpg,h_3000,q_90,w_3000/{ver}/{uid}/{name}"
+        return list(out.values())
     if "afasiaarchzine.com" in dom:
         ups = [WP_SIZE.sub("", u.split("?")[0]) for u in urls if "/wp-content/uploads/" in u]
         base = next((_stem(u) for u in ups if "afasia" in _stem(u)), None)

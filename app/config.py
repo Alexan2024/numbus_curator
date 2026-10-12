@@ -100,6 +100,7 @@ NOTES_WEB_SEARCHES = int(os.getenv("NOTES_WEB_SEARCHES", "6"))
 
 # ---------- музейные коллекции ----------
 MUSEUM_PER_RUN = int(os.getenv("MUSEUM_PER_RUN", os.getenv("MET_PER_RUN", "2")))  # объектов на музей за сбор
+DIVISARE_DEEP = int(os.getenv("DIVISARE_DEEP", "2"))  # старых проектов Divisare за сбор (0 — только свежая лента)
 MUSEUM_DAILY_MAX = int(os.getenv("MUSEUM_DAILY_MAX", "3"))                        # музейных постов в день
 
 # ---------- фото ----------

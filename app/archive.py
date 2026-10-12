@@ -189,7 +189,8 @@ def _wp_sites() -> dict[str, str]:
     out = {}
     for name, url in {**sources.FEEDS, **niche.NEW_FEEDS}.items():
         m = re.match(r"(https?://[^/]+)", url)
-        if m and "feedburner" not in url and "rss.xml" not in url and "mubi.com" not in url:
+        if m and "feedburner" not in url and "rss.xml" not in url and "mubi.com" not in url \
+                and "divisare.com" not in url:
             out[name] = m.group(1)
     out.update(niche.WP_SITES)
     full = {}

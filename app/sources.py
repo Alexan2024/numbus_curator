@@ -3,6 +3,7 @@
 или строкой в FEEDS; другой тип источника — функцией в COLLECTORS.
 Нишевые источники и чтение архивов вглубь — в app/niche.py, их сборщики стоят здесь же, в COLLECTORS."""
 import asyncio
+import html
 import logging
 import random
 import re
@@ -21,6 +22,7 @@ FEEDS = {
     "dezeen": "https://www.dezeen.com/architecture/feed/",
     "designboom": "https://www.designboom.com/architecture/feed/",
     "leibal": "https://leibal.com/feed/",
+    "divisare": "https://divisare.com/publications/11/feed",   # Selected Projects; архив вглубь — collect_divisare
     # искусство
     "colossal": "https://www.thisiscolossal.com/feed/",
     "booooooom": "https://www.booooooom.com/feed/",
@@ -45,6 +47,7 @@ FEEDS = {
 # Подсказка для первичного фильтра: о чём обычно пишет источник
 HINTS = {
     "archdaily": "архитектура", "dezeen": "архитектура", "designboom": "архитектура", "leibal": "архитектура",
+    "divisare": "архитектура и интерьеры, отобранные редакцией Divisare, фото архитектурных фотографов",
     "colossal": "искусство", "booooooom": "искусство и фото", "hyperallergic": "искусство, много новостей",
     "ignant": "искусство, фото, дизайн", "aperture": "фотография", "featureshoot": "фотография",
     "flashbak": "архив, старые фото", "messynessy": "архив, истории", "socks": "архив, история архитектуры",
@@ -120,7 +123,7 @@ async def collect_rss(client: httpx.AsyncClient) -> list[dict]:
             return []
         items = []
         for e in feed.entries[:25]:
-            link = e.get("link")
+            link = clean_link(e.get("link") or "")
             if link:
                 content = e.get("content") or []
                 body = content[0].get("value", "") if content else e.get("summary", "")
@@ -131,6 +134,49 @@ async def collect_rss(client: httpx.AsyncClient) -> list[dict]:
 
     groups = await asyncio.gather(*(one(n, u) for n, u in (await all_feeds()).items()))
     return [it for g in groups for it in g]
+
+
+def clean_link(url: str) -> str:
+    """У Divisare в ленте одна запись на каждое фото проекта, с utm-метками: без меток они сливаются в один адрес."""
+    if "divisare.com/projects/" in url:
+        return url.split("?")[0]
+    return url
+
+
+# ---------- Divisare: архив вглубь ----------
+# Список старых проектов у Divisare только по подписке, но страницы самих проектов открыты целиком
+# (текст и все фото до ~1750 px). Номера проектов идут подряд с пропусками: живой примерно каждый
+# двенадцатый, поэтому бот пробует случайные номера и останавливается на первых найденных.
+
+DIVISARE_ID_RANGE = (150_000, 573_000)
+
+
+async def collect_divisare(client: httpx.AsyncClient) -> list[dict]:
+    if "divisare" in await disabled() or config.DIVISARE_DEEP <= 0:
+        return []
+    items = []
+    for _ in range(config.DIVISARE_DEEP * 15):
+        pid = random.randint(*DIVISARE_ID_RANGE)
+        try:
+            r = await client.get(f"https://divisare.com/projects/{pid}", timeout=20)
+        except Exception as exc:
+            log.info("Divisare %s: %s", pid, exc)
+            continue
+        if r.status_code != 200:
+            await asyncio.sleep(0.5)
+            continue
+        m = re.search(r"<title>(.*?)\s*·\s*Divisare\s*</title>", r.text, re.S)
+        d = re.search(r'og:description" content="([^"]*)"', r.text)
+        title = html.unescape(m.group(1).strip()) if m else ""
+        if not title:
+            continue
+        desc = html.unescape(d.group(1)) if d else ""
+        items.append({"url": f"https://divisare.com/projects/{pid}", "title": title, "source": "divisare",
+                      "payload": {"content_html": f"<p>{html.escape(desc)}</p>" if desc else "", "deep": True}})
+        if len(items) >= config.DIVISARE_DEEP:
+            break
+        await asyncio.sleep(0.5)
+    return items
 
 
 async def check_feed(url: str) -> int:
@@ -213,7 +259,7 @@ async def collect_cma(client: httpx.AsyncClient) -> list[dict]:
     return items
 
 
-COLLECTORS = [collect_rss, collect_met, collect_cma, *niche.COLLECTORS]
+COLLECTORS = [collect_rss, collect_divisare, collect_met, collect_cma, *niche.COLLECTORS]
 
 
 async def collect_all() -> tuple[int, int]:
