@@ -1,8 +1,7 @@
 import React from 'react';
 import {AbsoluteFill, Audio, Img, interpolate, useCurrentFrame} from 'remotion';
-import {Bar, Fonts, Grain, H, INK, Sfx, W, clamp, easeQuart, easeSine} from './common';
+import {Bar, Fonts, Grain, H, INK, Sfx, W, clamp, easeSine} from './common';
 import {Label, Narration, Scrims} from './Narration';
-import {Backdrop, Captions, Headline, PulseScrims, punchAt} from './Pulse';
 
 /* Две картинки и переход между ними: «Чертёж → здание», «Тогда / сейчас», «Картина и место», «Кадр ← картина»,
    «Что под слоем», «Какая из двух». Вся раскладка считается в боте (app/reelplan.py → pair_props): у каждой
@@ -15,13 +14,12 @@ import {Backdrop, Captions, Headline, PulseScrims, punchAt} from './Pulse';
 type Key = number[];
 const F = {t: 0, x: 1, y: 2, w: 3, h: 4, cx: 5, cy: 6, cw: 7, op: 8, clip: 9, lab: 10};
 
-function at(keys: Key[], t: number, quart = false): Key {
+function at(keys: Key[], t: number): Key {
   if (t <= keys[0][0]) return keys[0];
   for (let i = 0; i < keys.length - 1; i++) {
     const a = keys[i], b = keys[i + 1];
     if (t <= b[0]) {
-      const raw = (t - a[0]) / Math.max(b[0] - a[0], 1e-6);
-      const u = !quart ? easeSine(raw) : i === 0 && a[0] === 0 ? 1 - (1 - Math.min(1, Math.max(0, raw))) ** 3 : easeQuart(raw);
+      const u = easeSine((t - a[0]) / Math.max(b[0] - a[0], 1e-6));
       return a.map((v, j) => j === F.cw ? Math.exp(Math.log(v) + (Math.log(b[j]) - Math.log(v)) * u) : v + (b[j] - v) * u);
     }
   }
@@ -64,9 +62,7 @@ const Tag: React.FC<{text: string; k: Key; l: any; right?: boolean}> = ({text, k
 
 export const Pair: React.FC<any> = (p) => {
   const frame = useCurrentFrame(); const t = frame / p.fps;
-  const pulse = p.style === 'pulse';
-  const ks = p.layers.map((l: any) => at(l.keys, t, pulse));
-  if (pulse) return <PairPulse p={p} ks={ks} t={t} frame={frame} />;
+  const ks = p.layers.map((l: any) => at(l.keys, t));
   const endIn = interpolate(t, [p.endStart, p.endStart + 0.8], [0, 1], clamp);
   const endK = p.loopStart ? Math.min(endIn, interpolate(t, [p.loopStart, p.loopStart + 0.45], [1, 0], clamp)) : endIn;
   const loop = p.loopStart ? t >= p.loopStart : false;
@@ -94,45 +90,6 @@ export const Pair: React.FC<any> = (p) => {
       <Bar text={p.rubric} />
       <Label t={t} start={p.endStart} top={p.labelTop} title={p.title} meta={p.meta} metaCol={170} />
     </AbsoluteFill>}
-    <Grain frame={frame} />
-    {p.voice && <Audio src={p.voice} />}
-    <Sfx list={p.sfx} fps={p.fps} />
-  </AbsoluteFill>;
-};
-
-/* pulse: те же раскладки и переходы, но быстрее; заголовок-хук с первого кадра, крупные субтитры,
-   толчки на ударных словах, размытый фон вместо чёрных полей, без титра в конце — сразу повтор. */
-const PairPulse: React.FC<{p: any; ks: Key[]; t: number; frame: number}> = ({p, ks, t, frame}) => {
-  const loop = p.loopStart ? t >= p.loopStart : false;
-  const b = ks[1];
-  const wipe = b[F.clip] > 0.002 && b[F.clip] < 0.998 && b[F.op] > 0.05;
-  const zoom = punchAt(p.punches, t, 0.04);
-  const hl = p.headline || {};
-  const headK = Math.max(interpolate(t, [hl.end - 0.05, hl.end + 0.3], [1, 0], clamp),
-    p.loopStart ? interpolate(t, [p.loopStart, p.loopStart + 0.4], [0, 1], clamp) : 0);
-  const cs = p.creditStart ?? p.endStart;
-  const credit = p.credit && t >= cs && !loop;
-  const beatI = p.beats.findIndex((x: any) => t >= x.start - 0.1 && t < x.end);
-  return <AbsoluteFill style={{background: '#0d0c0b', color: INK, overflow: 'hidden'}}>
-    <Fonts lang={p.lang} />
-    <Backdrop src={p.backdrop} t={t} />
-    <div style={{position: 'absolute', inset: 0, transform: `scale(${zoom})`, transformOrigin: '50% 40%'}}>
-      {p.layers.map((l: any, i: number) => <Layer key={i} l={l} k={ks[i]} t={t} id={`ink${i}`} />)}
-      {wipe && <div style={{position: 'absolute', left: b[F.x] + b[F.clip] * b[F.w] - 2, top: b[F.y], width: 4, height: b[F.h],
-        background: '#E2492B', opacity: b[F.op], boxShadow: '0 0 14px rgba(0,0,0,.5)'}} />}
-      <Tag text={p.layers[0].tag} l={p.layers[0]} k={(() => {
-        const a = ks[0], same = p.layout !== 'split' && Math.abs(a[F.x] - b[F.x]) + Math.abs(a[F.y] - b[F.y]) + Math.abs(a[F.w] - b[F.w]) < 2;
-        const hid = same ? Math.min(b[F.op], 1 - b[F.clip] * 2) : 0;
-        return a.map((v, j) => j === F.lab ? v * Math.max(0, 1 - Math.max(0, hid) * 1.5) : v);
-      })()} />
-      <Tag text={p.layers[1].tag} l={p.layers[1]} k={b.map((v, j) => j === F.lab ? v * Math.max(0, Math.min(1, (0.97 - b[F.clip]) * 4)) : v)}
-        right={b[F.clip] > 0.02} />
-    </div>
-    <PulseScrims head={headK} />
-    <Bar text={credit ? p.credit : beatI <= 1 || loop ? p.rubric : ''} strong={!!credit}
-      opacity={credit ? interpolate(t, [cs, cs + 0.3], [0.3, 1], clamp) : 0.9} />
-    <Headline text={hl.text} t={t} end={hl.end} loopStart={p.loopStart} />
-    <Captions beats={p.beats} t={t} hidden={t >= p.endStart} labels />
     <Grain frame={frame} />
     {p.voice && <Audio src={p.voice} />}
     <Sfx list={p.sfx} fps={p.fps} />

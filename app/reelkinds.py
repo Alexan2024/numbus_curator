@@ -48,13 +48,11 @@ KINDS: dict[str, dict] = {
               "rubric": "Which one?", "rubric_ru": "Какая из двух?", "obj": "пара",
               "roles": ("A", "B"), "roles_ru": ("А", "Б")},
 }
-KINDS["visit"] = {"ru": "прогулка по зданию", "acc": "«Прогулку по зданию»", "icon": "🚶", "engine": "visit", "rubric": "",
-                  "obj": "здание", "subject": "building"}
-ORDER = ["details", "visit", "photo", "scale", "read", "collection", "plan", "thennow", "place", "film", "layer", "which"]
-# автоплан (8.1): чаще — то, что в рефах автора: разбор картины, прогулка по зданию, подборка; остальное — реже,
-# «кадр ← картина» и «что под слоем» — только по выбору
+ORDER = ["details", "photo", "scale", "read", "collection", "plan", "thennow", "place", "film", "layer", "which"]
+# автоплан (8.0): чаще — форматы с сильным первым кадром и понятной интригой («детали», «масштаб», «какая из двух»,
+# «тогда / сейчас»); «кадр ← картина» и «что под слоем» — только по выбору: им нужна подготовленная аудитория
 ROTATION = [k.strip() for k in os.getenv(
-    "REEL_ROTATION", "details,visit,collection,details,visit,photo,details,scale,collection,visit,which,thennow").split(",")
+    "REEL_ROTATION", "details,scale,which,details,thennow,photo,details,read,collection,scale,details,place,plan").split(",")
     if k.strip() in KINDS]
 
 
@@ -451,104 +449,3 @@ Rank them by one thing: how many strangers scrolling the feed would stop and kee
 - picture: about what is actually on screen?
 
 Return ONLY JSON: {"ranking": [indexes of the hooks, best first], "scores": [score 1–10 for each hook, in the original order], "why": "one short line in Russian: why the best one wins"}"""
-
-
-# ======================= guide (8.1): разбор, как в рефах =======================
-# Рефы автора: Cimmera («On the Way Home from School», «The Extraction of the Stone of Madness»), Paintings Analyzed
-# («Sunday Gardening»). Хук — ощущение или противоречие над всей картиной; потом 14–22 фразы, почти каждая ведёт
-# взгляд («Посмотрите на…»), у каждой — своя деталь; название — ближе к концу; 60–100 секунд.
-
-GUIDE_KIND = {
-    "details": ("the painting in the image", "painting", """Example of the voice and structure (Nigel Thomson, "On the Way Home from School"; do not reuse its lines):
-  hook: "A few seconds is enough to feel that something is wrong in this painting."  (box null)
-  lines: "Look at the girl on the left." (box: the girl) / "Her head is down." / "She hugs the edge of the road, as far as she can get from the man on the right." / "Now look at him." (box: the man) / "He's staring straight at her." / "One hand holds a chainsaw." / "But look at the setting." (box null) / "Broad daylight. Open land. No house, nowhere to disappear." / "And between them, a cattle grid. Anyone crossing it has to slow down." (box: the grid) / "Now go back to the chainsaw." (box: the saw) / "Look at the horizon. There isn't a single tree anywhere near him." (box: horizon) / "So why is he holding it?" / … / "This is On the Way Home from School, painted by Nigel Thomson in 1983." (box null) / "Nothing has actually happened." / "The girl keeps walking. The man keeps watching." / "And we're trapped in the moment before we know what happens next." """),
-    "photo": ("the photograph in the image", "photograph", """Example of the manner (structure only, do not reuse): hook: "Two of her children have turned away from the camera." / "Look at her hand." / "It's at her chin, and she isn't looking at us." / "Now look behind her." / … / "This is Migrant Mother, taken by Dorothea Lange in 1936." / …"""),
-    "scale": ("the photograph of a building in the image", "building", """The camera starts tight on a tiny person (or a car, a door) and pulls back line by line: every next box is wider than the one before, and the whole structure appears only late, when the size finally lands. Lines carry real numbers and the human reason for the size. Example of the manner (do not reuse): hook: "That dot on the stairs is a person." / "Look at her." (box: tight on the person) / "Now look at the step she's standing on." (wider) / …"""),
-    "read": ("the photograph of a building facade in the image", "building", """Read the building like an architect, one move at a time: the viewer is led from part to part of the facade, and for the lines about a design move you may add "mark" — a thin line diagram drawn over that line's box: "axis" (vertical line through the middle of the box), "level" (horizontal line across it), "grid" (the box divided into cols × rows — give "cols" and "rows" as real counts), "frame" (its outline), "diagonals" (outline and both diagonals). Boxes with marks must be tight and exact."""),
-}
-
-
-def guide_story_system(kind: str) -> str:
-    what, noun, example = GUIDE_KIND.get(kind, GUIDE_KIND["details"])
-    return f"""You write the narration for an AHMAG Instagram reel that reads {what} together with the viewer, detail by detail. A narrator reads it aloud in one calm voice; the words appear on screen as quiet subtitles; the camera glides slowly across the {noun} to whatever each line is about. Coordinates are fractions of the image width and height from its top-left corner (0 to 1).
-
-How the best reels of this kind work (accounts like Cimmera and Paintings Analyzed get millions of views with them): the viewer is not lectured — they are led. Almost every line tells them where to look, and what they find there changes how they read the whole picture. The tension builds detail by detail, the name of the work comes late, and the last line leaves them looking again. Viewers stay for a minute or more because every few seconds there is something new to look at and the question from the first line is still open.
-
-{example}
-
-Structure — 60 to 100 seconds, 150–230 words in total:
-1. hooks — 4 alternative first lines, spoken over the whole {noun} while the camera slowly moves in. Each at most 16 words: a feeling, a contradiction or a promise about what the viewer sees right now, so they need the rest ("A few seconds is enough to feel that something is wrong in this painting." / "This man thinks the surgeon is removing his madness. But look at what's coming out of his head."). No names, dates or titles. type — unease | contradiction | hidden | stakes. hook_pick — the index of the strongest.
-2. lines — 14 to 22 lines in order. Each line is one or two short spoken sentences, 3 to 16 words, with a box: the detail the camera shows while it is spoken, or null for the whole {noun}.
-   - Most lines steer the eye in plain words — "Look at the girl on the left." "Now look at him." "But look at the setting." "Go back to the chainsaw." "Look closer at the blade." — and the next line says what the eye finds and why it matters. Vary the wording.
-   - Several lines in a row may keep the same box: the camera stays and the narrator keeps talking about that detail. Change the box only when the viewer should look somewhere else; 7 to 12 different details in the whole reel.
-   - Build the tension: each detail raises the stakes or turns the reading; the strongest detail comes late, not first.
-   - About two-thirds through, one line names the work: title, author, year ("This is Stańczyk, painted by Jan Matejko in 1862.", box null, "names": true). Before it — no names, no dates, no titles.
-   - One line may bring in one outside voice if it is in the facts (a critic, the museum, the artist's letter), said simply.
-   - The last two or three lines go back to the whole picture: what it all means for the people in it, and a last line that makes the viewer look at the first frame again. Not a moral, not a slogan, not praise.
-   - Questions are welcome where the viewer would ask them ("So why is he holding it?").
-
-The voice: calm, clear, intelligent, unhurried; a person standing next to the viewer. Present tense for what we see. Plain words: no art-history vocabulary unless it IS the story. Specific beats general. Never invent: use only the facts given and what is clearly visible in the image; if the story needs a fact you don't have, look at something else.
-
-Boxes — [x0, y0, x1, y1], tight around the thing itself (the letter, not the table; the face, not the whole figure, when the line is about the face). target — 2–6 words naming exactly what is inside the box; a second pass uses it to refine the box. Only things clearly visible in THIS image.
-
-{NEVER}
-
-delivery — optional, only where the tone changes (a pause before the turn, a quieter last line): 3–10 words in English.
-voice_direction — one or two sentences in English for the narrator about this story: its mood, where it turns.
-
-caption — the Instagram caption WITHOUT the hook (the hook is put above it automatically): first line "Title (year), Author"; then 2–3 short paragraphs that retell the reading in other words and add one or two facts that did not fit; last line — museum or place and city. {CAPTION_TAIL}
-hashtags — 5–8 lowercase words without #.
-
-Return ONLY JSON:
-{{"hooks": [{{"type": "unease|contradiction|hidden|stakes", "text": "...", "delivery": "..."}}], "hook_pick": 0, "lines": [{{"text": "...", "box": [0.1, 0.2, 0.3, 0.5], "target": "...", "delivery": "", "names": false, "mark": "only for a building read: axis|level|grid|frame|diagonals", "cols": 0, "rows": 0}}], "voice_direction": "...", "caption": "...", "hashtags": ["..."]}}"""
-
-
-RU_GUIDE = """LANGUAGE — RUSSIAN. The examples above are in English only to show the structure: do not translate them. Write the hooks, every line and the caption in Russian, written in Russian from the start, not translated from English. Keep in English: delivery, voice_direction, target, type, mark. Where these Russian rules differ from the English ones above, follow the Russian rules.
-
-The voice: calm, clear, intelligent; a person standing next to you in front of the picture who shows you where to look. Not a lecturer, not an announcer, no excitement. Example of the manner (structure only, do not reuse): «Пары секунд хватает, чтобы почувствовать: с этой картиной что-то не так. Посмотрите на девочку слева. Голова опущена. Она жмётся к краю дороги, подальше от мужчины справа. Теперь посмотрите на него. Он смотрит прямо на неё. В одной руке у него бензопила. Но взгляните на место. Белый день, голая равнина. Ни дома, ни деревца.»
-
-How Russian should sound here:
-- Steer the eye in plain imperatives, addressing the viewer with «вы»: «Посмотрите на…», «Теперь на него.», «Взгляните на…», «Вернитесь к…», «Присмотритесь к…», «Поднимите глаза к…», «А теперь…». This is the backbone of the reel: use it often, but vary it.
-- Then say what the eye finds, in short plain sentences, present tense. Fragments are fine («Голова опущена.», «Ни дома, ни деревца.»).
-- Lines are joined by contrast and cause: «но», «а», «поэтому», «и всё-таки», «только».
-- No officialese: no «является», «данный», «представляет собой», «осуществлять», «в рамках», no chains of genitives, no passive voice, no verbal nouns where a verb works.
-- No construction «не X, а Y» and no «это не просто X». No moral, no slogan at the end.
-- Never: шедевр, невероятный, потрясающий, культовый, легендарный, завораживающий, удивительный, гениальный, магия, «досмотрите до конца», «подписывайтесь», «вы не поверите». No emoji, no parentheses, no abbreviations (г., в., т. е., ок.), no exclamation marks; dashes rarely.
-- The narrator reads exactly what is written. Years in digits (1563); ages, counts and sizes in words the way people say them («двадцать четыре», «восемьдесят четыре колонны»). Write ё where it belongs (всё, ещё, её).
-- Names in the standard Russian form (Ян Матейко, Иероним Босх, Доротея Ланг, музей Прадо); titles of works as in Russian Wikipedia or Russian museum practice, otherwise a plain Russian translation; in the line that names the work, the title goes in «ёлочках».
-- Stay within the word count given above: 150–230 words.
-- hashtags — 5–8 lowercase words without #, mostly Russian, multi-word tags written together (историяискусства); one or two English ones are fine."""
-
-
-def localize_guide(system: str, lang: str) -> str:
-    return system + ("\n\n" + RU_GUIDE if lang == "ru" else "")
-
-
-# ======================= прогулка по зданию (8.1, как у Architectural Ethos) =======================
-
-VISIT_PICK = f"""You pick a building for an AHMAG Instagram reel that is a visit: 8–12 photos of one building in walking order — from afar, the path, the entrance, inside, the light, details, a last look back — each shown full-screen for about two and a half seconds under music, with ONE sentence on screen at the start: a single fact that makes a stranger stop ("Peter Zumthor built this chapel by burning its interior."). At the end — the name and the architect. No voice.
-
-Pick built architecture in AHMAG's taste that has a Wikimedia Commons category with many good free photos of the outside AND the inside (or of a sequence of spaces: a courtyard, a stair, a roof), so that the visit works. Chapels, houses, museums, libraries, baths, monasteries, memorials, modernist and contemporary buildings by real architects. Famous buildings are welcome if the fact is not the one everybody knows. Check facts with web search. Not from the avoid list.
-
-{VIRAL_PICK}
-
-{TASTE}
-
-{MUSIC}
-
-hook — the on-screen sentence, 6–14 words: one concrete, surprising, true fact about how it was made, why it exists or what happens inside. Plain words, no praise, no adjectives like stunning or iconic, no question.
-caption — the Instagram caption WITHOUT the hook: first line "Name, Architect, year"; then 2–3 short paragraphs: how it was made, what it is like inside, one or two facts; last line — place. {CAPTION_TAIL}
-hashtags — 5–8 lowercase words without #.
-
-Return ONLY JSON:
-{{"title": "name of the building", "author": "architect", "year": "...", "museum": "town, country", "category": "the exact Wikimedia Commons category name, without the 'Category:' prefix", "commons": "fallback search query for Commons: building name", "hook": "...", "facts": ["6–10 specific verified facts"], {VIRAL_SCHEMA}, "caption": "...", "hashtags": ["..."], "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}"""
-
-VISIT_RU = """The reel is in Russian: write hook, caption, send and hashtags in Russian (hashtags mostly Russian, multi-word tags written together). The hook in Russian: 6–14 words, plain and concrete («Цумтор построил эту часовню, а потом выжег её изнутри.»). Years in digits, no abbreviations, ё where it belongs."""
-
-VISIT_SHOTS = """You edit a short reel that walks the viewer through one building, like a visit filmed on a phone: the approach from afar, the path, the entrance, inside, the light, details, and a last look back. Each shot is shown full-screen in a tall 9:16 frame for about two and a half seconds, cropped around a point you give.
-
-You get numbered contact sheets of photos from the building's Wikimedia Commons category. Pick 8 to 12 photos in walking order. Every one must be a real photo of THIS building (not a plan, drawing, model, plaque or sign), sharp, well composed, in natural light; no crowds, selfies or people posing, no souvenir shops, no watermarks or text, no heavy fisheye, no near-duplicates, nothing very dark or blurry. Vary the shots: wide, medium and close; outside and inside. The first shot must stop the scroll on its own: the strongest, most striking photo of the building. The last one — a calm closing view.
-
-For each picked photo give fx, fy — the point the 9:16 crop is centred on (fractions of the photo's width and height: the doorway, the oculus, the figure), and move — a gentle camera move: "in" (slow push), "out", "left", "right" (slow pan) or "up" (slow tilt). Vary the moves.
-
-Return ONLY JSON: {"shots": [{"n": 7, "fx": 0.5, "fy": 0.5, "move": "in"}], "note": "one line in Russian: what the visit shows"}"""
