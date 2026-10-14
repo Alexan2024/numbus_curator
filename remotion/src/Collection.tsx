@@ -3,6 +3,7 @@ import {AbsoluteFill, Audio, Img, interpolate, useCurrentFrame} from 'remotion';
 import {Bar, Fonts, Grain, INK, M, MUTE, Rich, Sfx, clamp, easeSine, out3} from './common';
 import {Word} from './Narration';
 import {Backdrop, Captions, HEAD_TOP, Headline, PulseScrims} from './Pulse';
+import {CollectionGuide} from './Guide';
 
 /* Подборка: титул на первой работе, затем работы по несколько секунд. Все работы подборки — в одном виде:
    mode = bleed — все на весь кадр (подборка вертикальных работ), mode = frame — все целиком, как на стене:
@@ -41,6 +42,7 @@ const Caption: React.FC<{it: any; i: number; total: number; t: number}> = ({it, 
 export const Collection: React.FC<any> = (p) => {
   const frame = useCurrentFrame(); const t = frame / p.fps;
   if (p.style === 'pulse') return <CollectionPulse p={p} t={t} frame={frame} />;
+  if (p.style === 'guide') return <CollectionGuide {...p} />;
   const titleK = interpolate(t, [p.titleEnd - 0.4, p.titleEnd], [1, 0], clamp);
   const total = p.items.length;
   const bleed = p.mode === 'bleed';

@@ -25,8 +25,10 @@
 В день выхода в REELS_TIME приходит «Пора выкладывать»: видео файлом без сжатия, подпись одним блоком
 (нажать — скопируется), треки. Выложил — «✅ Выложил». Рилс по запросу — экран «🎬 Рилсы» на пульте.
 
-8.0 — рилсы под охват: объект с оценкой охвата (REEL_VIRAL_MIN), шесть хуков с заголовком на экране и отдельный
-проход-редактор, который выбирает лучший (judge_hooks), сценарий 15–25 с, вёрстка pulse (reelplan.STYLE).
+8.1 — рилсы по рефам автора (Cimmera, Paintings Analyzed, The Non Museum, Architectural Ethos), вёрстка guide:
+разбор картины — длинный, 14–22 фразы «посмотрите на…», каждая со своей деталью (guide_beats); подборка — работы на
+весь экран без голоса; новый формат «прогулка по зданию» (_visit): фото из категории Commons в порядке прогулки и один
+факт текстом. Объект — с оценкой охвата (REEL_VIRAL_MIN), хук выбирает отдельный проход-редактор (judge_hooks).
 
 Рилсы в Telegram-канал не идут. Голос в видео уже есть, музыку автор кладёт в Instagram.
 Статистика выложенных рилсов (пролистывания, время просмотра, пересылки) — «📊 Что заходит» на экране рилсов."""
@@ -80,7 +82,9 @@ KIND_RU = {k: v["ru"] for k, v in rk.KINDS.items()}
 KIND_ACC = {k: v["acc"] for k, v in rk.KINDS.items()}
 MUSEUMS = os.getenv("REEL_MUSEUMS", "1").strip().lower() not in ("0", "off", "false", "no")
 MAX_SIDE = int(os.getenv("REEL_MAX_SIDE", "4800"))     # картинки крупнее ужимаются: память рендера
-VOICED_COLLECTIONS = os.getenv("REEL_COLLECTION_VOICE", "1").strip().lower() not in ("0", "off", "false", "no")
+# guide (8.1): подборка, как у The Non Museum, — без голоса, под музыку; REEL_COLLECTION_VOICE=1 — с голосом
+VOICED_COLLECTIONS = os.getenv("REEL_COLLECTION_VOICE", "0" if reelplan.GUIDE else "1").strip().lower() \
+    not in ("0", "off", "false", "no")
 UA = {"User-Agent": f"AHMAG-bot/{config.VERSION} (+https://t.me/ahmag; curation bot)"}
 COMMONS = "https://commons.wikimedia.org/w/api.php"
 DIR = config.DATA_DIR / "reels"
@@ -550,13 +554,15 @@ TOPIC_HINT = {
 
 COLLECTION_SYSTEM = f"""You make Instagram reels for AHMAG, an account about architecture, art, photography and archives. This reel is a thematic compilation: a title card, then 6–8 works by different authors, each on screen for a few seconds with its title and author. Example of the genre: "The Art of Melancholy" — paintings where sadness is felt rather than shown.
 
-A good theme is specific and has a mood or an idea that ties works from different countries and periods: "Rooms without people", "Windows at night", "Concrete that looks soft", "Painters and their mothers". Not a whole category ("Modern architecture"), not a list of famous things ("Greatest paintings"). The reel is shown mostly to strangers: the theme must make someone stop in one second and think of a particular person to send it to; at least half of the works should be ones a stranger has seen or would recognise.
+A good theme is specific and has a mood or an idea that ties works from different countries and periods: "Art to rest your mind", "Rooms to be alone in", "Paintings that smell of summer", "Windows at night", "Concrete that looks soft", "Painters and their mothers". A mood or a use the viewer feels in one second works best. Not a whole category ("Modern architecture"), not a list of famous things ("Greatest paintings"). The reel is shown mostly to strangers: the theme must make someone stop in one second and think of a particular person to send it to; at least half of the works should be ones a stranger has seen or would recognise.
 
 {TASTE}
 
 Every work must have a large image on Wikimedia Commons: paintings and prints by artists who died before about 1955, historical photographs, buildings with free-licensed photos. Pick specific works, one per author; mix famous and lesser-known.
 
 The reel is narrated and fast: each work is on screen only while its line is spoken. intro — the line spoken over the title card, up to 12 words: a hook that opens the question the collection answers, about what ties these works, without naming the title again ("Every one of these rooms was painted by someone who lived alone."). Each work gets a line — up to 11 words, spoken while it is on screen: one specific fact the viewer cannot see, which ties it to the theme (who, when, what happened, why it belongs here). Lines are joined like a story, not a list, and pull the viewer to the next work; the last work's line lands the idea and makes the first one read differently. Wrap the one word per line the narrator leans on in *asterisks*. delivery for each line and intro_delivery — 6–12 words of direction for the narrator (tone, pace).
+
+Every work is shown full-screen in a tall 9:16 frame, cropped around its main subject: choose works whose subject sits well in a vertical slice — figures, portraits, interiors, a single tree, a tower, a doorway, a strong centre; no wide panoramas or friezes. Colourful, luminous, legible works stop the scroll better than dark ones.
 
 format — all works in the reel are shown the same way. "vertical": every work fills the whole tall screen, so EVERY work must be a tall portrait-format image (height at least 1.4 times the width): full-length portraits, standing figures, towers, doorways, narrow streets, vertical photographs. Choose it only when the theme suits tall works. "framed": each work is shown whole on a dark wall, any proportions. When unsure — "framed". Give 10 works in viewing order (some may not be found, the reel uses up to 8); the first one opens the reel under the title, so it should be strong.
 
@@ -565,7 +571,7 @@ format — all works in the reel are shown the same way. "vertical": every work 
 {MUSIC}
 
 Return ONLY JSON:
-{{"format": "vertical|framed", "title": "on-screen title shown big from the first frame, up to 28 characters, sentence case, works as a headline a stranger stops for; wrap the one key word in *asterisks* — it goes on a red highlight (\"The art of *melancholy*\")", "theme_ru": "тема по-русски, коротко", "intro": "...", "intro_delivery": "...", "works": [{{"title": "title of the work in English or original", "author": "...", "year": "...", "commons": "query for Wikimedia Commons search: title and author, no year", "line": "...", "delivery": "..."}}], "caption": "1–3 short sentences for the Instagram caption: what ties these works together", "hashtags": ["5–8 lowercase words without #"], "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}"""
+{{"format": "vertical|framed", "title": "on-screen title shown big from the first frame, up to 24 characters, sentence case (the screen sets it in capitals), works as a headline a stranger stops for (\"Art to rest your mind\")", "theme_ru": "тема по-русски, коротко", "intro": "...", "intro_delivery": "...", "works": [{{"title": "title of the work in English or original", "author": "...", "year": "...", "commons": "query for Wikimedia Commons search: title and author, no year", "line": "...", "delivery": "..."}}], "caption": "1–3 short sentences for the Instagram caption: what ties these works together", "hashtags": ["5–8 lowercase words without #"], "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}"""
 
 MORE_SYSTEM = f"""You add works to an AHMAG Instagram reel compilation. Same rules: a specific work by an author not yet in the reel, with a large image on Wikimedia Commons (artists who died before about 1955, historical photographs, buildings with free photos), fitting the theme.
 
@@ -575,7 +581,9 @@ Each work also gets a line — up to 14 words spoken while it is on screen: one 
 
 Return ONLY JSON: {{"works": [{{"title": "...", "author": "...", "year": "...", "commons": "query for Wikimedia Commons", "line": "...", "delivery": "..."}}]}}"""
 
-PAINTING_SYSTEM = f"""You pick a painting for an AHMAG Instagram reel that walks through its details: the camera starts on the whole picture, then moves to 4–6 details one by one, with one short line on each, and the lines tell the painting's story. Example: Matejko's "Stańczyk" — a jester sits alone while the ball goes on next door; the letter on the table; the comet in the window; Poland has lost Smolensk.
+PAINTING_SYSTEM = f"""You pick a painting for an AHMAG Instagram reel that reads it with the viewer for a minute or more: the camera starts on the whole picture, then leads the eye through 7–12 details one by one ("look at the girl on the left… now look at him…"), and what the viewer finds builds into the painting's story. Examples of the kind of picture that works: Nigel Thomson's "On the Way Home from School" (a girl, a man with a chainsaw, an empty road — something is wrong), Bosch's "The Extraction of the Stone of Madness" (a fraud, a funnel hat, a flower instead of a stone), John Falter's "Sunday Gardening" (two neighbours, two ways to spend a Sunday), Matejko's "Stańczyk" (a jester alone while the court dances).
+
+The picture must be legible on a phone: people, hands, faces, objects and a setting that can each fill the screen when the camera moves in; not too dark; many visible details that carry meaning.
 
 Pick a painting (or a fresco, altarpiece, large print) that is in the public domain and has a large image on Wikimedia Commons; has several visible details that carry the story; has a documented story with tension, contrast or a twist that a stranger would care about in one second — someone is losing something, hiding something, doesn't know something, or the obvious reading is wrong. A famous painting is welcome — even better — if its real story is not the one everybody knows. Check the facts with web search. Not from the avoid list.
 
@@ -586,10 +594,10 @@ Pick a painting (or a fresco, altarpiece, large print) that is in the public dom
 {MUSIC}
 
 Return ONLY JSON:
-{{"title": "common English title", "author": "...", "year": "...", "museum": "museum, city", "medium": "e.g. Oil on canvas, if known", "size": "e.g. 88 × 120 cm, if known", "commons": "query for Wikimedia Commons search: title and author", "facts": ["6–10 specific verified facts in English, about what is shown, details, context, what happened"], {rk.VIRAL_SCHEMA}, "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}"""
+{{"title": "common English title", "author": "...", "year": "...", "museum": "museum, city", "medium": "e.g. Oil on canvas, if known", "size": "e.g. 88 × 120 cm, if known", "commons": "query for Wikimedia Commons search: title and author", "facts": ["10–16 specific verified facts in English, about what is shown, details, context, what happened, what critics or the museum say"], {rk.VIRAL_SCHEMA}, "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}"""
 
 HOOK_TYPES = {"contradiction": "противоречие", "hidden": "скрытая деталь", "stakes": "ставки",
-              "challenge": "вызов", "question": "вопрос", "number": "цифра"}
+              "challenge": "вызов", "question": "вопрос", "number": "цифра", "unease": "тревога"}
 
 STORY_SYSTEM = """You write the narration for an AHMAG Instagram reel about the painting in the image. A narrator reads it aloud, the words appear on screen as big captions as they are spoken, and the camera moves between details. Coordinates are fractions of the image width and height from its top-left corner (0 to 1).
 
@@ -598,13 +606,13 @@ STORY_SYSTEM = """You write the narration for an AHMAG Instagram reel about the 
 - Let the people in the painting think and feel through what we see: where they look, what they hold, who is missing.
 
 Example of the voice and structure (Matejko's "Stańczyk"; do not reuse its lines):
-  hook: "The only man not laughing at this party is the *jester*."   screen: "Why is only the *jester* sad?"
+  hook: "The only man not laughing at this party is the *jester*."
   context: "The court is dancing next door. He sits alone."
   reveals: "Because of the ^letter on this table. Smolensk has fallen. The war is *lost*." / "But next ^door, they're still dancing. Nobody has read it." / "And in the window, a ^comet. Back then, that meant worse was *coming*."
   climax: "He's the fool. He's the only one who *sees* it."
   final: "Matejko painted this in 1862. Poland wasn't on the map *anymore*."
 
-Structure — 15 to 25 seconds, 40–55 words in total:
+Structure — 25 to 35 seconds, 70–90 words in total:
 
 1. """ + rk.HOOK_RULES + """
    The hook's box is the close-up the reel opens on: the detail the hook talks about.
@@ -620,7 +628,7 @@ Boxes — [x0, y0, x1, y1], tight around the thing itself, not around the area i
 caption — the Instagram caption WITHOUT the hook (the hook is put above it automatically): first line "Title (year), Author"; then 2 short paragraphs with the story and one or two facts that did not fit the video; last line — museum and city. """ + rk.CAPTION_TAIL + """
 
 Return ONLY JSON:
-{"hooks": [{"type": "contradiction|hidden|stakes|number|challenge|question", "text": "...", "screen": "...", "box": [0.1, 0.2, 0.3, 0.5], "target": "...", "delivery": "..."}], "hook_pick": 0, "context": "...", "context_delivery": "...", "reveals": [{"box": [0.1, 0.2, 0.3, 0.5], "target": "...", "label": "...", "text": "...", "delivery": "..."}], "climax": {"text": "...", "box": [0.1, 0.2, 0.3, 0.5], "target": "...", "delivery": "..."}, "final": "...", "final_delivery": "...", "voice_direction": "...", "caption": "...", "hashtags": ["..."]}"""
+{"hooks": [{"type": "contradiction|hidden|stakes|number|challenge|question", "text": "...", "box": [0.1, 0.2, 0.3, 0.5], "target": "...", "delivery": "..."}], "hook_pick": 0, "context": "...", "context_delivery": "...", "reveals": [{"box": [0.1, 0.2, 0.3, 0.5], "target": "...", "label": "...", "text": "...", "delivery": "..."}], "climax": {"text": "...", "box": [0.1, 0.2, 0.3, 0.5], "target": "...", "delivery": "..."}, "final": "...", "final_delivery": "...", "voice_direction": "...", "caption": "...", "hashtags": ["..."]}"""
 
 REFINE_SYSTEM = """You refine bounding boxes for a video camera. Each image is a crop from a painting, photograph or drawing with a grid drawn over it: lines every 1/10 of the crop, numbered 0–10 along the top (x) and the left side (y). For each crop you get the thing the camera must frame. Give its tight box in grid units: x0, y0 (top-left) and x1, y1 (bottom-right), decimals allowed, 0 to 10. Tight around the thing itself, not its surroundings. If the thing is not in the crop, or you are not sure which one it is, return null for that crop.
 
@@ -645,8 +653,7 @@ async def judge_hooks(st: dict, image: Path | None, facts: list, background: boo
     if image and Path(image).exists():
         with Image.open(image) as im:
             content.append(_img_block(im.convert("RGB"), 1024, 80))
-    lines = [f"{i}. [{h.get('type') or 'hook'}] spoken: {h['text'].replace('*', '').replace('^', '')} | screen: "
-             f"{(h.get('screen') or '—')}" for i, h in enumerate(hooks)]
+    lines = [f"{i}. [{h.get('type') or 'hook'}] {h['text'].replace('*', '').replace('^', '')}" for i, h in enumerate(hooks)]
     text = ("Facts:\n" + "\n".join(f"- {f}" for f in (facts or [])[:10]) + "\n\nHooks:\n" + "\n".join(lines))
     try:
         data = await _ask(content + [{"type": "text", "text": text}], system=rk.HOOK_JUDGE, max_tokens=900,
@@ -674,11 +681,6 @@ async def judge_hooks(st: dict, image: Path | None, facts: list, background: boo
             h["score"] = scores[i]
     st["hooks"] = [hooks[i] for i in order]
     st["hook_i"] = 0
-    best = st["hooks"][0]
-    scr = str(data.get("screen") or "").strip().strip('"«»')
-    if scr and len(scr.replace("*", "")) <= 40 and scr != best.get("screen"):
-        best["screen_was"] = best.get("screen") or ""
-        best["screen"] = scr
     if data.get("why"):
         st["hook_why"] = str(data["why"])[:200]
 
@@ -697,10 +699,12 @@ def beats(d: dict) -> list[dict]:
     st = d.get("story")
     if not st:
         out = [{"kind": "context", "text": d.get("intro") or "", "box": None}]
-        return out + [{"kind": "reveal", "text": f.get("text") or "", "box": _box(f.get("box"))}
-                      for f in d.get("frames") or []]
+        out += [{"kind": "reveal", "text": f.get("text") or "", "box": _box(f.get("box"))} for f in d.get("frames") or []]
+        return [b for b in out if b["text"].strip()]
     if isinstance(st.get("context"), dict):
         return pair_beats(d)
+    if st.get("lines"):
+        return guide_beats(d)
     kind = d.get("kind") or "details"
     hooks = st.get("hooks") or []
     h = hooks[st.get("hook_i", 0) % len(hooks)] if hooks else None
@@ -729,6 +733,29 @@ def beats(d: dict) -> list[dict]:
         b["raw"] = b["text"]
         b["text"] = b["text"].replace("*", "").replace("^", "")
     return [b for b in out if b["text"].strip()]
+
+
+def guide_beats(d: dict) -> list[dict]:
+    """8.1, разбор как в рефах: хук над всей картиной, потом фразы «посмотрите на…», у каждой — своя деталь (box)
+    или вся картина. → [{kind: hook | line, text, raw, box, how}]."""
+    st = d.get("story") or {}
+    hooks = [h for h in st.get("hooks") or [] if (h.get("text") or "").strip()]
+    out = []
+    if hooks:
+        h = hooks[st.get("hook_i", 0) % len(hooks)]
+        out.append({"kind": "hook", "raw": h["text"], "box": _box(h.get("box")), "how": h.get("delivery")})
+    for ln in st.get("lines") or []:
+        if (ln.get("text") or "").strip():
+            b = {"kind": "line", "raw": ln["text"], "box": _box(ln.get("box")), "how": ln.get("delivery"), "label": "",
+                 "names": bool(ln.get("names"))}
+            mk = str(ln.get("mark") or "").lower()
+            if d.get("kind") == "read" and b["box"] and mk in ("axis", "level", "grid", "frame", "diagonals"):
+                b["mark"] = {"type": mk, "box": b["box"], "cols": ln.get("cols"), "rows": ln.get("rows")}
+            out.append(b)
+    for b in out:
+        b["raw"] = b["raw"].replace("*", "").replace("^", "")
+        b["text"] = b["raw"]
+    return out
 
 
 def pair_beats(d: dict) -> list[dict]:
@@ -809,6 +836,12 @@ async def refine_boxes(path: Path, st: dict, background: bool) -> int:
     items = [h for h in st.get("hooks") or []] + list(st.get("reveals") or []) + \
         ([st["climax"]] if (st.get("climax") or {}).get("box") else [])
     items = [x for x in items if _box(x.get("box"))]
+    same: dict = {}                       # guide: фразы с одной и той же деталью уточняются одной обрезкой
+    for ln in st.get("lines") or []:
+        b = _box(ln.get("box"))
+        if b:
+            same.setdefault(tuple(b), []).append(ln)
+    items += [group[0] for group in same.values()]
     if not items:
         return 0
     with Image.open(path) as im:
@@ -835,8 +868,11 @@ async def refine_boxes(path: Path, st: dict, background: bool) -> int:
             continue
         ax0, ay0, ax1, ay1 = crops[n][1]
         aw, ah = ax1 - ax0, ay1 - ay0
+        was = tuple(_box(items[n].get("box")) or ())
         items[n]["box"] = [round(ax0 + b[0] * aw, 4), round(ay0 + b[1] * ah, 4),
                            round(ax0 + b[2] * aw, 4), round(ay0 + b[3] * ah, 4)]
+        for ln in same.get(was, [])[1:]:
+            ln["box"] = list(items[n]["box"])
         done += 1
     return done
 
@@ -939,6 +975,9 @@ def build_caption(r_kind: str, d: dict) -> str:
             w = _disp(it, lang)
             lines.append(f"{n}. {w.get('title')} — {w.get('author')}" + (f", {w['year']}" if w.get("year") else ""))
         lines += ["", _credits(d.get("items") or [], lang), "", _tags(d.get("hashtags"), "ahmagreels")]
+    elif r_kind == "visit":
+        lines = [str(d.get("hook") or "").replace("*", ""), "", d.get("caption", "").strip(), "",
+                 _credits(d.get("shots") or [], lang), "", _tags(d.get("hashtags"), "ahmagreels")]
     else:
         hook = hook_text(d)
         its = [d["pair"]["a"], d["pair"]["b"]] if d.get("pair") else [d.get("painting") or {}]
@@ -973,6 +1012,8 @@ async def _collection(rid: int, d: dict, background: bool, client: httpx.AsyncCl
                 continue
             vertical = str(plan.get("format") or "").lower() == "vertical"
             tall = reelplan.BLEED + 0.03 if vertical else None
+            if reelplan.GUIDE:
+                vertical, tall = False, 1.6         # на весь высокий экран: широкие панорамы не годятся
             good = await verify(client, works[:12], background, max_aspect=tall)
             missing = [w["title"] for w in works if w["title"] not in {g["title"] for g in good}]
             for _ in range(MORE_ROUNDS):
@@ -1104,12 +1145,19 @@ async def _details(rid: int, d: dict, background: bool, client: httpx.AsyncClien
                         + "\n".join(f"- {f}" for f in d.get("facts") or [])
                         + ("\n\nThe previous version used these details and lines, choose others where possible:\n"
                            + "\n".join(avoid) if avoid else ""))
-                system = rk.localize(STORY_SYSTEM if kind == "details" else rk.story_system(kind), lang)
-                hooks, reveals, st = [], [], {}
+                guide = reelplan.GUIDE
+                system = (rk.localize_guide(rk.guide_story_system(kind), lang) if guide
+                          else rk.localize(STORY_SYSTEM if kind == "details" else rk.story_system(kind), lang))
+                hooks, reveals, lines, st = [], [], [], {}
                 for _ in range(2):                  # сюжет не сложился — ещё раз, потом другой объект
-                    st = await _ask([block, {"type": "text", "text": text}], system=system, max_tokens=5000,
+                    st = await _ask([block, {"type": "text", "text": text}], system=system, max_tokens=9000 if guide else 5000,
                                     background=background)
                     hooks = [h for h in st.get("hooks") or [] if h.get("text")]
+                    if guide:
+                        lines = [ln for ln in st.get("lines") or [] if (ln.get("text") or "").strip()]
+                        if hooks and len(lines) >= 8 and sum(1 for ln in lines if _box(ln.get("box"))) >= 4:
+                            break
+                        continue
                     reveals = [r for r in st.get("reveals") or [] if r.get("text") and _box(r.get("box"))][:4]
                     if hooks and len(reveals) >= 2:
                         break
@@ -1122,10 +1170,18 @@ async def _details(rid: int, d: dict, background: bool, client: httpx.AsyncClien
                 # выбранный хук — первым, остальные — для кнопки «Другой хук»
                 pick = pick if 0 <= pick < len(hooks) else 0
                 hooks = [hooks[pick]] + [h for i, h in enumerate(hooks) if i != pick]
-                d["story"] = {"hooks": hooks, "hook_i": 0, "context": st.get("context") or "", "reveals": reveals,
-                              "climax": st.get("climax") or {}, "final": st.get("final") or "",
-                              "context_delivery": st.get("context_delivery") or "", "final_delivery": st.get("final_delivery") or "",
-                              "voice_direction": st.get("voice_direction") or ""}
+                if guide:
+                    for ln in lines:
+                        if not _box(ln.get("box")):
+                            ln["box"] = None
+                    d["story"] = {"hooks": hooks, "hook_i": 0, "lines": lines,
+                                  "voice_direction": st.get("voice_direction") or ""}
+                else:
+                    d["story"] = {"hooks": hooks, "hook_i": 0, "context": st.get("context") or "", "reveals": reveals,
+                                  "climax": st.get("climax") or {}, "final": st.get("final") or "",
+                                  "context_delivery": st.get("context_delivery") or "",
+                                  "final_delivery": st.get("final_delivery") or "",
+                                  "voice_direction": st.get("voice_direction") or ""}
                 for k in ("figure_label", "context_box"):
                     if st.get(k):
                         d["story"][k] = st[k]
@@ -1337,6 +1393,167 @@ async def _pair(rid: int, d: dict, background: bool, client: httpx.AsyncClient) 
     return d
 
 
+# ======================= прогулка по зданию (8.1) =======================
+
+VISIT_MIN = 6
+
+
+async def commons_category(client: httpx.AsyncClient, category: str, limit: int = 60) -> list[dict]:
+    """Фото из категории Commons и её подкатегорий (один уровень, до 6): [{title, w, h, thumb, artist, license}].
+    Только крупные JPEG, по высоте хватает на вертикальный кадр."""
+    cat = category.strip()
+    if not cat.lower().startswith("category:"):
+        cat = "Category:" + cat
+    out, seen, cats = [], set(), [cat]
+
+    async def files(c: str) -> list:
+        params = {"action": "query", "format": "json", "generator": "categorymembers", "gcmtitle": c,
+                  "gcmtype": "file|subcat", "gcmlimit": "100", "prop": "imageinfo", "iiprop": "url|size|mime|extmetadata",
+                  "iiurlwidth": "400", "iiextmetadatafilter": "Artist|LicenseShortName"}
+        try:
+            return list((((await _commons_get(client, params)).get("query") or {}).get("pages") or {}).values())
+        except Exception as exc:
+            log.info("Commons %s: %s", c, exc)
+            return []
+    k = 0
+    while k < len(cats) and len(out) < limit:
+        for pg in await files(cats[k]):
+            if pg.get("ns") == 14:
+                if k == 0 and len(cats) < 7:
+                    cats.append(pg["title"])
+                continue
+            i = (pg.get("imageinfo") or [{}])[0]
+            if i.get("mime") != "image/jpeg" or not i.get("thumburl") or pg["title"] in seen:
+                continue
+            if min(i.get("width") or 0, i.get("height") or 0) < 1300:
+                continue
+            seen.add(pg["title"])
+            meta = i.get("extmetadata") or {}
+            out.append({"title": pg["title"], "w": i["width"], "h": i["height"], "thumb": i["thumburl"],
+                        "artist": _strip((meta.get("Artist") or {}).get("value", ""))[:80],
+                        "license": _strip((meta.get("LicenseShortName") or {}).get("value", ""))[:40]})
+        k += 1
+    return out[:limit]
+
+
+def _grid(thumbs: list, start: int) -> Image.Image:
+    """Контактный лист 4 × 3 с номерами (start + 1 …)."""
+    cell, cols = 300, 4
+    rows = max(1, -(-len(thumbs) // cols))
+    sheet = Image.new("RGB", (cols * cell, rows * (cell + 36)), (255, 255, 255))
+    dr = ImageDraw.Draw(sheet)
+    for n, t in enumerate(thumbs):
+        x, y = (n % cols) * cell, (n // cols) * (cell + 36)
+        if t is not None:
+            t = t.copy()
+            t.thumbnail((cell - 8, cell - 8))
+            sheet.paste(t, (x + (cell - t.width) // 2, y + 36 + (cell - t.height) // 2))
+        dr.text((x + 6, y + 4), str(start + n + 1), fill=(0, 0, 0), font=reelrender.font(26))
+    return sheet
+
+
+async def _visit(rid: int, d: dict, background: bool, client: httpx.AsyncClient) -> dict:
+    """Прогулка по зданию: здание с хорошей категорией Commons, 8–12 фото в порядке прогулки, факт текстом."""
+    folder = DIR / str(rid)
+    lang = rk.lang_of(d)
+    picked_now, last, attempt = False, "", 0
+    for attempt in range(1, PICK_TRIES + 1):
+        try:
+            if not d.get("building"):
+                picked_now = True
+                req = d.get("request")
+                prompt = ((f"The author asks for: {req}\n" if req else "")
+                          + "Avoid (already done):\n" + (("\n".join(await _avoid("visit"))) or "—")
+                          + _tried_prompt(d, "buildings"))
+                tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}]
+                system = rk.localize_pick(rk.VISIT_PICK, lang) + ("\n\n" + rk.VISIT_RU if lang == "ru" else "")
+                p = await _ask(prompt, system=system, max_tokens=4000, tools=tools, background=background)
+                if not p.get("title") or not p.get("hook"):
+                    raise SwapObject("Claude не выбрал здание")
+                what = f"{p['title']} — {p.get('author') or ''}".strip(" —")
+                weak = _weak(p, d)
+                if weak:
+                    raise SwapObject(f"«{p['title']}» — {weak}", what)
+                d.update(building={k: p.get(k) for k in ("title", "author", "year", "museum", "category", "commons", "ru")},
+                         title=p["title"], hook=p["hook"], facts=p.get("facts") or [], caption=p.get("caption") or "",
+                         hashtags=p.get("hashtags") or [], music=(p.get("music") or [])[:3], viral=p.get("viral"),
+                         send=p.get("send") or "")
+                d.pop("shots", None)
+            b = d["building"]
+            what = f"{b.get('title')} — {b.get('author') or ''}".strip(" —")
+            if not d.get("shots"):
+                cands = await commons_category(client, b.get("category") or b.get("title") or "")
+                if len(cands) < 12 and b.get("commons"):
+                    have = {c["title"] for c in cands}
+                    for q in (b["commons"], f"{b['commons']} interior"):
+                        cands += [c for c in await commons_candidates(client, q, 10) if c["title"] not in have]
+                        have = {c["title"] for c in cands}
+                if len(cands) < VISIT_MIN:
+                    raise SwapObject(f"у «{b.get('title')}» на Commons мало фото ({len(cands)})", what)
+                cands = cands[:48]
+                thumbs = await _thumbs(client, cands)
+                content: list = [{"type": "text", "text": f"Building: {b.get('title')} — {b.get('author')}, {b.get('year')}, "
+                                                          f"{b.get('museum')}. {len(cands)} photos on the sheets below."}]
+                for k in range(0, len(cands), 12):
+                    content.append(_img_block(_grid(thumbs[k:k + 12], k), 1400, 80))
+                sel = await _ask(content, system=rk.VISIT_SHOTS, max_tokens=1500, background=background)
+                shots = []
+                for x in sel.get("shots") or []:
+                    try:
+                        n = int(x.get("n")) - 1
+                        f = [min(1.0, max(0.0, float(x.get("fx", 0.5)))), min(1.0, max(0.0, float(x.get("fy", 0.5))))]
+                    except (TypeError, ValueError):
+                        continue
+                    mv = str(x.get("move") or "in").lower()
+                    if 0 <= n < len(cands) and all(s_["file"] != cands[n]["title"] for s_ in shots):
+                        shots.append({"file": cands[n]["title"], "focus": f, "move": mv if mv in ("in", "out", "left", "right", "up") else "in",
+                                      "artist": cands[n]["artist"], "license": cands[n]["license"]})
+                if len(shots) < VISIT_MIN:
+                    raise SwapObject(f"для «{b.get('title')}» не набралось {VISIT_MIN} хороших кадров", what)
+                d["shots"], d["visit_note"] = shots[:12], str(sel.get("note") or "")[:200]
+            ok = []
+            for n, sh in enumerate(d["shots"]):
+                path = folder / f"shot_{n:02d}_{hashlib.md5(sh['file'].encode()).hexdigest()[:8]}.jpg"
+                try:
+                    if not path.exists():
+                        await commons_download(client, sh["file"], path)
+                except Exception as exc:
+                    log.warning("Прогулка %s: не скачался кадр %s: %s", rid, sh["file"], exc)
+                    continue
+                sh["path"] = str(path)
+                ok.append(sh)
+            if len(ok) < VISIT_MIN:
+                d.pop("shots", None)
+                raise SwapObject(f"скачалось только {len(ok)} кадров «{b.get('title')}»", what)
+            d["shots"] = ok
+            break
+        except SwapObject as exc:
+            if not picked_now:
+                raise ReelError(f"{exc} — попробуй «Другое здание»") from exc
+            last = str(exc)
+            log.info("Рилс %s: попытка %s — %s, беру другое здание", rid, attempt, last)
+            _mark_tried(d, exc.what)
+            for k in ("building", "shots", "hook", "facts", "music", "title", "caption"):
+                d.pop(k, None)
+            await _set(rid, data=d)
+    else:
+        raise ReelError(f"перебрал {PICK_TRIES} зданий — ни одно не подошло (последнее: {last}). «Ещё раз» продолжит с новыми")
+    if attempt > 1:
+        d["swap_note"] = f"собрал с {attempt}-й попытки — до этого: {last}"
+    b = d["building"]
+    if lang == "ru":
+        await _ensure_ru([b], background)
+    show = {**b, **_disp(b, lang)}
+    video = folder / f"reel_{int(datetime.now().timestamp())}.mp4"
+    if not reelplan.available():
+        raise ReelError(f"прогулка собирается только новой вёрсткой: {reelplan.why_not()}")
+    props = await asyncio.to_thread(reelplan.visit_props, folder, {**d, "building": show})
+    d["duration"] = await asyncio.to_thread(reelplan.render, "Visit", props, folder, video)
+    d["video"], d["cover_t"] = str(video), props.get("coverT")
+    d["painting"] = {k: b.get(k) for k in ("title", "author", "year", "museum", "ru")}   # для карточки и подписи
+    return d
+
+
 async def _voice(folder: Path, d: dict, bs: list[dict]) -> list | dict | None:
     """Озвучить вступление и фразы деталей. Уже озвученное (тот же текст, тот же голос) не синтезируется заново.
     Не вышло — рилс собирается без звука, а в d["voice_note"] — почему."""
@@ -1423,7 +1640,7 @@ async def generate(bot: Bot, rid: int, background: bool = True) -> None:
             d["kind"] = r["kind"]
             eng = rk.engine(r["kind"])
             async with httpx.AsyncClient(headers=UA, follow_redirects=True) as client:
-                d = await {"collection": _collection, "pair": _pair}.get(eng, _details)(rid, d, background, client)
+                d = await {"collection": _collection, "pair": _pair, "visit": _visit}.get(eng, _details)(rid, d, background, client)
         except Exception as exc:
             log.exception("Рилс %s", rid)
             why = str(exc) if isinstance(exc, ReelError) else curator.explain(exc)
@@ -1494,7 +1711,11 @@ def _card_text(r, d: dict, note: str | None = None) -> str:
             it = _disp(it, lang)
             return (f"<b>{html.escape(it.get('title') or '')}</b> — {html.escape(it.get('author') or '')}"
                     + (f", {html.escape(str(it['year']))}" if it.get("year") else ""))
-        if d.get("pair"):
+        if r["kind"] == "visit":
+            lines.append("\n" + line(d.get("painting") or d.get("building") or {}))
+            lines.append(f"🪝 <b>{html.escape(str(d.get('hook') or ''))}</b>")
+            lines.append(f"📷 {len(d.get('shots') or [])} кадров" + (f" — {html.escape(d['visit_note'])}" if d.get("visit_note") else ""))
+        elif d.get("pair"):
             roles = rk.roles(r["kind"], lang)
             lines.append(f"\n{roles[0]}: {line(d['pair']['a'])}\n{roles[1]}: {line(d['pair']['b'])}")
         else:
@@ -1503,7 +1724,17 @@ def _card_text(r, d: dict, note: str | None = None) -> str:
         mark = {"hook": "🪝", "context": "·", "reveal": "·", "climax": "❗️", "final": "↩️"}
         side = {"a": "A", "b": "B", "both": "A+B"}
         st = d.get("story") or {}
-        for b in beats(d):
+        bs = beats(d)
+        n_lines = sum(1 for b in bs if b["kind"] == "line")
+        shown = 0
+        for b in bs:
+            if b["kind"] == "line":
+                # разбор длинный: в карточке — начало, остальное видно в ролике
+                shown += 1
+                if shown > 4:
+                    if shown == 5:
+                        lines.append(f"… ещё {n_lines - 4} фраз")
+                    continue
             tag = f"<i>[{side[b['show']]}]</i> " if b.get("show") else ""
             if b["kind"] == "hook":
                 hooks = st.get("hooks") or []
@@ -1514,7 +1745,7 @@ def _card_text(r, d: dict, note: str | None = None) -> str:
                 if h.get("screen"):
                     lines.append(f"🔠 на экране: «{html.escape(h['screen'].replace('*', ''))}»")
             else:
-                lines.append(f"{mark[b['kind']]} {tag}{html.escape(cut(b['text']))}")
+                lines.append(f"{mark.get(b['kind'], '·')} {tag}{html.escape(cut(b['text']))}")
     if d.get("send"):
         lines.append(f"📨 <i>Перешлют, потому что: {html.escape(str(d['send'])[:160])}</i>")
     mus = _music_lines(d)
@@ -1524,7 +1755,7 @@ def _card_text(r, d: dict, note: str | None = None) -> str:
         lines.append(f"\n🔄 {html.escape(d['swap_note'])}")
     if d.get("render_note"):
         lines.append(f"\n⚠️ {html.escape(d['render_note'])}")
-    if r["kind"] != "collection" or d.get("voice"):
+    if r["kind"] not in ("collection", "visit") or d.get("voice"):
         lines.append("\n" + (f"⚠️ {html.escape(d['voice_note'])}" if d.get("voice_note") else f"🎙 {html.escape(d.get('voice_label') or '')}"))
     lines.append(f"\n⏱ {d.get('duration', 0):.0f} с · подпись {rk.LANG_RU[lang]} придёт в день выхода")
     text = "\n".join(lines)
@@ -2367,7 +2598,7 @@ async def on_cb(cb: CallbackQuery, bot: Bot, state: FSMContext):
     elif a == "lang":
         # тот же объект, рассказ заново на другом языке; подборку — заново целиком (строки работ привязаны к языку)
         lang = "en" if lang == "ru" else "ru"
-        if r["kind"] == "collection":
+        if r["kind"] in ("collection", "visit"):
             d = {k: v for k, v in d.items() if k == "request"}
         else:
             for k in ("story", "frames", "caption", "hashtags", "avoid_frames", "caption_override", "auto_pick"):
@@ -2375,6 +2606,9 @@ async def on_cb(cb: CallbackQuery, bot: Bot, state: FSMContext):
         d["lang"] = lang
         await db.set_setting("reel_last_lang", lang)
         note = f"Переделываю {rk.LANG_RU[lang]}"
+    elif a == "det" and r["kind"] == "visit":
+        d.pop("shots", None)
+        note = "Подбираю другие кадры"
     elif a == "det":
         if r["kind"] == "collection":
             return await cb.answer()

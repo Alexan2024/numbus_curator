@@ -17,6 +17,8 @@ const FONT_FILES = (lang?: string): [string, string, FontFaceDescriptors][] => [
   ['AhSerif', lang === 'ru' ? 'NotoSerifDisplay-Cond-Regular.ttf' : 'InstrumentSerif-Regular.ttf', {}],
   ['AhSerif', lang === 'ru' ? 'NotoSerifDisplay-Cond-Italic.ttf' : 'InstrumentSerif-Italic.ttf', {style: 'italic'}],
   ['AhGrot', 'InterTight.ttf', {weight: '100 900'}],
+  // guide: субтитры — узкая контрастная антиква средней насыщенности, одна для латиницы и кириллицы
+  ['AhCap', 'NotoSerifDisplay-Cond-Medium.ttf', {}],
   ['AhMono', 'IBMPlexMono-Regular.ttf', {}],
   ['AhMono', 'IBMPlexMono-Medium.ttf', {weight: '500'}],
 ];

@@ -37,10 +37,13 @@ CONCURRENCY = str(max(1, min(int(os.getenv("REMOTION_CONCURRENCY", "2")), os.cpu
 # Стиль рилса (8.0). pulse — быстрый монтаж под ленту: кадр 0 уже в движении, заголовок-хук сверху с первого кадра,
 # крупные субтитры по 2–4 слова, резкие переезды, толчки камеры на ударных словах, рамка на детали, размытая
 # картина вместо чёрных полей, без отдельного титра в конце — сразу повтор. calm — прежняя спокойная вёрстка.
-STYLE = os.getenv("REEL_STYLE", "pulse").strip().lower()
-if STYLE not in ("pulse", "calm"):
-    STYLE = "pulse"
+# guide (8.1, по умолчанию) — как в рефах автора (Cimmera, Paintings Analyzed, The Non Museum): картина на весь экран,
+# спокойная камера от детали к детали под голос, тихие субтитры антиквой, без плашек, рамок и строки со знаком.
+STYLE = os.getenv("REEL_STYLE", "guide").strip().lower()
+if STYLE not in ("guide", "pulse", "calm"):
+    STYLE = "guide"
 PULSE = STYLE == "pulse"
+GUIDE = STYLE == "guide"
 
 
 def available() -> bool:
@@ -399,7 +402,7 @@ def backdrop(image: Path, folder: Path, ratio: float = W / H) -> str | None:
         return None
 
 
-def grade(image: Path, folder: Path) -> Path:
+def grade(image: Path, folder: Path, target: float = 0.34, gmin: float = 0.62) -> Path:
     """pulse: тёмную картину слегка высветлить — в ленте тёмный кадр пролистывают. Поднимаются тени (гамма),
     светлые места не выбиваются; уже светлую картинку не трогаем. → путь к картинке для рендера."""
     import numpy as np
@@ -407,9 +410,9 @@ def grade(image: Path, folder: Path) -> Path:
         with Image.open(image) as im:
             small = np.asarray(im.convert("L").resize((256, 256)), dtype=np.float32) / 255
             mean = float(small.mean())
-            if mean >= 0.32:
+            if mean >= target - 0.02:
                 return image
-            g = max(0.62, min(1.0, math.log(0.34) / math.log(max(mean, 0.02))))
+            g = max(gmin, min(1.0, math.log(target) / math.log(max(mean, 0.02))))
             dest = folder / f"graded_{hashlib.md5(f'{image}|{g:.3f}'.encode()).hexdigest()[:8]}.jpg"
             if dest.exists():
                 return dest
@@ -474,6 +477,8 @@ def _punches(out: list[dict], moves: list[tuple[float, float]]) -> list[float]:
 def story_props(folder: Path, image: Path, beats: list[dict], voice, pt: dict, sfx: bool = True) -> dict:
     """beats — reels.beats(d) (с raw — текст с *акцентами* и ^якорем); voice — дубль OpenAI (dict), фразы по одной
     (list) или None. → props для композиции Story (пути — относительно folder, их заменит render())."""
+    if GUIDE and any(b["kind"] == "line" for b in beats):
+        return guide_props(folder, image, beats, voice, pt, sfx)
     if PULSE:
         image = grade(image, folder)
     pw, ph = _size(image)
@@ -680,6 +685,99 @@ def story_props(folder: Path, image: Path, beats: list[dict], voice, pt: dict, s
             "lang": lang, **extra}
 
 
+# ======================= guide: разбор картины, как в рефах =======================
+# Картина — на весь экран, кроме общего плана в начале и в конце (там она целиком на чёрном, как у Cimmera).
+# Каждая фраза — своя деталь (box) или вся картина (None); камера плывёт к ней 1–2 с по синусу и медленно наезжает,
+# пока фраза звучит. Несколько фраз подряд с той же деталью — камера стоит. Субтитры — антиквой внизу по центру.
+
+G_MARGIN = 60                 # поля у картины целиком
+G_WIN = (180, 1380)           # куда ставится деталь: от верха почти до субтитров
+G_MOVE = (1.0, 2.0)           # переезд, с
+G_HOLD = 1.05                 # наезд, пока звучит фраза
+G_END = 3.2                   # титр в конце: картина целиком и название
+
+
+def _g_whole(pw, ph, cy=H / 2 - 40):
+    """Вся картина на чёрном: по ширине с полями (высокая — не выше 1500 px), центр — cy экрана."""
+    s = min((W - 2 * G_MARGIN) / pw, 1500 / ph)
+    return [pw / 2, ph / 2 - (cy - H / 2) / s, W / s]
+
+
+def _g_detail(pw, ph, box):
+    """Деталь крупно, а вокруг — картина до краёв экрана (без чёрных полей, если картина это позволяет)."""
+    x0, y0, x1, y1 = [max(0.0, min(1.0, float(v))) for v in box]
+    bx0, by0, bx1, by1 = x0 * pw, y0 * ph, x1 * pw, y1 * ph
+    bw, bh = max(bx1 - bx0, pw * 0.03), max(by1 - by0, ph * 0.03)
+    wy0, wy1 = G_WIN
+    s = min(0.84 * W / bw, 0.8 * (wy1 - wy0) / bh)
+    cover = max(W / pw, H / ph)                         # меньше — по краям экрана видно чёрное
+    s = max(min(s, max(ZOOM_MAX, cover)), cover if cover <= 1.7 else 0)
+    if s <= 0:
+        s = min(0.84 * W / bw, 0.8 * (wy1 - wy0) / bh, ZOOM_MAX)
+    cy = (by0 + by1) / 2 - ((wy0 + wy1) / 2 - H / 2) / s
+    return _clamp_cam(pw, ph, (bx0 + bx1) / 2, cy, W / s)
+
+
+def guide_props(folder: Path, image: Path, beats: list[dict], voice, pt: dict, sfx: bool = True) -> dict:
+    """Разбор картины в стиле guide. beats — reels.beats(d): хук и фразы (kind line) с box. → props для Story."""
+    image = grade(image, folder, 0.28, 0.8)              # очень тёмную картину чуть высветлить — без «серости»
+    pw, ph = _size(image)
+    whole = _g_whole(pw, ph)
+    out, clips, voice_end = _timeline(beats, voice)
+    # «вся картина» посреди рассказа: широкую не держим крошечной на чёрном — она крупнее, по высоте почти до
+    # субтитров (края срезаны); целиком — только на хуке и на фразе с названием
+    s_whole = W / whole[2]
+    s_mid = min(max(s_whole, 1180 / ph), s_whole * 1.75)
+    mid = _clamp_cam(pw, ph, pw / 2, ph / 2 - (H / 2 - 40 - H / 2) / s_mid, W / s_mid)
+    views = []
+    for b in beats:
+        box = _box4(b.get("box")) if b.get("box") else None
+        if box:
+            views.append(_g_detail(pw, ph, box))
+        elif b["kind"] == "hook" or b.get("names") or "«" in b.get("raw", ""):
+            views.append(whole)
+        else:
+            views.append(mid)
+    cam = [[0.0, *whole, 0]]
+    prev_arrive, moves = 0.0, []
+    for i in range(1, len(beats)):
+        a, b = views[i - 1], views[i]
+        if all(abs(x - y) < 1e-6 for x, y in zip(a, b)):
+            continue                                     # та же деталь — камера стоит, только медленный наезд
+        need = min(G_MOVE[1], max(G_MOVE[0], _need(a, b) * 0.9))
+        # камера трогается вместе с фразой «Посмотрите на…» и приезжает, пока она звучит
+        arrive = max(out[i]["start"] - 0.15 + need, prev_arrive + 0.6 + need)
+        leave = arrive - need
+        k = 1.22 if i == 1 and not beats[0].get("box") else 1 + (G_HOLD - 1) * min(1.0, (leave - prev_arrive) / 3.0)
+        held = _hold(pw, ph, a, beats[i - 1].get("box"), k)      # на хуке картина целиком заметно приближается
+        cam.append([round(leave, 3), *held, 0])
+        cam.append([round(arrive, 3), *b, 0])
+        moves.append((leave, arrive))
+        prev_arrive = arrive
+    end_speech = max(voice_end, out[-1]["end"])
+    last = views[-1]
+    cam.append([max(end_speech, cam[-1][0] + 0.5), *_hold(pw, ph, last, beats[-1].get("box"), G_HOLD), 0])
+    # титр: картина целиком повыше, под ней — название и автор
+    end_start = cam[-1][0] + 0.2
+    s_end = min((W - 2 * G_MARGIN) / pw, 1180 / ph)
+    end_view = [pw / 2, ph / 2 - (840 - H / 2) / s_end, W / s_end]
+    cam.append([end_start, *cam[-1][1:4], 0])
+    cam.append([end_start + 1.2, *end_view, 0])
+    dur = end_start + G_END
+    label_top = round(840 + ph * s_end / 2 + 70)
+    voice_path = None
+    if clips:
+        voice_path = folder / "voice_mix.wav"
+        _mix_voice(clips, dur, voice_path)
+    year = str(pt.get("year") or "").strip()
+    return {"fps": FPS, "duration": round(dur * FPS), "pw": pw, "ph": ph, "style": "guide",
+            "cam": [[round(x, 3) for x in k] for k in cam], "marks": _marks(beats, out, pw, ph, end_start),
+            "beats": out, "sfx": [], "slack": [0, 0], "endStart": round(end_start, 3), "labelTop": label_top,
+            "title": pt.get("title") or "", "sub": ", ".join(x for x in (pt.get("author"), year) if x),
+            "image": str(image), "voice": str(voice_path) if voice_path else None, "_dur": dur,
+            "coverT": round(min(1.2, out[0]["end"] * 0.5), 2), "lang": pt.get("lang") or "en", "loopStart": None}
+
+
 # ======================= время частей рассказа (пары, подборки) =======================
 
 def _timeline(beats: list[dict], voice, min_part: float = 1.6) -> tuple[list[dict], list, float]:
@@ -715,13 +813,16 @@ def _timeline(beats: list[dict], voice, min_part: float = 1.6) -> tuple[list[dic
             trim = max(0.0, float(v["starts"][0]) - 0.06) if v and v.get("starts") else 0.0
             if PULSE:
                 s0 = 0.0 if i == 0 else t + (0.35 if b["kind"] == "climax" else 0.06)
+            elif GUIDE:
+                # между фразами — короткий вдох, как у живого рассказчика; после хука — чуть дольше
+                s0 = 0.0 if i == 0 else t + (0.45 if beats[i - 1]["kind"] == "hook" else 0.28)
             else:
                 s0 = 0.0 if i == 0 else t + (0.6 if b["kind"] == "climax" else 0.2)
             speech = (float(v["dur"]) - trim) if v else n * 0.32 + 0.3
-            if PULSE and v and v.get("audio"):
+            if (PULSE or GUIDE) and v and v.get("audio"):
                 speech = _speech_end(v["audio"], float(v["dur"])) - trim
             ws = [s0 + x - trim for x in v["starts"]] if v and v.get("starts") else [s0 + k * 0.32 for k in range(n)]
-            if PULSE:
+            if PULSE or GUIDE:
                 tail = 0.1 if b["kind"] == "hook" else 0.45 if b["kind"] == "climax" else 0.12
                 e = max(s0 + min(min_part, 1.0), s0 + speech + tail)
             else:
@@ -1080,7 +1181,49 @@ def collection_beats(d: dict) -> list[dict]:
 PULSE_BOX = (470, 1340)                               # pulse: поле работы — от подписи сверху до субтитров (немного под них)
 
 
+G_SHOT = float(os.getenv("REEL_COLLECTION_SHOT", "3.6"))   # guide: сколько секунд на работу в подборке
+
+
+def guide_collection_props(folder: Path, d: dict, sfx: bool = True, voice=None) -> dict:
+    """Подборка в стиле guide (как у The Non Museum): титул-тема на первой работе, дальше работы по G_SHOT секунд,
+    каждая на весь экран (кадр по фокусу), название и автор — тонкими прописными сверху. С голосом — работа держится,
+    пока звучит её строка."""
+    paths = [grade(Path(it["path"]), folder, 0.24, 0.85) for it in d["items"]]
+    sizes = [_size(x) for x in paths]
+    n_all = len(paths)
+    bs = collection_beats(d) if voice else []
+    tl, clips, voice_end = _timeline(bs, voice) if bs else ([], [], 0.0)
+    ru = d.get("lang") == "ru"
+    if tl:
+        starts = [0.0] + [tl[k + 1]["start"] - 0.15 for k in range(1, n_all)]
+        last_end = max(voice_end, tl[-1]["end"]) + 0.6
+        title_end = max(2.4, starts[1] if n_all > 1 else last_end)
+    else:
+        starts = [k * G_SHOT for k in range(n_all)]
+        last_end = n_all * G_SHOT
+        title_end = G_SHOT
+    items = []
+    for n, (it, path, (pw, ph)) in enumerate(zip(d["items"], paths, sizes)):
+        end = starts[n + 1] if n + 1 < n_all else last_end
+        items.append({"image": str(path), "pw": pw, "ph": ph, "focus": it.get("focus") or [0.5, 0.5],
+                      "start": round(starts[n], 3), "dur": round(end - starts[n], 3),
+                      "title": (ru and it.get("title_ru")) or it.get("title") or "",
+                      "author": (ru and it.get("author_ru")) or it.get("author") or ""})
+    dur = last_end
+    voice_path = None
+    if clips:
+        voice_path = folder / "voice_mix.wav"
+        _mix_voice(clips, dur, voice_path)
+    return {"fps": FPS, "duration": round(dur * FPS), "items": items, "style": "guide",
+            "title": (d.get("title_em") or d.get("title") or "").replace("*", ""), "titleEnd": round(title_end, 3),
+            "beats": tl[1:] if tl else [], "intro": tl[0]["words"] if tl else None,
+            "voice": str(voice_path) if voice_path else None, "coverT": 1.0, "sfx": [], "_dur": dur,
+            "lang": d.get("lang") or "en"}
+
+
 def collection_props(folder: Path, d: dict, sfx: bool = True, voice=None) -> dict:
+    if GUIDE:
+        return guide_collection_props(folder, d, sfx, voice)
     paths = [Path(it["path"]) for it in d["items"]]
     if PULSE:
         paths = [grade(x, folder) for x in paths]
@@ -1148,6 +1291,35 @@ def collection_props(folder: Path, d: dict, sfx: bool = True, voice=None) -> dic
                if PULSE else {})}
 
 
+# ======================= прогулка по зданию (8.1) =======================
+
+V_SHOT = float(os.getenv("REEL_VISIT_SHOT", "2.4"))     # сколько секунд на кадр
+V_LAST = 3.4                                             # последний кадр — дольше: на нём название
+
+
+def visit_props(folder: Path, d: dict) -> dict:
+    """Прогулка: кадры по V_SHOT секунд, каждый на весь экран (кадр по фокусу) со своим движением; факт — текстом
+    в начале, название и архитектор — на последнем кадре. Голоса нет: музыку кладёт автор."""
+    shots, t = [], 0.0
+    sh = d["shots"]
+    for n, s_ in enumerate(sh):
+        path = grade(Path(s_["path"]), folder, 0.24, 0.88)
+        pw, ph = _size(path)
+        dur = V_LAST if n == len(sh) - 1 else V_SHOT
+        shots.append({"image": str(path), "pw": pw, "ph": ph, "focus": s_.get("focus") or [0.5, 0.5],
+                      "move": s_.get("move") or "in", "start": round(t, 3), "dur": round(dur, 3)})
+        t += dur
+    hook = str(d.get("hook") or "").replace("*", "").strip()
+    # факт держится, пока его можно дважды прочитать, но не дольше половины ролика
+    hook_end = min(t * 0.5, max(6.0, len(hook.split()) * 0.55 + 3.0))
+    b = d.get("building") or {}
+    return {"fps": FPS, "duration": round(t * FPS), "shots": shots, "style": "guide", "hook": hook,
+            "hookEnd": round(hook_end, 3), "title": b.get("title") or d.get("title") or "",
+            "sub": ", ".join(x for x in (b.get("author"), str(b.get("year") or "")) if x and x != "None"),
+            "creditStart": round(t - V_LAST + 0.4, 3), "coverT": 0.8, "sfx": [], "voice": None, "_dur": t,
+            "lang": d.get("lang") or "en"}
+
+
 # ======================= рендер =======================
 
 def render(comp: str, props: dict, folder: Path, out: Path) -> float:
@@ -1168,6 +1340,8 @@ def render(comp: str, props: dict, folder: Path, out: Path) -> float:
                 it["backdrop"] = fix(it["backdrop"])
         for l in props.get("layers") or []:
             l["src"] = fix(l["src"])
+        for sh in props.get("shots") or []:
+            sh["image"] = fix(sh["image"])
         for e in props.get("sfx") or []:
             e["src"] = fix(e["src"])
         pfile = folder / f"props_{comp}.json"

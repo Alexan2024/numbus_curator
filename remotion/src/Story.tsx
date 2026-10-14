@@ -4,6 +4,7 @@ import {Bar, Fonts, Grain, INK, Sfx, Stage, camState, clamp, clampCam} from './c
 import {Label, Narration, Scrims} from './Narration';
 import {Marks} from './Marks';
 import {Backdrop, Captions, Headline, PulseScrims, punchAt} from './Pulse';
+import {StoryGuide} from './Guide';
 
 /* Одна картинка, камера ходит по деталям под голос: «Детали картины», «Одна фотография», «Масштаб»,
    «Разбор здания». Хук на крупной детали, рассказ словами по голосу, над строкой — номер и имя детали,
@@ -11,7 +12,8 @@ import {Backdrop, Captions, Headline, PulseScrims, punchAt} from './Pulse';
    к первому кадру — повтор ролика начинается без стыка. Линии (marks) — только в «Разборе» и «Масштабе».
    style = pulse (8.0) — своя вёрстка под ленту: см. Pulse.tsx и StoryPulse ниже. */
 
-export const Story: React.FC<any> = (p) => p.style === 'pulse' ? <StoryPulse {...p} /> : <StoryCalm {...p} />;
+export const Story: React.FC<any> = (p) => p.style === 'guide' ? <StoryGuide {...p} />
+  : p.style === 'pulse' ? <StoryPulse {...p} /> : <StoryCalm {...p} />;
 
 const StoryCalm: React.FC<any> = (p) => {
   const frame = useCurrentFrame(); const t = frame / p.fps;
