@@ -5,6 +5,8 @@ export const W = 1080, H = 1920, A = H / W, M = 72;
 // знак и название — ниже шапки Instagram (на 150 px её «Reels» и камера их закрывали)
 export const BAR_TOP = 280;   // = верхние 14% кадра, которые Meta советует не занимать
 export const INK = '#F2EEE6', MUTE = 'rgba(242,238,230,.62)';
+// pulse (8.0): один акцентный цвет — красная линия архитектора, как в «Разборе»: рамка на детали, ударное слово
+export const ACCENT = '#E2492B';
 
 // Шрифты загружаются через FontFace, и кадр не снимается, пока они не загрузились (delayRender). Имена
 // семейств с приставкой Ah: «Serif» без кавычек браузер читал как общее семейство serif и брал системную
@@ -45,17 +47,24 @@ export const out3 = {...clamp, easing: Easing.out(Easing.cubic)};
 
 // разгон и торможение по синусу: скорость нарастает и спадает мягко, без рывка на стыках
 export const easeSine = (u: number) => -(Math.cos(Math.PI * Math.min(1, Math.max(0, u))) - 1) / 2;
+// pulse: круче разгон и торможение — переезд-рывок, почти вся дорога на середине (там же и смаз)
+export const easeQuart = (u: number) => { const x = Math.min(1, Math.max(0, u));
+  return x < .5 ? 8 * x ** 4 : 1 - (-2 * x + 2) ** 4 / 2; };
+export type Ease = 'sine' | 'quart';
+const EASE = {sine: easeSine, quart: easeQuart};
 // камера: [время, cx, cy, ширина кадра, растворение] в пикселях картины. Отрезок, который кончается ключом
 // с растворением = 1, — не проезд: кадр предыдущего ключа растворяется в кадре этого
 export type Cam = number[];
 export type CamState = {cam: [number, number, number]; prev?: [number, number, number]; mix: number};
-export function camState(keys: Cam[], t: number): CamState {
+export function camState(keys: Cam[], t: number, ease: Ease = 'sine'): CamState {
   if (!keys.length) return {cam: [0, 0, 1], mix: 1};
   if (t <= keys[0][0]) return {cam: [keys[0][1], keys[0][2], keys[0][3]], mix: 1};
   for (let i = 0; i < keys.length - 1; i++) {
     const a = keys[i], b = keys[i + 1];
     if (t <= b[0]) {
-      const u = easeSine((t - a[0]) / Math.max(b[0] - a[0], 1e-6));
+      // наезд с самого первого кадра (первый отрезок) — с места и с торможением: движение видно сразу
+      const raw = (t - a[0]) / Math.max(b[0] - a[0], 1e-6);
+      const u = ease === 'quart' && i === 0 && a[0] === 0 ? 1 - (1 - Math.min(1, Math.max(0, raw))) ** 3 : EASE[ease](raw);
       if (b[4] === 1) return {cam: [b[1], b[2], b[3]], prev: [a[1], a[2], a[3]], mix: u};
       return {cam: [a[1] + (b[1] - a[1]) * u, a[2] + (b[2] - a[2]) * u,
         Math.exp(Math.log(a[3]) + (Math.log(b[3]) - Math.log(a[3])) * u)], mix: 1};
@@ -64,7 +73,7 @@ export function camState(keys: Cam[], t: number): CamState {
   const l = keys[keys.length - 1];
   return {cam: [l[1], l[2], l[3]], mix: 1};
 }
-export const camAt = (keys: Cam[], t: number) => camState(keys, t).cam;
+export const camAt = (keys: Cam[], t: number, ease: Ease = 'sine') => camState(keys, t, ease).cam;
 
 // кадр не выходит за картину (с запасом slack экранных px) по тем осям, где он её меньше
 export function clampCam(pw: number, ph: number, c: [number, number, number], slack: number[] = [0, 0]):
@@ -98,12 +107,14 @@ export const Sfx: React.FC<{list?: any[]; fps: number}> = ({list, fps}) => <>{(l
     <Audio src={String(e.src).startsWith('static:') ? staticFile(String(e.src).slice(7)) : e.src} volume={e.vol} />
   </Sequence>)}</>;
 
-export const Bar: React.FC<{text: string; opacity?: number}> = ({text, opacity = 1}) =>
+export const Bar: React.FC<{text: string; opacity?: number; strong?: boolean}> = ({text, opacity = 1, strong}) =>
   <div style={{position: 'absolute', left: M, right: M, top: BAR_TOP, display: 'flex', alignItems: 'center', gap: 22,
-    fontFamily: 'AhMono', fontSize: 21, letterSpacing: '.14em', textTransform: 'uppercase', color: MUTE, opacity}}>
+    fontFamily: 'AhMono', fontSize: strong ? 23 : 21, fontWeight: strong ? 500 : 400, letterSpacing: '.14em',
+    textTransform: 'uppercase', color: strong ? INK : MUTE, opacity,
+    textShadow: strong ? '0 1px 10px rgba(0,0,0,.6)' : undefined}}>
     <Img src={staticFile('logo.png')} style={{height: 30, opacity: .9}} />
-    <span style={{width: 46, height: 1, background: MUTE}} />
-    <span>{text}</span>
+    {text ? <span style={{width: 46, height: 1, background: MUTE}} /> : null}
+    {text ? <span>{text}</span> : null}
   </div>;
 
 export const Grain: React.FC<{frame: number}> = ({frame}) => {

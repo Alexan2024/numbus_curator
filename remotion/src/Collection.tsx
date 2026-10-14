@@ -2,6 +2,7 @@ import React from 'react';
 import {AbsoluteFill, Audio, Img, interpolate, useCurrentFrame} from 'remotion';
 import {Bar, Fonts, Grain, INK, M, MUTE, Rich, Sfx, clamp, easeSine, out3} from './common';
 import {Word} from './Narration';
+import {Backdrop, Captions, HEAD_TOP, Headline, PulseScrims} from './Pulse';
 
 /* Подборка: титул на первой работе, затем работы по несколько секунд. Все работы подборки — в одном виде:
    mode = bleed — все на весь кадр (подборка вертикальных работ), mode = frame — все целиком, как на стене:
@@ -39,6 +40,7 @@ const Caption: React.FC<{it: any; i: number; total: number; t: number}> = ({it, 
 
 export const Collection: React.FC<any> = (p) => {
   const frame = useCurrentFrame(); const t = frame / p.fps;
+  if (p.style === 'pulse') return <CollectionPulse p={p} t={t} frame={frame} />;
   const titleK = interpolate(t, [p.titleEnd - 0.4, p.titleEnd], [1, 0], clamp);
   const total = p.items.length;
   const bleed = p.mode === 'bleed';
@@ -104,6 +106,52 @@ export const Collection: React.FC<any> = (p) => {
     </AbsoluteFill>}
 
     <Bar text={t < p.titleEnd || loopK > 0 ? (p.lang === 'ru' ? `Подборка · ${total} ${total % 10 >= 2 && total % 10 <= 4 && (total < 12 || total > 14) ? 'работы' : 'работ'}` : `Collection · ${total} works`) : p.series} />
+    <Grain frame={frame} />
+    {p.voice && <Audio src={p.voice} />}
+    <Sfx list={p.sfx} fps={p.fps} />
+  </AbsoluteFill>;
+};
+
+/* pulse: работа сменяется резко — входит с наездом за треть секунды, без затемнения; название и автор —
+   сверху под строкой со знаком, строка голоса — крупными субтитрами внизу. Титул — заголовок с первого кадра. */
+const countRu = (n: number) => n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14) ? 'работы' : n % 10 === 1 && n % 100 !== 11 ? 'работа' : 'работ';
+
+const CollectionPulse: React.FC<{p: any; t: number; frame: number}> = ({p, t, frame}) => {
+  const total = p.items.length;
+  const bleed = p.mode === 'bleed';
+  const loop = p.loopStart ? t >= p.loopStart : false;
+  const hl = p.headline || {};
+  const headK = Math.max(interpolate(t, [hl.end - 0.05, hl.end + 0.3], [1, 0], clamp),
+    p.loopStart ? interpolate(t, [p.loopStart, p.loopStart + 0.4], [0, 1], clamp) : 0);
+  // на повторе — снова первая работа
+  const idx = loop ? 0 : Math.max(0, p.items.findIndex((it: any) => t >= it.start && t < it.start + it.dur));
+  const it = p.items[idx] || p.items[0];
+  const lt = loop ? t - p.loopStart : t - it.start;
+  const enter = idx === 0 && !loop ? 1 : interpolate(lt, [0, 0.34], [0, 1], out3);
+  const z = (1.1 - 0.1 * enter) * (1 + (bleed ? 0.05 : 0.03) * Math.min(1, lt / Math.max(it.dur, 0.1)));
+  const capK = idx === 0 && !loop ? interpolate(t, [p.titleEnd, p.titleEnd + 0.35], [0, 1], out3)
+    : interpolate(lt, [0.12, 0.42], [0, 1], out3);
+  return <AbsoluteFill style={{background: '#0d0c0b', color: INK, overflow: 'hidden'}}>
+    <Fonts lang={p.lang} />
+    {bleed ? <Img src={it.image} style={{position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover',
+      transform: `scale(${z})`}} /> : <>
+      <Backdrop src={it.backdrop} t={t} />
+      <Img src={it.image} style={{position: 'absolute', left: it.frame[0], top: it.frame[1], width: it.frame[2], height: it.frame[3],
+        transformOrigin: '50% 50%', transform: `scale(${z})`, boxShadow: '0 30px 90px rgba(0,0,0,.6)'}} />
+    </>}
+    <PulseScrims head={Math.max(headK, capK * 0.6)} />
+    <Bar text={headK > 0.01 ? (p.lang === 'ru' ? `Подборка · ${total} ${countRu(total)}` : `Collection · ${total} works`) : ''} opacity={0.9} />
+    <Headline text={hl.text} t={t} end={hl.end} loopStart={p.loopStart} />
+    {capK > 0.01 && headK < 0.5 && <div style={{position: 'absolute', left: M, width: 936, top: HEAD_TOP - 6, opacity: capK * (1 - headK),
+      transform: `translateY(${(1 - capK) * 12}px)`, textShadow: '0 2px 18px rgba(0,0,0,.6)'}}>
+      <div style={{fontFamily: 'AhMono', fontWeight: 500, fontSize: 23, letterSpacing: '.14em', color: MUTE, marginBottom: 14}}>
+        <span style={{color: INK}}>{String(idx + 1).padStart(2, '0')}</span> / {String(total).padStart(2, '0')}</div>
+      <div style={{fontFamily: 'AhSerif', fontSize: it.title.length > 36 ? 52 : 62, lineHeight: 1, letterSpacing: '-.01em',
+        textWrap: 'balance' as any}}><Rich text={it.title} /></div>
+      <div style={{marginTop: 12, fontFamily: 'AhGrot', fontSize: 28, fontWeight: 500, color: MUTE}}>
+        {it.author}{it.year ? <>&nbsp;&nbsp;·&nbsp;&nbsp;{it.year}</> : null}</div>
+    </div>}
+    <Captions beats={p.beats || []} t={t} hidden={loop} />
     <Grain frame={frame} />
     {p.voice && <Audio src={p.voice} />}
     <Sfx list={p.sfx} fps={p.fps} />

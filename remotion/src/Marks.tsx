@@ -1,6 +1,6 @@
 import React from 'react';
 import {interpolate} from 'remotion';
-import {H, INK, W, out3} from './common';
+import {ACCENT, H, INK, W, out3} from './common';
 
 /* Линии поверх снимка: «Разбор здания» (ось, уровень, сетка, контур, диагонали) и кольцо вокруг человека
    в «Масштабе». Координаты — в пикселях картинки, линии едут вместе с камерой. Линия прорисовывается
@@ -71,9 +71,31 @@ export const Marks: React.FC<{marks?: any[]; cam: [number, number, number]; t: n
             strokeWidth={2.4} />
           {m.label && <>
             <line x1={fx + (right ? rx : -rx)} y1={fy} x2={fx + (right ? rx + 44 : -rx - 44)} y2={fy} stroke={INK} strokeWidth={1.4} />
-            <text x={fx + (right ? rx + 56 : -rx - 56)} y={fy + 8} fill={INK} fontFamily="Grot" fontWeight={500} fontSize={27}
+            <text x={fx + (right ? rx + 56 : -rx - 56)} y={fy + 8} fill={INK} fontFamily="AhGrot" fontWeight={500} fontSize={27}
               textAnchor={right ? 'start' : 'end'}>{m.label}</text>
           </>}
+        </g>;
+      }
+      if (m.type === 'focus') {
+        // pulse: уголки видоискателя вокруг детали и ярлык «01 · Письмо» — куда смотреть
+        const x0 = sx(m.x0), x1 = sx(m.x1), y0 = sy(m.y0), y1 = sy(m.y1);
+        const fx = (x0 + x1) / 2, fy = (y0 + y1) / 2, z = 1.16 - 0.16 * k;
+        const X0 = fx + (x0 - fx) * z, X1 = fx + (x1 - fx) * z, Y0 = fy + (y0 - fy) * z, Y1 = fy + (y1 - fy) * z;
+        const c = Math.max(26, Math.min(86, Math.min(X1 - X0, Y1 - Y0) * 0.24));
+        const L = [[[X0, Y0 + c], [X0, Y0], [X0 + c, Y0]], [[X1 - c, Y0], [X1, Y0], [X1, Y0 + c]],
+          [[X1, Y1 - c], [X1, Y1], [X1 - c, Y1]], [[X0 + c, Y1], [X0, Y1], [X0, Y1 - c]]]
+          .map((l) => l.map((q) => q.join(',')).join(' '));
+        const below = Y0 < 420;
+        const lx = Math.max(24, Math.min(X0, W - 420)), ly = below ? Math.min(Y1 + 16, H - 620) : Y0 - 58;
+        return <g key={i} opacity={op}>
+          {L.map((pt, j) => <polyline key={'h' + j} points={pt} fill="none" stroke="rgba(8,7,6,.5)" strokeWidth={11}
+            strokeLinecap="square" />)}
+          {L.map((pt, j) => <polyline key={j} points={pt} fill="none" stroke={ACCENT} strokeWidth={5.5} strokeLinecap="square" />)}
+          {m.label && <foreignObject x={lx} y={ly} width={420} height={48}>
+            <div style={{display: 'inline-block', background: ACCENT, color: INK, fontFamily: 'AhMono', fontWeight: 500,
+              fontSize: 23, letterSpacing: '.12em', textTransform: 'uppercase', padding: '9px 14px 8px', lineHeight: 1,
+              whiteSpace: 'nowrap', transform: `translateX(${(1 - k) * -10}px)`}}>{m.label}</div>
+          </foreignObject>}
         </g>;
       }
       const sh = shape(m, sx, sy);

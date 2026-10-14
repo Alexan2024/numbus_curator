@@ -193,7 +193,14 @@ async def collect_met(client: httpx.AsyncClient) -> list[dict]:
     items = []
     for q in random.sample(MUSEUM_QUERIES, 2):
         try:
-            r = await _get(client, f"{base}/search", params={"q": q, "hasImages": "true"})
+            # поиск v1 The Met отключила 1 октября 2026; v1.1 отдаёт по странице — берём случайную из первых 300
+            search = "https://collectionapi.metmuseum.org/public/collection/v1.1/search"
+            r = await _get(client, search, params={"q": q, "hasImages": "true", "limit": 100, "offset": 0})
+            total = int(r.json().get("total") or 0)
+            if total > 100:
+                off = random.choice(range(0, min(total, 300), 100))
+                if off:
+                    r = await _get(client, search, params={"q": q, "hasImages": "true", "limit": 100, "offset": off})
             ids = (r.json().get("objectIDs") or [])[:300]
             for oid in random.sample(ids, min(config.MUSEUM_PER_RUN * 3, len(ids))):
                 o = (await _get(client, f"{base}/objects/{oid}")).json()
