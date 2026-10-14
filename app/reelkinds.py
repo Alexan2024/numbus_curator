@@ -210,7 +210,7 @@ Return ONLY JSON:
 
     "scale": f"""You pick a building or structure for an AHMAG Instagram reel about SCALE: the reel opens on a tiny person (or a door, a car) in a photo, and the camera slowly pulls back until the whole structure fills the frame. The shock of the size is the story — and why anyone built it that big.
 
-Pick built architecture or engineering in AHMAG's taste: cathedrals, hypostyle halls, stepwells, dams, bridges, brutalist megastructures, ruins, memorials, monasteries in cliffs, bunkers, silos. Never commercial towers or developer projects. There must be a large photo on Wikimedia Commons (free licence) where the whole structure is visible AND at least one person (or a car, a door) is visible and small. Facts must include real dimensions (height, length, weight, years to build, how many people) and the human reason for the size. Check facts with web search. Not from the avoid list.
+Pick built architecture or engineering in AHMAG's taste: cathedrals, hypostyle halls, stepwells, dams, bridges, brutalist megastructures, ruins, memorials, monasteries in cliffs, bunkers, silos. Never commercial towers or developer projects. There must be a large, sharp photo where the whole structure is visible AND at least one person (or a car, a door) is visible and small. The photo matters most. Best — professional photos from the building's publication on ArchDaily, Divisare, Archi.ru, Designboom or Archello: find it with web search, give its URL in "article" and the photographer's name in "photographer" (as credited in the publication). If there is no such publication, a large free photo on Wikimedia Commons. Facts must include real dimensions (height, length, weight, years to build, how many people) and the human reason for the size. Check facts with web search. Not from the avoid list.
 
 {VIRAL_PICK}
 
@@ -219,11 +219,11 @@ Pick built architecture or engineering in AHMAG's taste: cathedrals, hypostyle h
 {MUSIC}
 
 Return ONLY JSON:
-{{"title": "name of the building", "author": "architect or builders", "year": "year or years built", "museum": "city, country", "medium": "main material, e.g. Reinforced concrete", "size": "the key dimension, e.g. 152 m tall", "commons": "query for Wikimedia Commons: the building + people or visitors", "facts": ["6–10 specific verified facts with numbers"], {VIRAL_SCHEMA}, "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}""",
+{{"title": "name of the building", "author": "architect or builders", "year": "year or years built", "museum": "city, country", "medium": "main material, e.g. Reinforced concrete", "size": "the key dimension, e.g. 152 m tall", "commons": "query for Wikimedia Commons: the building + people or visitors", "article": "URL of the building's publication with professional photos, or empty", "photographer": "", "facts": ["6–10 specific verified facts with numbers"], {VIRAL_SCHEMA}, "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}""",
 
     "read": f"""You pick a building for an AHMAG Instagram reel that READS a building like an architect: over one clear photo of its main facade, thin lines draw the architect's moves one by one — the axis, the grid, the levels, a proportion — and a narrator explains what each move does to the person who walks in.
 
-Pick built architecture in AHMAG's taste whose design is legible from one frontal photo: classical and Renaissance villas and temples, modernist and post-war buildings, rationalism, brick and concrete. There must be a large, sharp, frontal, not strongly distorted photo of the whole facade on Wikimedia Commons (free licence). The design logic must be documented (proportions, dimensions, the architect's own words, what the building was for). Check facts with web search. Not from the avoid list.
+Pick built architecture in AHMAG's taste whose design is legible from one frontal photo: classical and Renaissance villas and temples, modernist and post-war buildings, rationalism, brick and concrete. There must be a large, sharp, frontal, not strongly distorted photo of the whole facade. The photo matters most. Best — professional photos from the building's publication on ArchDaily, Divisare, Archi.ru, Designboom or Archello: find it with web search, give its URL in "article" and the photographer's name in "photographer" (as credited in the publication). If there is no such publication, a large free photo on Wikimedia Commons. The design logic must be documented (proportions, dimensions, the architect's own words, what the building was for). Check facts with web search. Not from the avoid list.
 
 {VIRAL_PICK}
 
@@ -232,7 +232,7 @@ Pick built architecture in AHMAG's taste whose design is legible from one fronta
 {MUSIC}
 
 Return ONLY JSON:
-{{"title": "name of the building", "author": "architect", "year": "...", "museum": "city, country", "medium": "main material", "size": "key dimensions if known", "commons": "query for Wikimedia Commons: building name + facade", "facts": ["6–10 specific verified facts: proportions, dimensions, intentions, history"], {VIRAL_SCHEMA}, "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}""",
+{{"title": "name of the building", "author": "architect", "year": "...", "museum": "city, country", "medium": "main material", "size": "key dimensions if known", "commons": "query for Wikimedia Commons: building name + facade", "article": "URL of the building's publication with professional photos, or empty", "photographer": "", "facts": ["6–10 specific verified facts: proportions, dimensions, intentions, history"], {VIRAL_SCHEMA}, "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}""",
 }
 
 # что должно быть на картинке — для проверки кандидатов с Commons
@@ -345,6 +345,8 @@ PAIR_PICK = {
 def pair_pick_system(kind: str) -> str:
     return f"""You pick material for an AHMAG Instagram reel built on two images and the moment one turns into the other. Pick {PAIR_PICK[kind]}
 
+For a photo of a building as it stands today (built, now, real), the best source is a professional photo from the building's publication on ArchDaily, Divisare, Archi.ru, Designboom or Archello: give its URL in "article" and the photographer in "photographer" for that side; otherwise Wikimedia Commons. Paintings and drawings — Commons or a museum's open-access collection.
+
 It must have a documented story with tension that a stranger would care about in two seconds. Check facts with web search. Famous works and places are welcome if the real story is not the one everybody knows. Not from the avoid list.
 
 {VIRAL_PICK}
@@ -354,7 +356,7 @@ It must have a documented story with tension that a stranger would care about in
 {MUSIC}
 
 Return ONLY JSON:
-{{"title": "short name for the reel, e.g. Villa Rotonda", "a": {{"role": "...", "title": "...", "author": "...", "year": "...", "museum": "museum or place, city", "commons": "query for Wikimedia Commons search"}}, "b": {{"role": "...", "title": "...", "author": "...", "year": "...", "museum": "...", "commons": "query for Wikimedia Commons search", "film": {{"title": "only for a film", "year": "..."}}}}, "answer": "a|b — only for a which-one reel", "facts": ["6–10 specific verified facts in English"], {VIRAL_SCHEMA}, "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}"""
+{{"title": "short name for the reel, e.g. Villa Rotonda", "a": {{"role": "...", "title": "...", "author": "...", "year": "...", "museum": "museum or place, city", "commons": "query for Wikimedia Commons search"}}, "b": {{"role": "...", "title": "...", "author": "...", "year": "...", "museum": "...", "commons": "query for Wikimedia Commons search", "article": "for a building photo: URL of its publication, or empty", "photographer": "", "film": {{"title": "only for a film", "year": "..."}}}}, "answer": "a|b — only for a which-one reel", "facts": ["6–10 specific verified facts in English"], {VIRAL_SCHEMA}, "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}"""
 
 
 PAIR_NEED = {

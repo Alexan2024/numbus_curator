@@ -327,6 +327,13 @@ MET = "https://collectionapi.metmuseum.org/public/collection/v1"
 # поиск v1 The Met отключила 1 октября 2026 (отвечает сообщением без objectIDs) — теперь v1.1, постранично
 MET_SEARCH = "https://collectionapi.metmuseum.org/public/collection/v1.1/search"
 CMA = "https://openaccess-api.clevelandart.org/api/artworks/"
+SMK = "https://api.smk.dk/api/v1/art/search/"            # Statens Museum for Kunst, Копенгаген: открытый доступ, IIIF
+EUROPEANA = "https://api.europeana.eu/record/v2/search.json"
+EUROPEANA_KEY = os.getenv("EUROPEANA_KEY", "api2demo")
+# у этих поставщиков Europeana отдаёт полноразмерные файлы; у остальных бывают превью в 400 px
+EUROPEANA_GOOD = ("rijksmuseum", "nationalmuseum", "finnish national gallery", "kansallisgalleria", "belvedere",
+                  "mauritshuis", "nasjonalmuseet", "statens museum", "städel", "staedel", "kunsthalle", "museo",
+                  "musée", "musee", "national gallery", "galleria", "gallery")
 
 
 def _same(a: str, b: str) -> bool:
@@ -337,8 +344,9 @@ def _same(a: str, b: str) -> bool:
 
 
 async def museum_candidates(client: httpx.AsyncClient, w: dict) -> list[dict]:
-    """The Met и Cleveland Museum of Art: картинки в открытом доступе (CC0) в полном размере — чище сканов Commons.
-    → [{title, w, h, thumb, url, artist, license}] (0–2 штуки). Картины и графика, не архитектура."""
+    """Музеи с открытым доступом, файлы в полном размере — чище сканов Commons: The Met, Cleveland Museum of Art, SMK,
+    музеи Europeana (Рейксмузеум и другие). → [{title, w, h, thumb, url, artist, license, src}] (0–4 штуки).
+    Картины и графика, не архитектура."""
     if not MUSEUMS or not w.get("title"):
         return []
     q = f"{w.get('title')} {w.get('author') or ''}".strip()
@@ -368,7 +376,123 @@ async def museum_candidates(client: httpx.AsyncClient, w: dict) -> list[dict]:
                 break
     except Exception as exc:
         log.info("Cleveland «%s»: %s", q, exc)
+    out += await _smk(client, w, q)
+    out += await _europeana(client, w, q)
     return out
+
+
+async def _smk(client: httpx.AsyncClient, w: dict, q: str) -> list[dict]:
+    """SMK (Копенгаген): общественное достояние, файлы до 3000 px через IIIF. Названия на датском, поэтому
+    подходит и совпадение по автору: какая это работа, Claude всё равно проверяет глазами по превью."""
+    try:
+        r = await client.get(SMK, params={"keys": q, "offset": 0, "rows": 4,
+                                          "filters": "[public_domain:true],[has_image:true]"}, timeout=20)
+        for o in r.json().get("items") or []:
+            titles = " ".join(t.get("title") or "" for t in o.get("titles") or [])
+            who = ", ".join(p.get("creator") or "" for p in o.get("production") or [])
+            if not (_same(w["title"], titles) or (w.get("author") and _same(w["author"], who))):
+                continue
+            iiif = o.get("image_iiif_id")
+            big = f"{iiif}/full/!3000,3000/0/default.jpg" if iiif else o.get("image_native")
+            if not big:
+                continue
+            return [{"title": f"SMK: {titles[:60]}", "w": int(o.get("image_width") or 0), "h": int(o.get("image_height") or 0),
+                     "thumb": o.get("image_thumbnail") or big, "url": big, "artist": who[:80],
+                     "license": "Public domain (SMK Open)", "src": "SMK"}]
+    except Exception as exc:
+        log.info("SMK «%s»: %s", q, exc)
+    return []
+
+
+async def _europeana(client: httpx.AsyncClient, w: dict, q: str) -> list[dict]:
+    """Europeana: открытые коллекции европейских музеев (Рейксмузеум и другие) — только поставщики с полноразмерными
+    файлами (EUROPEANA_GOOD)."""
+    try:
+        r = await client.get(EUROPEANA, params={"wskey": EUROPEANA_KEY, "query": q, "rows": 8, "reusability": "open",
+                                                "media": "true", "qf": "TYPE:IMAGE"}, timeout=25)
+        for o in r.json().get("items") or []:
+            prov = " ".join(o.get("dataProvider") or []).lower()
+            big = (o.get("edmIsShownBy") or [None])[0]
+            if not big or not any(g in prov for g in EUROPEANA_GOOD):
+                continue
+            titles = " ".join(o.get("title") or [])
+            who = " ".join(o.get("dcCreator") or [])
+            if not (_same(w["title"], titles) or (w.get("author") and who and _same(w["author"], who))):
+                continue
+            name = (o.get("dataProvider") or ["Europeana"])[0]
+            return [{"title": f"{name}: {titles[:60]}", "w": 0, "h": 0, "thumb": (o.get("edmPreview") or [big])[0],
+                     "url": big, "artist": who[:80], "license": f"Public domain ({name} via Europeana)", "src": name}]
+    except Exception as exc:
+        log.info("Europeana «%s»: %s", q, exc)
+    return []
+
+
+# ======================= архитектурные издания =======================
+# Профессиональные фото здания — из его публикации (ArchDaily, Divisare, Archi.ru, Designboom…): Claude находит
+# публикацию поиском и даёт ссылку в поле article; бот берёт фото со страницы. Фотограф и издание — в подписи.
+
+MAGAZINES = {"archdaily.com": "ArchDaily", "divisare.com": "Divisare", "archi.ru": "Archi.ru",
+             "designboom.com": "Designboom", "dezeen.com": "Dezeen", "archello.com": "Archello",
+             "afasiaarchzine.com": "Afasia", "architectural-review.com": "The Architectural Review",
+             "domusweb.it": "Domus", "metalocus.es": "Metalocus", "arquitecturaviva.com": "Arquitectura Viva"}
+
+
+def _magazine(url: str) -> str:
+    host = re.sub(r"^www\.", "", (re.match(r"https?://([^/]+)", url or "") or [None, ""])[1].lower())
+    return next((name for dom, name in MAGAZINES.items() if host.endswith(dom)), host)
+
+
+async def article_candidates(client: httpx.AsyncClient, w: dict, n: int = 6) -> list[dict]:
+    """Фото со страницы публикации w["article"] → кандидаты для verify (как у Commons и музеев)."""
+    url = str(w.get("article") or "").strip()
+    if not url.startswith("http"):
+        return []
+    from app import media
+    try:
+        art = await media.extract_article(client, url)
+    except Exception as exc:
+        log.info("Публикация %s не открылась: %s", url, exc)
+        return []
+    mag = _magazine(url)
+    who = str(w.get("photographer") or "").strip()
+    urls = (art.get("image_urls") or [])[:n * 2]
+    sizes = await asyncio.gather(*(_probe_size(client, u) for u in urls))
+    out = []
+    for k, (u, wh) in enumerate(zip(urls, sizes)):
+        # в старых публикациях фото бывают по 500 px — такие не берём, лучше Commons
+        if not wh or max(wh) < ARTICLE_MIN or min(wh) < ARTICLE_MIN * 0.6:
+            continue
+        thumb = u.replace("/large_jpg/", "/medium_jpg/") if "adsttc.com" in u else u
+        out.append({"title": f"{mag}: фото {k + 1}", "w": wh[0], "h": wh[1], "thumb": thumb, "url": u,
+                    "artist": who or mag, "license": mag, "src": mag})
+        if len(out) >= n:
+            break
+    log.info("Публикация %s: фото %s, крупных %s", url, len(urls), len(out))
+    return out
+
+
+ARTICLE_MIN = int(os.getenv("REEL_ARTICLE_MIN", "1400"))     # фото из публикации — не меньше этого по длинной стороне
+
+
+async def _probe_size(client: httpx.AsyncClient, url: str) -> tuple[int, int] | None:
+    """Размер картинки по началу файла (без скачивания целиком)."""
+    from PIL import ImageFile
+    try:
+        parser = ImageFile.Parser()
+        async with client.stream("GET", url, timeout=30) as r:
+            if r.status_code != 200:
+                return None
+            got = 0
+            async for chunk in r.aiter_bytes(16384):
+                parser.feed(chunk)
+                got += len(chunk)
+                if parser.image is not None:
+                    return parser.image.size
+                if got > 600_000:
+                    break
+    except Exception:
+        return None
+    return None
 
 
 async def tmdb_candidates(client: httpx.AsyncClient, film: dict, n: int = 4) -> list[dict]:
@@ -431,8 +555,8 @@ async def _thumbs(client: httpx.AsyncClient, cands: list[dict]) -> list[Image.Im
     return await asyncio.gather(*(one(c) for c in cands))
 
 
-def _sheet(thumbs: list[Image.Image | None]) -> Image.Image:
-    """Превью кандидатов в ряд, с номерами 1, 2, 3 — чтобы Claude выбрал нужный."""
+def _sheet(thumbs: list[Image.Image | None], per_row: int = 5) -> Image.Image:
+    """Превью кандидатов с номерами 1, 2, 3… — чтобы Claude выбрал нужный. Больше пяти — в несколько рядов."""
     h = 320
     tiles = []
     for n, t in enumerate(thumbs, 1):
@@ -444,11 +568,14 @@ def _sheet(thumbs: list[Image.Image | None]) -> Image.Image:
         tile.paste(t, (0, 40))
         ImageDraw.Draw(tile).text((8, 6), str(n), fill=(0, 0, 0), font=reelrender.font(28))
         tiles.append(tile)
-    sheet = Image.new("RGB", (sum(t.width for t in tiles) + 16 * (len(tiles) - 1), h + 40), (255, 255, 255))
-    x = 0
-    for t in tiles:
-        sheet.paste(t, (x, 0))
-        x += t.width + 16
+    rows = [tiles[i:i + per_row] for i in range(0, len(tiles), per_row)] or [[]]
+    width = max(sum(t.width for t in r) + 16 * max(0, len(r) - 1) for r in rows) or h
+    sheet = Image.new("RGB", (width, len(rows) * (h + 56) - 16), (255, 255, 255))
+    for k, r in enumerate(rows):
+        x = 0
+        for t in r:
+            sheet.paste(t, (x, k * (h + 56)))
+            x += t.width + 16
     return sheet
 
 
@@ -461,9 +588,9 @@ def _img_block(im: Image.Image, max_side: int = 1568, quality: int = 85) -> dict
                                         "data": base64.b64encode(buf.getvalue()).decode()}}
 
 
-PICK_SYSTEM = """You check pictures for an Instagram reel. For each numbered sheet you get the work that should be shown and 1–3 candidate images from Wikimedia Commons, numbered on the sheet.
+PICK_SYSTEM = """You check pictures for an Instagram reel. For each numbered sheet you get the work that should be shown and several candidate images — from Wikimedia Commons, museum open-access collections and architecture publications (ArchDaily, Divisare and others) — numbered on the sheet.
 
-Pick the candidate that shows exactly this work, whole and clean: for a painting or print — the full picture, straight, without a frame or museum wall around it if another candidate has that, not a detail, sketch, copy or engraving after it (unless the work itself is a print); for a building — a clear, well-composed photo of this building; for a photograph — the photograph itself. Prefer the sharper, better-coloured one. If none fits, pick 0.
+Pick the candidate that shows exactly this work, whole and clean: for a painting or print — the full picture, straight, without a frame or museum wall around it if another candidate has that, not a detail, sketch, copy or engraving after it (unless the work itself is a print); for a building — a clear, well-composed photo of this building, and a professional photo from a publication beats a tourist snapshot; for a photograph — the photograph itself. Prefer the sharper, better-coloured one; for a painting prefer a museum's own file over a copy. Never a collage or a grid of several photos, a plan or diagram (unless the work itself is a drawing), or a picture with text or a watermark on it. If none fits, pick 0.
 
 Also give the centre of the main subject in the picked image (a face, a figure, the building) as fractions of its width and height: fx, fy from 0 to 1 — the video slowly pushes in toward it.
 
@@ -480,10 +607,10 @@ async def verify(client: httpx.AsyncClient, works: list[dict], background: bool,
 
     async def cands(w):
         async with sem:
-            own = list(w.get("cands") or [])
-            mus = await museum_candidates(client, w) if museums and not own else []
+            own = list(w.get("cands") or []) + await article_candidates(client, w)
+            mus = await museum_candidates(client, w) if museums and not w.get("cands") else []
             c = []
-            if w.get("commons") or not own:
+            if w.get("commons") or not own or w.get("article"):
                 # запрос Claude, потом «название автор», потом просто название — пока не наберётся кандидатов
                 qs: list[str] = []
                 for q in (w.get("commons"), f"{w.get('title') or ''} {w.get('author') or ''}", w.get("title")):
@@ -501,7 +628,7 @@ async def verify(client: httpx.AsyncClient, works: list[dict], background: bool,
             c = own + mus + c
             if max_aspect:
                 c = [x for x in c if not x["w"] or x["w"] / max(1, x["h"]) <= max_aspect]
-            return c[:per + len(mus)]
+            return c[:per + len(mus) + len(own)]
     found = await asyncio.gather(*(cands(w) for w in works))
     pairs = [(w, c) for w, c in zip(works, found) if c]
     if not pairs:
@@ -526,7 +653,7 @@ async def verify(client: httpx.AsyncClient, works: list[dict], background: bool,
         if 1 <= k <= len(c):
             got = c[k - 1]
             row = {**{a: b for a, b in w.items() if a != "cands"}, "file": got["title"], "artist": got["artist"],
-                   "license": got["license"], "focus": focus}
+                   "license": got["license"], "focus": focus, "src": got.get("src") or ""}
             if got.get("url"):
                 row["url"] = got["url"]
             out.append(row)
@@ -554,7 +681,7 @@ A good theme is specific and has a mood or an idea that ties works from differen
 
 {TASTE}
 
-Every work must have a large image on Wikimedia Commons: paintings and prints by artists who died before about 1955, historical photographs, buildings with free-licensed photos. Pick specific works, one per author; mix famous and lesser-known.
+Every work must have a large high-quality image: paintings and prints by artists who died before about 1955 (Wikimedia Commons or a museum's open-access collection), historical photographs, buildings (Commons or a professional photo in the building's publication on ArchDaily, Divisare, Archi.ru — then give its URL in "article" and the photographer in "photographer"). Pick specific works, one per author; mix famous and lesser-known.
 
 The reel is narrated and fast: each work is on screen only while its line is spoken. intro — the line spoken over the title card, up to 12 words: a hook that opens the question the collection answers, about what ties these works, without naming the title again ("Every one of these rooms was painted by someone who lived alone."). Each work gets a line — up to 11 words, spoken while it is on screen: one specific fact the viewer cannot see, which ties it to the theme (who, when, what happened, why it belongs here). Lines are joined like a story, not a list, and pull the viewer to the next work; the last work's line lands the idea and makes the first one read differently. Wrap the one word per line the narrator leans on in *asterisks*. delivery for each line and intro_delivery — 6–12 words of direction for the narrator (tone, pace).
 
@@ -567,7 +694,7 @@ format — all works in the reel are shown the same way. "vertical": every work 
 {MUSIC}
 
 Return ONLY JSON:
-{{"format": "vertical|framed", "title": "on-screen title shown big from the first frame, up to 28 characters, sentence case, works as a headline a stranger stops for; wrap the one key word in *asterisks* — it is set in italics (\"Art to rest your *mind*\")", "theme_ru": "тема по-русски, коротко", "intro": "...", "intro_delivery": "...", "works": [{{"title": "title of the work in English or original", "author": "...", "year": "...", "commons": "query for Wikimedia Commons search: title and author, no year", "line": "...", "delivery": "..."}}], "caption": "1–3 short sentences for the Instagram caption: what ties these works together", "hashtags": ["5–8 lowercase words without #"], "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}"""
+{{"format": "vertical|framed", "title": "on-screen title shown big from the first frame, up to 28 characters, sentence case, works as a headline a stranger stops for; wrap the one key word in *asterisks* — it is set in italics (\"Art to rest your *mind*\")", "theme_ru": "тема по-русски, коротко", "intro": "...", "intro_delivery": "...", "works": [{{"title": "title of the work in English or original", "author": "...", "year": "...", "commons": "query for Wikimedia Commons search: title and author, no year", "article": "only for a building: URL of its publication with professional photos, or empty", "photographer": "", "line": "...", "delivery": "..."}}], "caption": "1–3 short sentences for the Instagram caption: what ties these works together", "hashtags": ["5–8 lowercase words without #"], "music": [{{"artist": "...", "track": "...", "mood": "..."}}]}}"""
 
 MORE_SYSTEM = f"""You add works to an AHMAG Instagram reel compilation. Same rules: a specific work by an author not yet in the reel, with a large image on Wikimedia Commons (artists who died before about 1955, historical photographs, buildings with free photos), fitting the theme.
 
@@ -581,7 +708,7 @@ PAINTING_SYSTEM = f"""You pick a painting for an AHMAG Instagram reel that walks
 
 The picture must be legible on a phone: people, hands, faces, objects and a setting that can each fill the screen when the camera moves in; not too dark; many visible details that carry meaning.
 
-Pick a painting (or a fresco, altarpiece, large print) that is in the public domain and has a large image on Wikimedia Commons; has several visible details that carry the story; has a documented story with tension, contrast or a twist that a stranger would care about in one second — someone is losing something, hiding something, doesn't know something, or the obvious reading is wrong. A famous painting is welcome — even better — if its real story is not the one everybody knows. Check the facts with web search. Not from the avoid list.
+Pick a painting (or a fresco, altarpiece, large print) that is in the public domain and has a large high-quality image — on Wikimedia Commons or in a museum's open-access collection (The Met, Rijksmuseum, SMK, Cleveland, Nationalmuseum and others; Russian museums' works are usually on Commons in Google Art Project scans); has several visible details that carry the story; has a documented story with tension, contrast or a twist that a stranger would care about in one second — someone is losing something, hiding something, doesn't know something, or the obvious reading is wrong. A famous painting is welcome — even better — if its real story is not the one everybody knows. Check the facts with web search. Not from the avoid list.
 
 {rk.VIRAL_PICK}
 
@@ -910,8 +1037,8 @@ def _credits(items: list[dict], lang: str = "en") -> str:
     src = []
     for it in items:
         lic = it.get("license") or ""
-        src.append("The Met" if "The Met" in lic else "Cleveland Museum of Art" if "Cleveland" in lic
-                   else "film still" if "film" in lic else "Wikimedia Commons")
+        src.append(it.get("src") or ("The Met" if "The Met" in lic else "Cleveland Museum of Art" if "Cleveland" in lic
+                                     else "film still" if "film" in lic else "Wikimedia Commons"))
     head, photos = ("Изображения: ", ". Фото: ") if lang == "ru" else ("Images: ", ". Photos: ")
     base = head + (", ".join(dict.fromkeys(x for x in src if x != "film still")) if src else "Wikimedia Commons")
     return base + (photos + "; ".join(dict.fromkeys(need)) if need else "")
@@ -1199,7 +1326,8 @@ async def _pair(rid: int, d: dict, background: bool, client: httpx.AsyncClient) 
                     raise SwapObject(f"«{what}» — {weak}", what)
                 got = []
                 for side, role in ((a, spec["roles"][0]), (b, spec["roles"][1])):
-                    w = {k: side.get(k) for k in ("title", "author", "year", "museum", "commons", "role", "ru")}
+                    w = {k: side.get(k) for k in ("title", "author", "year", "museum", "commons", "role", "ru",
+                                                  "article", "photographer")}
                     w["need"] = rk.PAIR_NEED.get(side.get("role") or "", "") or rk.PAIR_NEED.get(role, "")
                     if kind == "film" and side is b:
                         w["cands"] = await tmdb_candidates(client, b.get("film") or {"title": b.get("title"), "year": b.get("year")})
